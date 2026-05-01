@@ -10,7 +10,9 @@ import { isTauri } from "@tauri-apps/api/core";
 import type { Theme } from "@tauri-apps/api/window";
 import "./App.css";
 import {
+  checkForAppUpdate,
   hideMainWindow,
+  installAppUpdate,
   loadAppState,
   minimizeMainWindow,
   openRepositoryUrl,
@@ -28,8 +30,10 @@ import {
   toggleMaximizeMainWindow,
   writeClipboardText,
 } from "./desktopApi";
+import type { AppUpdateInfo } from "./desktopApi";
 import { APP_VERSION, REPOSITORY_URL } from "./constants";
 import { TEXT } from "./i18n";
+import type { AppText } from "./i18n";
 import {
   flattenScreens,
   getLayoutBounds,
@@ -86,6 +90,13 @@ type WorkspaceTab = (typeof WORKSPACE_TABS)[number]["id"];
 
 const CLIENT_TABS: WorkspaceTab[] = ["settings"];
 const PERFORMANCE_SAMPLE_LIMIT = 32;
+type UpdateStatus =
+  | "idle"
+  | "checking"
+  | "available"
+  | "current"
+  | "installing"
+  | "error";
 
 interface DragState {
   pointerId: number;
@@ -128,6 +139,10 @@ function App() {
   const [performanceSamples, setPerformanceSamples] = useState<
     PerformanceSample[]
   >([]);
+  const [updateStatus, setUpdateStatus] = useState<UpdateStatus>("idle");
+  const [availableUpdate, setAvailableUpdate] =
+    useState<AppUpdateInfo | null>(null);
+  const [updateMessage, setUpdateMessage] = useState<string | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<WorkspaceTab>("layout");
   const [systemTheme, setSystemTheme] = useState<Exclude<ThemeMode, "system">>(
@@ -938,6 +953,56 @@ function App() {
     void openRepositoryUrl();
   }
 
+  async function checkDesktopUpdate() {
+    if (!isTauri()) {
+      setUpdateStatus("current");
+      setAvailableUpdate(null);
+      setUpdateMessage(ui.settings.updatesBrowserCopy);
+      return;
+    }
+
+    setUpdateStatus("checking");
+    setUpdateMessage(null);
+
+    try {
+      const result = await checkForAppUpdate();
+
+      if (result.available && result.update) {
+        setAvailableUpdate(result.update);
+        setUpdateStatus("available");
+        setUpdateMessage(`${ui.settings.updateAvailable}: v${result.update.version}`);
+        return;
+      }
+
+      setAvailableUpdate(null);
+      setUpdateStatus("current");
+      setUpdateMessage(ui.settings.updateCurrent);
+    } catch (error: unknown) {
+      setUpdateStatus("error");
+      setUpdateMessage(
+        error instanceof Error ? error.message : ui.errors.checkUpdate,
+      );
+    }
+  }
+
+  async function installDesktopUpdate() {
+    if (!availableUpdate || updateStatus === "installing") {
+      return;
+    }
+
+    setUpdateStatus("installing");
+    setUpdateMessage(`${ui.settings.updateInstalling}: v${availableUpdate.version}`);
+
+    try {
+      await installAppUpdate();
+    } catch (error: unknown) {
+      setUpdateStatus("error");
+      setUpdateMessage(
+        error instanceof Error ? error.message : ui.errors.installUpdate,
+      );
+    }
+  }
+
   if (!snapshot || !layout || !runtime || !displayLayout) {
     return (
       <main className={shellClassName}>
@@ -1522,6 +1587,66 @@ function App() {
                 ) : null}
               </section>
 
+              <section className="surface-card settings-card update-card">
+                <div className="card-title-row">
+                  <h2>{ui.settings.updates}</h2>
+                  <span className={`update-status-badge ${updateStatus}`}>
+                    {updateStatusLabel(updateStatus, ui)}
+                  </span>
+                </div>
+                <p className="muted-copy">
+                  {isTauri()
+                    ? ui.settings.updatesCopy
+                    : ui.settings.updatesBrowserCopy}
+                </p>
+                <dl className="network-meta compact-meta">
+                  <div>
+                    <dt>{ui.settings.currentVersion}</dt>
+                    <dd>v{APP_VERSION}</dd>
+                  </div>
+                  <div>
+                    <dt>{ui.settings.latestVersion}</dt>
+                    <dd>
+                      {availableUpdate ? `v${availableUpdate.version}` : "--"}
+                    </dd>
+                  </div>
+                </dl>
+                {updateMessage ? (
+                  <p className={`muted-copy update-message ${updateStatus}`}>
+                    {updateMessage}
+                  </p>
+                ) : null}
+                <div className="inline-actions">
+                  <button
+                    type="button"
+                    className="secondary-button compact-button"
+                    onClick={() => void checkDesktopUpdate()}
+                    disabled={
+                      updateStatus === "checking" ||
+                      updateStatus === "installing"
+                    }
+                  >
+                    {updateStatus === "checking"
+                      ? ui.settings.checkingUpdate
+                      : ui.settings.checkUpdate}
+                  </button>
+                  <button
+                    type="button"
+                    className="primary-button compact-button"
+                    onClick={() => void installDesktopUpdate()}
+                    disabled={
+                      !availableUpdate ||
+                      updateStatus === "checking" ||
+                      updateStatus === "installing"
+                    }
+                  >
+                    {updateStatus === "installing"
+                      ? ui.settings.installingUpdate
+                      : ui.settings.installUpdate}
+                  </button>
+                </div>
+              </section>
+
               <section className="surface-card performance-card">
                 <div className="card-title-row">
                   <h2>{ui.settings.performance}</h2>
@@ -1994,6 +2119,23 @@ function formatScreenCount(count: number, language: AppLanguage) {
   return language === "en"
     ? `${count} ${count === 1 ? "screen" : "screens"}`
     : `${count} 屏`;
+}
+
+function updateStatusLabel(status: UpdateStatus, ui: AppText) {
+  switch (status) {
+    case "checking":
+      return ui.settings.updateChecking;
+    case "available":
+      return ui.settings.updateAvailable;
+    case "current":
+      return ui.settings.updateCurrent;
+    case "installing":
+      return ui.settings.updateInstalling;
+    case "error":
+      return ui.settings.updateFailed;
+    default:
+      return ui.settings.updateIdle;
+  }
 }
 
 function uniqueScreenId(

@@ -225,6 +225,25 @@
   color: #1d5fd0;
 }
 
+.theme-light .update-status-badge {
+  background: #eef2f8;
+  color: #4b5568;
+}
+
+.theme-light .update-status-badge.available {
+  background: #dff7f2;
+  color: #08796f;
+}
+
+.theme-light .update-status-badge.error {
+  background: #fee2e2;
+  color: #b91c1c;
+}
+
+.theme-light .update-message.error {
+  color: #b91c1c;
+}
+
 .theme-light .tag-pill-manual {
   background: #fef3c7;
   color: #9a5a00;
@@ -1549,6 +1568,42 @@
   border-color: rgba(16, 185, 129, 0.45);
   background: rgba(16, 185, 129, 0.14);
   color: #34d399;
+}
+
+.update-card {
+  display: grid;
+  gap: 10px;
+}
+
+.update-status-badge {
+  min-height: 26px;
+  display: inline-flex;
+  align-items: center;
+  padding: 0 9px;
+  border-radius: 999px;
+  background: rgba(63, 63, 70, 0.72);
+  color: #d4d4d8;
+  font-size: 12px;
+  font-weight: 800;
+  white-space: nowrap;
+}
+
+.update-status-badge.available {
+  background: rgba(16, 185, 129, 0.14);
+  color: #34d399;
+}
+
+.update-status-badge.error {
+  background: rgba(127, 29, 29, 0.38);
+  color: #fca5a5;
+}
+
+.update-message {
+  margin-top: 0 !important;
+}
+
+.update-message.error {
+  color: #fca5a5;
 }
 
 .clipboard-card {

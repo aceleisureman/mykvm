@@ -108,6 +108,11 @@ jobs:
             echo ""
             echo "- $subject"
             echo ""
+            echo "Downloads:"
+            echo "- macOS: download the .dmg, then drag MyKVM to Applications. The .app.tar.gz file is for automatic updates only."
+            echo "- Windows: download the .exe or .msi installer."
+            echo "- Linux: download the AppImage, .deb, or .rpm package."
+            echo ""
             echo "Changes since ${latest_tag:-project start}:"
             if [[ -z "$latest_tag" ]]; then
               git log --pretty=format:'- %s'
@@ -136,12 +141,15 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: macos-latest
+          - os: macos-14
             name: macos
+            args: --ci --target universal-apple-darwin
           - os: windows-latest
             name: windows
+            args: --ci
           - os: ubuntu-22.04
             name: linux
+            args: --ci
 
     runs-on: ${{ matrix.os }}
 
@@ -166,8 +174,23 @@ jobs:
       - name: Install Rust stable
         run: rustup default stable
 
+      - name: Add macOS Rust targets
+        if: matrix.name == 'macos'
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
       - name: Install dependencies
         run: npm ci
+
+      - name: Validate updater signing key
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "$TAURI_SIGNING_PRIVATE_KEY" ]; then
+            echo "::error::TAURI_SIGNING_PRIVATE_KEY is required to create signed updater artifacts."
+            exit 1
+          fi
 
       - name: Apply release version
         shell: bash
@@ -184,6 +207,57 @@ jobs:
           }
           NODE
 
+      - name: Validate Apple signing secrets
+        if: matrix.name == 'macos'
+        shell: bash
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_API_KEY_PRIVATE_KEY: ${{ secrets.APPLE_API_KEY_PRIVATE_KEY }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          missing=0
+          require() {
+            if [ -z "${!1:-}" ]; then
+              echo "::error::$1 is required for a signed and notarized macOS release."
+              missing=1
+            fi
+          }
+
+          require APPLE_CERTIFICATE
+          require APPLE_CERTIFICATE_PASSWORD
+          require APPLE_SIGNING_IDENTITY
+
+          if [ -n "$APPLE_API_KEY_PRIVATE_KEY$APPLE_API_KEY_ID$APPLE_API_ISSUER" ]; then
+            require APPLE_API_KEY_PRIVATE_KEY
+            require APPLE_API_KEY_ID
+            require APPLE_API_ISSUER
+          else
+            require APPLE_ID
+            require APPLE_PASSWORD
+            require APPLE_TEAM_ID
+          fi
+
+          exit "$missing"
+
+      - name: Write Apple notarization API key
+        if: matrix.name == 'macos'
+        shell: bash
+        env:
+          APPLE_API_KEY_PRIVATE_KEY: ${{ secrets.APPLE_API_KEY_PRIVATE_KEY }}
+        run: |
+          if [ -n "$APPLE_API_KEY_PRIVATE_KEY" ]; then
+            mkdir -p "$RUNNER_TEMP/apple-notary"
+            printf '%s' "$APPLE_API_KEY_PRIVATE_KEY" > "$RUNNER_TEMP/apple-notary/AuthKey.p8"
+            echo "APPLE_API_KEY_PATH=$RUNNER_TEMP/apple-notary/AuthKey.p8" >> "$GITHUB_ENV"
+          fi
+
       - name: Build web app
         run: npm run build
 
@@ -197,10 +271,168 @@ jobs:
         uses: tauri-apps/tauri-action@action-v0.6.2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         with:
           tauriScript: npm run tauri
+          args: ${{ matrix.args }}
           tagName: ${{ needs.prepare.outputs.tag }}
           releaseName: "MyKVM ${{ needs.prepare.outputs.tag }}"
           releaseBody: ${{ needs.prepare.outputs.release_notes }}
           releaseDraft: false
           prerelease: false
+          uploadUpdaterJson: true
+          uploadUpdaterSignatures: true
+
+      - name: Verify macOS signing and notarization
+        if: matrix.name == 'macos'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          app_path="$(find src-tauri/target -path '*/release/bundle/macos/*.app' -type d | head -n 1)"
+          dmg_path="$(find src-tauri/target -path '*/release/bundle/dmg/*.dmg' -type f | head -n 1)"
+          tar_path="$(find src-tauri/target -path '*/release/bundle/macos/*.app.tar.gz' -type f | head -n 1)"
+
+          if [ -z "$app_path" ]; then
+            echo "::error::No macOS .app bundle was produced."
+            exit 1
+          fi
+
+          if [ -z "$dmg_path" ]; then
+            echo "::error::No macOS .dmg installer was produced."
+            exit 1
+          fi
+
+          if [ -z "$tar_path" ] || [ ! -f "$tar_path.sig" ]; then
+            echo "::error::No signed macOS updater .app.tar.gz artifact was produced."
+            exit 1
+          fi
+
+          codesign --verify --deep --strict --verbose=2 "$app_path"
+          spctl -a -t exec -vv "$app_path"
+          codesign --verify --verbose=2 "$dmg_path"
+          spctl -a -t open --context context:primary-signature -vv "$dmg_path"
+
+  assemble-latest-json:
+    name: Assemble updater manifest
+    needs:
+      - prepare
+      - build
+    if: needs.prepare.outputs.should_release == 'true'
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p dl
+          gh release download "$TAG" --dir dl --repo "$GITHUB_REPOSITORY" --clobber
+          find dl -maxdepth 1 -type f -printf '%f\n' | sort
+
+      - name: Generate latest.json
+        env:
+          REPO: ${{ github.repository }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          const fs = require('fs');
+          const path = require('path');
+
+          const dir = 'dl';
+          const files = fs.readdirSync(dir);
+          const tag = process.env.TAG;
+          const version = process.env.VERSION;
+          const baseUrl = `https://github.com/${process.env.REPO}/releases/download/${tag}`;
+          const assetUrl = (name) => `${baseUrl}/${encodeURIComponent(name)}`;
+          const signatureFor = (name) => {
+            const sigName = `${name}.sig`;
+            return files.includes(sigName)
+              ? fs.readFileSync(path.join(dir, sigName), 'utf8').trim()
+              : null;
+          };
+          const platforms = {};
+
+          const addPlatform = (key, assetName) => {
+            const signature = signatureFor(assetName);
+            if (!signature) {
+              console.warn(`Skipping ${key}: missing signature for ${assetName}`);
+              return false;
+            }
+
+            platforms[key] = {
+              signature,
+              url: assetUrl(assetName),
+            };
+            return true;
+          };
+
+          const macAsset = files.find((name) => /\.app\.tar\.gz$/i.test(name));
+          if (!macAsset) {
+            throw new Error('No macOS updater .app.tar.gz asset found.');
+          }
+          const macAdded =
+            addPlatform('darwin-aarch64', macAsset) &&
+            addPlatform('darwin-x86_64', macAsset);
+          if (!macAdded) {
+            throw new Error(`Missing signature for macOS updater asset ${macAsset}.`);
+          }
+
+          const windowsAsset = files.find(
+            (name) =>
+              !name.endsWith('.sig') &&
+              (/setup\.exe$/i.test(name) || /\.msi$/i.test(name)),
+          );
+          if (windowsAsset) {
+            addPlatform('windows-x86_64', windowsAsset);
+          }
+
+          const linuxAsset = files.find(
+            (name) =>
+              !name.endsWith('.sig') &&
+              /\.AppImage$/i.test(name) &&
+              /(amd64|x86_64)/i.test(name),
+          );
+          if (linuxAsset) {
+            addPlatform('linux-x86_64', linuxAsset);
+          }
+
+          fs.writeFileSync(
+            'latest.json',
+            `${JSON.stringify(
+              {
+                version,
+                notes: `Release ${tag}`,
+                pub_date: new Date().toISOString(),
+                platforms,
+              },
+              null,
+              2,
+            )}\n`,
+          );
+
+          console.log(fs.readFileSync('latest.json', 'utf8'));
+          NODE
+
+      - name: Upload latest.json
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -euo pipefail
+          gh release upload "$TAG" latest.json --clobber --repo "$GITHUB_REPOSITORY"

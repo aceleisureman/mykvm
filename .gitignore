@@ -9,6 +9,7 @@ lerna-debug.log*
 
 node_modules
 .vite
+.tauri
 dist
 dist-ssr
 src-tauri/target
