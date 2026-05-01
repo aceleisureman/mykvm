@@ -1,0 +1,82 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "tauri:dev",
+      "type": "shell",
+      "command": "npm",
+      "args": ["run", "tauri:dev"],
+      "isBackground": true,
+      "problemMatcher": [],
+      "presentation": {
+        "panel": "dedicated",
+        "reveal": "always",
+        "clear": true
+      },
+      "windows": {
+        "command": "powershell.exe",
+        "args": [
+          "-NoProfile",
+          "-ExecutionPolicy",
+          "Bypass",
+          "-File",
+          "${workspaceFolder}\\scripts\\run-tauri-dev.ps1"
+        ]
+      },
+      "osx": {
+        "command": "sh",
+        "args": ["${workspaceFolder}/scripts/run-tauri-dev.sh"]
+      },
+      "linux": {
+        "command": "sh",
+        "args": ["${workspaceFolder}/scripts/run-tauri-dev.sh"]
+      }
+    },
+    {
+      "label": "check-dev-env",
+      "type": "shell",
+      "command": "npm.cmd",
+      "args": ["run", "build"],
+      "problemMatcher": [],
+      "presentation": {
+        "panel": "dedicated",
+        "reveal": "always",
+        "clear": true
+      },
+      "windows": {
+        "command": "powershell.exe",
+        "args": [
+          "-NoProfile",
+          "-ExecutionPolicy",
+          "Bypass",
+          "-File",
+          "${workspaceFolder}\\scripts\\check-dev-env.ps1"
+        ]
+      },
+      "osx": {
+        "command": "sh",
+        "args": ["${workspaceFolder}/scripts/check-dev-env.sh"]
+      },
+      "linux": {
+        "command": "sh",
+        "args": ["${workspaceFolder}/scripts/check-dev-env.sh"]
+      }
+    },
+    {
+      "label": "tauri:build",
+      "type": "shell",
+      "command": "npm",
+      "args": ["run", "tauri:build"],
+      "problemMatcher": [],
+      "presentation": {
+        "panel": "dedicated",
+        "reveal": "always",
+        "clear": true
+      },
+      "windows": {
+        "command": "npm.cmd",
+        "args": ["run", "tauri:build"]
+      }
+    }
+  ]
+}

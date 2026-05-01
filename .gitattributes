@@ -1,0 +1,7 @@
+src-tauri/Cargo.toml text eol=lf
+src-tauri/Cargo.lock text eol=lf
+src-tauri/tauri*.conf.json text eol=lf
+.gitattributes text eol=lf
+.gitignore text eol=lf
+*.md text eol=lf
+.github/workflows/*.yml text eol=lf

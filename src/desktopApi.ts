@@ -1,0 +1,251 @@
+import { invoke, isTauri } from '@tauri-apps/api/core'
+import { REPOSITORY_URL } from './constants'
+import { defaultLayout } from './defaultLayout'
+import type { AppStateSnapshot, DiscoveryStatus, PerformanceSample, RuntimeStatus } from './runtime'
+import type { LayoutState } from './types'
+
+const FALLBACK_RUNTIME: RuntimeStatus = {
+  started: false,
+  transport: {
+    state: 'stubbed',
+    detail: 'Desktop fallback mode does not start discovery, input capture, or injection.',
+  },
+  capture: {
+    state: 'stubbed',
+    detail: 'Global input capture will be implemented in the Rust layer.',
+  },
+  inject: {
+    state: 'stubbed',
+    detail: 'System input injection will be implemented in the Rust layer.',
+  },
+  clipboard: {
+    state: 'stubbed',
+    detail: '剪贴板同步需要在 Tauri 桌面端运行。',
+  },
+  privilege: {
+    isElevated: false,
+    canElevate: false,
+    detail: 'Administrator restart is available only in the Windows desktop runtime.',
+  },
+  discovery: {
+    state: 'idle',
+    detail: 'LAN discovery is available only in the Tauri desktop runtime.',
+    port: 47833,
+    localPeer: {
+      id: 'browser-preview',
+      name: 'Desktop fallback',
+      platform: navigator.platform,
+      host: window.location.hostname || 'localhost',
+      ip: '127.0.0.1',
+      transportPort: defaultLayout.transportPort,
+      screenCount: 1,
+      inputReady: false,
+      screens: [
+        {
+          id: 'browser-display-1',
+          name: 'Browser display',
+          x: defaultLayout.devices[0].screens[0].x,
+          y: defaultLayout.devices[0].screens[0].y,
+          width: defaultLayout.devices[0].screens[0].width,
+          height: defaultLayout.devices[0].screens[0].height,
+          scale: defaultLayout.devices[0].screens[0].scale,
+          isPrimary: true,
+        },
+      ],
+      appVersion: '0.1.0',
+      lastSeenMs: Date.now(),
+    },
+    peers: [],
+  },
+}
+
+let browserRuntime = FALLBACK_RUNTIME
+let browserClipboardText = ''
+
+export async function loadAppState(): Promise<AppStateSnapshot> {
+  if (!isTauri()) {
+    return {
+      layout: defaultLayout,
+      runtime: browserRuntime,
+    }
+  }
+
+  return invoke<AppStateSnapshot>('load_app_state')
+}
+
+export async function saveLayout(layout: LayoutState): Promise<LayoutState> {
+  if (!isTauri()) {
+    return layout
+  }
+
+  return invoke<LayoutState>('save_layout', { layout })
+}
+
+export async function startRuntime(): Promise<RuntimeStatus> {
+  if (!isTauri()) {
+    browserRuntime = {
+      started: true,
+      transport: {
+        state: 'ready',
+        detail: 'Desktop fallback does not start native discovery, input capture, or injection.',
+      },
+      capture: FALLBACK_RUNTIME.capture,
+      inject: FALLBACK_RUNTIME.inject,
+      clipboard: FALLBACK_RUNTIME.clipboard,
+      privilege: FALLBACK_RUNTIME.privilege,
+      discovery: {
+        ...FALLBACK_RUNTIME.discovery,
+        detail: 'Desktop fallback cannot scan the LAN. Start the Tauri desktop app to use UDP discovery.',
+        localPeer: {
+          ...FALLBACK_RUNTIME.discovery.localPeer,
+          lastSeenMs: Date.now(),
+        },
+      },
+    }
+
+    return browserRuntime
+  }
+
+  return invoke<RuntimeStatus>('start_runtime')
+}
+
+export async function readRuntimeStatus(): Promise<RuntimeStatus> {
+  if (!isTauri()) {
+    browserRuntime = {
+      ...browserRuntime,
+      discovery: {
+        ...browserRuntime.discovery,
+        localPeer: {
+          ...browserRuntime.discovery.localPeer,
+          lastSeenMs: Date.now(),
+        },
+      },
+    }
+
+    return browserRuntime
+  }
+
+  return invoke<RuntimeStatus>('read_runtime_status')
+}
+
+export async function stopRuntime(): Promise<RuntimeStatus> {
+  if (!isTauri()) {
+    browserRuntime = FALLBACK_RUNTIME
+    return browserRuntime
+  }
+
+  return invoke<RuntimeStatus>('stop_runtime')
+}
+
+export async function scanLanPeers(): Promise<DiscoveryStatus> {
+  if (!isTauri()) {
+    return browserRuntime.discovery
+  }
+
+  return invoke<DiscoveryStatus>('scan_lan_peers')
+}
+
+export async function probeLanPeer(host: string) {
+  if (!isTauri()) {
+    throw new Error('Direct peer probing is available only in the Tauri desktop runtime.')
+  }
+
+  return invoke<DiscoveryStatus['localPeer']>('probe_lan_peer', { host })
+}
+
+export async function readClipboardText(): Promise<string> {
+  if (!isTauri()) {
+    return browserClipboardText
+  }
+
+  return invoke<string>('read_clipboard_text')
+}
+
+export async function writeClipboardText(text: string): Promise<void> {
+  if (!isTauri()) {
+    browserClipboardText = text
+    return
+  }
+
+  await invoke('write_clipboard_text', { text })
+}
+
+export async function readPerformanceSample(): Promise<PerformanceSample> {
+  if (!isTauri()) {
+    const memory = (performance as Performance & {
+      memory?: {
+        usedJSHeapSize: number
+        jsHeapSizeLimit: number
+      }
+    }).memory
+    const usedMb = memory ? memory.usedJSHeapSize / 1024 / 1024 : 96 + Math.sin(Date.now() / 2000) * 12
+
+    return {
+      timestampMs: Date.now(),
+      appCpuPercent: Math.max(2, Math.min(100, 18 + Math.sin(Date.now() / 1500) * 10)),
+      appMemoryMb: usedMb,
+      transportPackets: Math.round(Date.now() / 1000) % 700,
+      inputEvents: Math.round(Date.now() / 80) % 1200,
+      clipboardPackets: Math.round(Date.now() / 5000) % 80,
+    }
+  }
+
+  return invoke<PerformanceSample>('read_performance_sample')
+}
+
+export async function restartAsAdmin(): Promise<void> {
+  if (!isTauri()) {
+    return
+  }
+
+  await invoke('restart_as_admin')
+}
+
+export async function syncWindowChrome(theme: 'dark' | 'light'): Promise<void> {
+  if (!isTauri()) {
+    return
+  }
+
+  await invoke('sync_window_chrome', { theme })
+}
+
+export async function minimizeMainWindow(): Promise<void> {
+  if (!isTauri()) {
+    return
+  }
+
+  await invoke('minimize_main_window')
+}
+
+export async function hideMainWindow(): Promise<void> {
+  if (!isTauri()) {
+    return
+  }
+
+  await invoke('hide_main_window')
+}
+
+export async function startWindowDrag(): Promise<void> {
+  if (!isTauri()) {
+    return
+  }
+
+  await invoke('start_window_drag')
+}
+
+export async function toggleMaximizeMainWindow(): Promise<void> {
+  if (!isTauri()) {
+    return
+  }
+
+  await invoke('toggle_maximize_main_window')
+}
+
+export async function openRepositoryUrl(): Promise<void> {
+  if (!isTauri()) {
+    window.open(REPOSITORY_URL, '_blank', 'noopener,noreferrer')
+    return
+  }
+
+  await invoke('open_repository_url')
+}

@@ -1,0 +1,58 @@
+export type Platform = 'windows' | 'macos' | 'unknown'
+
+export type ScreenEdge = 'left' | 'right' | 'top' | 'bottom'
+
+export type MachineRole = 'unset' | 'server' | 'client'
+
+export type AppLanguage = 'cn' | 'en'
+
+export type ThemeMode = 'system' | 'dark' | 'light'
+
+export type TransportPortMode = 'auto' | 'fixed'
+
+export interface Screen {
+  id: string
+  deviceId: string
+  name: string
+  x: number
+  y: number
+  width: number
+  height: number
+  scale: number
+  isPrimary: boolean
+}
+
+export interface Device {
+  id: string
+  name: string
+  platform: Platform
+  host: string
+  transportPort: number
+  color: string
+  online: boolean
+  inputReady: boolean
+  role: 'local' | 'server' | 'client'
+  source?: 'detected' | 'manual'
+  screens: Screen[]
+}
+
+export interface LayoutState {
+  devices: Device[]
+  activeDeviceId: string
+  selectedScreenId: string
+  inputMode: 'control' | 'receive'
+  machineRole: MachineRole
+  clipboardSync: boolean
+  language: AppLanguage
+  themeMode: ThemeMode
+  performanceMonitor: boolean
+  transportPortMode: TransportPortMode
+  transportPort: number
+}
+
+export interface ScreenAdjacency {
+  fromScreenId: string
+  toScreenId: string
+  fromEdge: ScreenEdge
+  toEdge: ScreenEdge
+}

@@ -1,0 +1,2629 @@
+use std::{
+    net::{SocketAddr, UdpSocket},
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        mpsc, Arc, Mutex, OnceLock,
+    },
+    thread,
+    time::{Duration, Instant},
+};
+
+use serde::{Deserialize, Serialize};
+
+use crate::{broadcast_addrs, Device, LayoutState, NativeStageStatus, Screen};
+
+const INPUT_PROTOCOL: &str = "mykvm.input.v1";
+const EDGE_TOLERANCE: i32 = 80;
+const CROSSING_MARGIN: f64 = 4.0;
+const MIN_CROSSING_DELTA: f64 = 1.0;
+const CROSSING_AXIS_DOMINANCE: f64 = 0.6;
+const MOUSE_MOVE_SEND_INTERVAL_MS: u64 = 8;
+const DRAG_MOVE_SEND_INTERVAL_MS: u64 = 8;
+const LEFT_BUTTON_MASK: u64 = 1;
+const RIGHT_BUTTON_MASK: u64 = 1 << 1;
+const MIDDLE_BUTTON_MASK: u64 = 1 << 2;
+
+static INPUT_TX_FAILURES: AtomicU64 = AtomicU64::new(0);
+static INPUT_TX_SKIPS: AtomicU64 = AtomicU64::new(0);
+static INPUT_BROADCAST_ONLY_DEVICES: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+static REMOTE_MOUSE_STATE: OnceLock<Mutex<RemoteMouseState>> = OnceLock::new();
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Edge {
+    Left,
+    Right,
+    Top,
+    Bottom,
+}
+
+#[derive(Debug, Clone)]
+struct InputTarget {
+    device_id: String,
+    target_addr: String,
+    target_port: u16,
+    screen_id: String,
+    local_screen: Screen,
+    layout_local_screen: Screen,
+    remote_screen: Screen,
+    edge: Edge,
+}
+
+#[derive(Debug, Clone)]
+struct ActiveTarget {
+    target: InputTarget,
+    x: f64,
+    y: f64,
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    invert_y: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct ClipboardTarget {
+    pub device_id: String,
+    pub addr: String,
+    pub expires_at: Option<Instant>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct InputPacket {
+    protocol: String,
+    #[serde(default)]
+    target_device_id: String,
+    #[serde(default)]
+    origin_device_id: String,
+    #[serde(default)]
+    origin_port: u16,
+    event: InputEvent,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+enum InputEvent {
+    MouseMove { screen_id: String, x: i32, y: i32 },
+    MouseButton { button: MouseButton, down: bool },
+    Scroll { delta_x: i32, delta_y: i32 },
+    Key { key_code: u16, down: bool },
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum MouseButton {
+    Left,
+    Right,
+    Middle,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct RemoteMouseState {
+    x: i32,
+    y: i32,
+    buttons: u64,
+}
+
+pub fn stopped_capture_status() -> NativeStageStatus {
+    NativeStageStatus {
+        state: "stubbed".into(),
+        detail: "Input sharing is stopped.".into(),
+    }
+}
+
+pub fn stopped_inject_status() -> NativeStageStatus {
+    NativeStageStatus {
+        state: "stubbed".into(),
+        detail: "Input injection is stopped.".into(),
+    }
+}
+
+pub fn start_input_runtime(
+    layout: LayoutState,
+    layout_state: Arc<Mutex<LayoutState>>,
+    native_layout: LayoutState,
+    stop: Arc<AtomicBool>,
+    remote_active: Arc<AtomicBool>,
+    clipboard_target: Arc<Mutex<Option<ClipboardTarget>>>,
+    input_events: Arc<AtomicU64>,
+) -> (NativeStageStatus, NativeStageStatus) {
+    let inject_status = input_receive_status(&layout);
+    if layout.input_mode == "receive" {
+        remote_active.store(false, Ordering::Relaxed);
+        clear_clipboard_target(&clipboard_target);
+        return (receive_only_status(), inject_status);
+    }
+
+    let targets = build_input_targets(&layout, &native_layout);
+    let capture_status = start_input_capture(
+        targets,
+        layout_state,
+        native_layout,
+        stop,
+        remote_active,
+        clipboard_target,
+        input_events,
+    );
+
+    (capture_status, inject_status)
+}
+
+pub fn input_runtime_status(
+    layout: &LayoutState,
+    native_layout: &LayoutState,
+) -> (NativeStageStatus, NativeStageStatus) {
+    let targets = build_input_targets(layout, native_layout);
+    let capture = if layout.input_mode == "receive" {
+        receive_only_status()
+    } else if targets.is_empty() {
+        no_target_status(layout)
+    } else if cfg!(any(target_os = "macos", target_os = "windows")) {
+        NativeStageStatus {
+            state: "ready".into(),
+            detail: format!(
+                "控制端已就绪，{} 条远端贴边可用于鼠标和键盘切换。",
+                targets.len()
+            ),
+        }
+    } else {
+        unsupported_capture_status()
+    };
+
+    (
+        capture,
+        NativeStageStatus {
+            state: "ready".into(),
+            detail: input_receive_status(layout).detail,
+        },
+    )
+}
+
+fn input_receive_status(layout: &LayoutState) -> NativeStageStatus {
+    NativeStageStatus {
+        state: "ready".into(),
+        detail: format!(
+            "Receiving shared input on the MessagePack transport UDP {}.",
+            layout.transport_port
+        ),
+    }
+}
+
+fn start_input_capture(
+    targets: Vec<InputTarget>,
+    layout_state: Arc<Mutex<LayoutState>>,
+    native_layout: LayoutState,
+    stop: Arc<AtomicBool>,
+    remote_active: Arc<AtomicBool>,
+    clipboard_target: Arc<Mutex<Option<ClipboardTarget>>>,
+    input_events: Arc<AtomicU64>,
+) -> NativeStageStatus {
+    start_platform_capture(
+        targets,
+        layout_state,
+        native_layout,
+        stop,
+        remote_active,
+        clipboard_target,
+        input_events,
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn start_platform_capture(
+    targets: Vec<InputTarget>,
+    layout_state: Arc<Mutex<LayoutState>>,
+    native_layout: LayoutState,
+    stop: Arc<AtomicBool>,
+    remote_active: Arc<AtomicBool>,
+    clipboard_target: Arc<Mutex<Option<ClipboardTarget>>>,
+    input_events: Arc<AtomicU64>,
+) -> NativeStageStatus {
+    use core_foundation::runloop::{kCFRunLoopDefaultMode, CFRunLoop};
+    use core_graphics::event::{
+        CGEventTap, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement, CGEventType,
+    };
+
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let target_count = targets.len();
+
+    thread::spawn(move || {
+        let socket = match UdpSocket::bind("0.0.0.0:0") {
+            Ok(socket) => socket,
+            Err(error) => {
+                let _ = ready_tx.send(Err(format!("failed to open shared input sender: {error}")));
+                return;
+            }
+        };
+
+        let local_y_bounds = local_y_bounds(&targets);
+        let context = Arc::new(MacCaptureContext {
+            socket,
+            layout_state,
+            native_layout,
+            active: Mutex::new(None),
+            remote_active,
+            clipboard_target,
+            input_events,
+            anchor: Mutex::new(None),
+            cursor_hidden: Mutex::new(false),
+            last_mouse_move_sent: Mutex::new(None),
+            remote_button_mask: AtomicU64::new(0),
+            pressed_modifiers: Mutex::new(Vec::new()),
+            local_y_bounds,
+        });
+        let callback_context = Arc::clone(&context);
+        let event_types = vec![
+            CGEventType::MouseMoved,
+            CGEventType::LeftMouseDragged,
+            CGEventType::RightMouseDragged,
+            CGEventType::OtherMouseDragged,
+            CGEventType::LeftMouseDown,
+            CGEventType::LeftMouseUp,
+            CGEventType::RightMouseDown,
+            CGEventType::RightMouseUp,
+            CGEventType::OtherMouseDown,
+            CGEventType::OtherMouseUp,
+            CGEventType::ScrollWheel,
+            CGEventType::KeyDown,
+            CGEventType::KeyUp,
+            CGEventType::FlagsChanged,
+        ];
+
+        let result = CGEventTap::with_enabled(
+            CGEventTapLocation::HID,
+            CGEventTapPlacement::HeadInsertEventTap,
+            CGEventTapOptions::Default,
+            event_types,
+            move |_proxy, event_type, event| {
+                handle_macos_event(&callback_context, event_type, event)
+            },
+            || {
+                let _ = ready_tx.send(Ok(()));
+                while !stop.load(Ordering::Relaxed) {
+                    let _ = CFRunLoop::run_in_mode(
+                        unsafe { kCFRunLoopDefaultMode },
+                        Duration::from_millis(100),
+                        false,
+                    );
+                }
+            },
+        );
+
+        show_macos_cursor_if_needed(&context);
+        context.remote_active.store(false, Ordering::Relaxed);
+        clear_clipboard_target(&context.clipboard_target);
+
+        if result.is_err() {
+            let _ = ready_tx.send(Err(
+                "macOS input capture needs Accessibility and Input Monitoring permission.".into(),
+            ));
+        }
+    });
+
+    match ready_rx.recv_timeout(Duration::from_secs(1)) {
+        Ok(Ok(())) => NativeStageStatus {
+            state: "ready".into(),
+            detail: format!("控制端已就绪，{target_count} 条远端贴边可用于鼠标和键盘切换。"),
+        },
+        Ok(Err(error)) => NativeStageStatus {
+            state: "error".into(),
+            detail: error,
+        },
+        Err(_) => NativeStageStatus {
+            state: "error".into(),
+            detail: "macOS input capture did not become ready.".into(),
+        },
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn start_platform_capture(
+    targets: Vec<InputTarget>,
+    layout_state: Arc<Mutex<LayoutState>>,
+    native_layout: LayoutState,
+    stop: Arc<AtomicBool>,
+    remote_active: Arc<AtomicBool>,
+    clipboard_target: Arc<Mutex<Option<ClipboardTarget>>>,
+    input_events: Arc<AtomicU64>,
+) -> NativeStageStatus {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        PeekMessageW, SetWindowsHookExW, UnhookWindowsHookEx, MSG, PM_REMOVE, WH_KEYBOARD_LL,
+        WH_MOUSE_LL,
+    };
+
+    let target_count = targets.len();
+    let (ready_tx, ready_rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let socket = match UdpSocket::bind("0.0.0.0:0") {
+            Ok(socket) => socket,
+            Err(error) => {
+                let _ = ready_tx.send(Err(format!("failed to open shared input sender: {error}")));
+                return;
+            }
+        };
+
+        let context = Arc::new(WindowsCaptureContext {
+            socket,
+            layout_state,
+            native_layout,
+            active: Mutex::new(None),
+            remote_active,
+            clipboard_target,
+            input_events,
+            anchor: Mutex::new(None),
+            last_point: Mutex::new(None),
+            last_mouse_move_sent: Mutex::new(None),
+            remote_button_mask: AtomicU64::new(0),
+            cursor_hide_calls: Mutex::new(0),
+        });
+
+        if let Ok(mut current) = WINDOWS_CAPTURE_CONTEXT.lock() {
+            *current = Some(Arc::clone(&context));
+        }
+
+        let mouse_hook = unsafe {
+            SetWindowsHookExW(
+                WH_MOUSE_LL,
+                Some(windows_mouse_proc),
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if mouse_hook.is_null() {
+            context.remote_active.store(false, Ordering::Relaxed);
+            clear_clipboard_target(&context.clipboard_target);
+            clear_windows_capture_context();
+            let _ = ready_tx.send(Err("failed to install Windows mouse hook".into()));
+            return;
+        }
+
+        let keyboard_hook = unsafe {
+            SetWindowsHookExW(
+                WH_KEYBOARD_LL,
+                Some(windows_keyboard_proc),
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if keyboard_hook.is_null() {
+            unsafe {
+                let _ = UnhookWindowsHookEx(mouse_hook);
+            }
+            context.remote_active.store(false, Ordering::Relaxed);
+            clear_clipboard_target(&context.clipboard_target);
+            clear_windows_capture_context();
+            let _ = ready_tx.send(Err("failed to install Windows keyboard hook".into()));
+            return;
+        }
+
+        let _ = ready_tx.send(Ok(()));
+        let mut message = MSG::default();
+        while !stop.load(Ordering::Relaxed) {
+            unsafe {
+                while PeekMessageW(&mut message, std::ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {}
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        unsafe {
+            let _ = UnhookWindowsHookEx(mouse_hook);
+            let _ = UnhookWindowsHookEx(keyboard_hook);
+        }
+        show_windows_cursor_if_needed(&context);
+        context.remote_active.store(false, Ordering::Relaxed);
+        clear_clipboard_target(&context.clipboard_target);
+        clear_windows_capture_context();
+    });
+
+    match ready_rx.recv_timeout(Duration::from_secs(1)) {
+        Ok(Ok(())) => NativeStageStatus {
+            state: "ready".into(),
+            detail: format!("控制端已就绪，{target_count} 条远端贴边可用于鼠标和键盘切换。"),
+        },
+        Ok(Err(error)) => NativeStageStatus {
+            state: "error".into(),
+            detail: error,
+        },
+        Err(_) => NativeStageStatus {
+            state: "error".into(),
+            detail: "Windows input capture did not become ready.".into(),
+        },
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+#[cfg(not(target_os = "windows"))]
+fn start_platform_capture(
+    _targets: Vec<InputTarget>,
+    _layout_state: Arc<Mutex<LayoutState>>,
+    _native_layout: LayoutState,
+    _stop: Arc<AtomicBool>,
+    remote_active: Arc<AtomicBool>,
+    clipboard_target: Arc<Mutex<Option<ClipboardTarget>>>,
+    _input_events: Arc<AtomicU64>,
+) -> NativeStageStatus {
+    remote_active.store(false, Ordering::Relaxed);
+    clear_clipboard_target(&clipboard_target);
+    unsupported_capture_status()
+}
+
+fn no_target_status(layout: &LayoutState) -> NativeStageStatus {
+    let remote_count = layout
+        .devices
+        .iter()
+        .filter(|device| device.role != "local")
+        .count();
+    let online_remote_count = layout
+        .devices
+        .iter()
+        .filter(|device| device.role != "local" && device.online)
+        .count();
+    let detail = if remote_count == 0 {
+        "控制模式已开启，但布局里还没有远端设备。先让对方电脑运行 mykvm，再在 LAN devices 里 Scan 并 Add。"
+    } else if online_remote_count == 0 {
+        "控制模式已开启，但远端设备都被标记为离线。把要控制的设备切回 online 后再启动运行时。"
+    } else {
+        "控制模式已开启，且已有在线远端设备，但屏幕还没有和本机贴边。拖动远端显示器贴住本机边缘后才会生成切屏目标。"
+    };
+
+    NativeStageStatus {
+        state: "idle".into(),
+        detail: detail.into(),
+    }
+}
+
+fn receive_only_status() -> NativeStageStatus {
+    NativeStageStatus {
+        state: "idle".into(),
+        detail: "当前是仅接收模式：会接收远端输入，但不会捕获本机鼠标和键盘。".into(),
+    }
+}
+
+fn unsupported_capture_status() -> NativeStageStatus {
+    NativeStageStatus {
+        state: "stubbed".into(),
+        detail: "Global input capture is not implemented on this platform.".into(),
+    }
+}
+
+fn build_input_targets(layout: &LayoutState, native_layout: &LayoutState) -> Vec<InputTarget> {
+    let Some(local_device) = layout.devices.iter().find(|device| device.role == "local") else {
+        return Vec::new();
+    };
+    let native_device = native_layout
+        .devices
+        .iter()
+        .find(|device| device.role == "local")
+        .or_else(|| native_layout.devices.first());
+
+    let local_screens = &local_device.screens;
+    let mut targets = Vec::new();
+
+    for device in layout
+        .devices
+        .iter()
+        .filter(|device| device.role != "local" && device.online && device.input_ready)
+    {
+        for layout_local_screen in local_screens {
+            let native_local_screen = native_device
+                .and_then(|device| {
+                    device
+                        .screens
+                        .iter()
+                        .find(|screen| screen.id == layout_local_screen.id)
+                })
+                .unwrap_or(layout_local_screen);
+
+            for remote_screen in &device.screens {
+                if let Some(edge) = touching_edge(layout_local_screen, remote_screen) {
+                    targets.push(InputTarget {
+                        device_id: device.id.clone(),
+                        target_addr: format!("{}:{}", device.host, device.transport_port),
+                        target_port: device.transport_port,
+                        screen_id: peer_screen_id(device, remote_screen),
+                        local_screen: native_local_screen.clone(),
+                        layout_local_screen: layout_local_screen.clone(),
+                        remote_screen: remote_screen.clone(),
+                        edge,
+                    });
+                }
+            }
+        }
+    }
+
+    targets
+}
+
+fn current_input_targets(
+    layout_state: &Arc<Mutex<LayoutState>>,
+    native_layout: &LayoutState,
+) -> Vec<InputTarget> {
+    layout_state
+        .lock()
+        .map(|layout| build_input_targets(&layout, native_layout))
+        .unwrap_or_default()
+}
+
+fn touching_edge(local: &Screen, remote: &Screen) -> Option<Edge> {
+    if near(local.x + local.width, remote.x)
+        && ranges_overlap(
+            local.y,
+            local.y + local.height,
+            remote.y,
+            remote.y + remote.height,
+        )
+    {
+        return Some(Edge::Right);
+    }
+
+    if near(local.x, remote.x + remote.width)
+        && ranges_overlap(
+            local.y,
+            local.y + local.height,
+            remote.y,
+            remote.y + remote.height,
+        )
+    {
+        return Some(Edge::Left);
+    }
+
+    if near(local.y + local.height, remote.y)
+        && ranges_overlap(
+            local.x,
+            local.x + local.width,
+            remote.x,
+            remote.x + remote.width,
+        )
+    {
+        return Some(Edge::Bottom);
+    }
+
+    if near(local.y, remote.y + remote.height)
+        && ranges_overlap(
+            local.x,
+            local.x + local.width,
+            remote.x,
+            remote.x + remote.width,
+        )
+    {
+        return Some(Edge::Top);
+    }
+
+    None
+}
+
+fn near(a: i32, b: i32) -> bool {
+    (a - b).abs() <= EDGE_TOLERANCE
+}
+
+fn ranges_overlap(a_start: i32, a_end: i32, b_start: i32, b_end: i32) -> bool {
+    i32::min(a_end, b_end) - i32::max(a_start, b_start) > EDGE_TOLERANCE
+}
+
+fn peer_screen_id(device: &Device, screen: &Screen) -> String {
+    screen
+        .id
+        .strip_prefix(&format!("{}-", device.id))
+        .unwrap_or(&screen.id)
+        .to_string()
+}
+
+fn send_packet(
+    socket: &UdpSocket,
+    target: &InputTarget,
+    event: InputEvent,
+    layout_state: &Arc<Mutex<LayoutState>>,
+    input_events: &Arc<AtomicU64>,
+) -> bool {
+    let (origin_device_id, origin_port) = input_origin(layout_state);
+    let packet = InputPacket {
+        protocol: INPUT_PROTOCOL.into(),
+        target_device_id: target.device_id.clone(),
+        origin_device_id,
+        origin_port,
+        event,
+    };
+    let Some((target_addr, target_port)) = live_target_endpoint(target, layout_state) else {
+        INPUT_TX_SKIPS.fetch_add(1, Ordering::Relaxed);
+        return false;
+    };
+
+    let payload = match rmp_serde::to_vec_named(&packet) {
+        Ok(payload) => payload,
+        Err(error) => {
+            log::warn!(
+                "input tx encode failed target={} error={}",
+                target_addr,
+                error
+            );
+            return false;
+        }
+    };
+
+    let direct_send = !target_prefers_broadcast(&target.device_id);
+    if direct_send {
+        match socket.send_to(&payload, target_addr.as_str()) {
+            Ok(bytes) => {
+                let _ = bytes;
+                input_events.fetch_add(1, Ordering::Relaxed);
+                return true;
+            }
+            Err(error) => {
+                INPUT_TX_FAILURES.fetch_add(1, Ordering::Relaxed);
+                let error_text = error.to_string();
+
+                if send_broadcast_packet(socket, &payload, target_port, input_events) {
+                    remember_broadcast_fallback(&target.device_id);
+                    return true;
+                }
+
+                mark_target_offline(layout_state, target, &error_text);
+                return false;
+            }
+        }
+    }
+
+    if send_broadcast_packet(socket, &payload, target_port, input_events) {
+        return true;
+    }
+
+    mark_target_offline(layout_state, target, "broadcast send failed");
+    false
+}
+
+fn input_origin(layout_state: &Arc<Mutex<LayoutState>>) -> (String, u16) {
+    let Ok(layout) = layout_state.lock() else {
+        return (String::new(), 0);
+    };
+    let device_id = local_device(&layout)
+        .map(|device| device.id.clone())
+        .unwrap_or_default();
+
+    (device_id, layout.transport_port)
+}
+
+fn send_broadcast_packet(
+    socket: &UdpSocket,
+    payload: &[u8],
+    target_port: u16,
+    input_events: &Arc<AtomicU64>,
+) -> bool {
+    let Some(target_addr) = broadcast_addrs(target_port).into_iter().next() else {
+        return false;
+    };
+
+    let _ = socket.set_broadcast(true);
+    match socket.send_to(payload, target_addr.as_str()) {
+        Ok(bytes) => {
+            let _ = bytes;
+            input_events.fetch_add(1, Ordering::Relaxed);
+            true
+        }
+        Err(error) => {
+            let _ = error;
+            INPUT_TX_FAILURES.fetch_add(1, Ordering::Relaxed);
+            false
+        }
+    }
+}
+
+fn broadcast_fallbacks() -> &'static Mutex<Vec<String>> {
+    INPUT_BROADCAST_ONLY_DEVICES.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn target_prefers_broadcast(device_id: &str) -> bool {
+    broadcast_fallbacks()
+        .lock()
+        .map(|devices| devices.iter().any(|id| id == device_id))
+        .unwrap_or(false)
+}
+
+fn remember_broadcast_fallback(device_id: &str) {
+    if let Ok(mut devices) = broadcast_fallbacks().lock() {
+        if devices.iter().any(|id| id == device_id) {
+            return;
+        }
+        if devices.len() >= 32 {
+            devices.remove(0);
+        }
+        devices.push(device_id.to_string());
+    }
+}
+
+fn mark_target_offline(
+    layout_state: &Arc<Mutex<LayoutState>>,
+    target: &InputTarget,
+    _reason: &str,
+) {
+    let Ok(mut layout) = layout_state.lock() else {
+        return;
+    };
+    let Some(device) = layout
+        .devices
+        .iter_mut()
+        .find(|device| device.id == target.device_id)
+    else {
+        return;
+    };
+    if !device.online {
+        return;
+    }
+
+    device.online = false;
+}
+
+fn live_target_endpoint(
+    target: &InputTarget,
+    layout_state: &Arc<Mutex<LayoutState>>,
+) -> Option<(String, u16)> {
+    let Ok(layout) = layout_state.lock() else {
+        return Some((target.target_addr.clone(), target.target_port));
+    };
+
+    layout
+        .devices
+        .iter()
+        .find(|device| device.id == target.device_id)
+        .and_then(|device| {
+            (device.online && device.input_ready).then(|| {
+                (
+                    format!("{}:{}", device.host, device.transport_port),
+                    device.transport_port,
+                )
+            })
+        })
+}
+
+fn target_is_online(target: &InputTarget, layout_state: &Arc<Mutex<LayoutState>>) -> bool {
+    layout_state
+        .lock()
+        .ok()
+        .and_then(|layout| {
+            layout
+                .devices
+                .iter()
+                .find(|device| device.id == target.device_id)
+                .map(|device| device.online && device.input_ready)
+        })
+        .unwrap_or(false)
+}
+
+pub fn try_inject_packet_from_source(
+    layout: &LayoutState,
+    payload: &[u8],
+    source: SocketAddr,
+    input_events: &Arc<AtomicU64>,
+    local_peer_id: &str,
+    clipboard_target: &Arc<Mutex<Option<ClipboardTarget>>>,
+) -> bool {
+    let Some(packet) = decode_input_packet(payload) else {
+        return false;
+    };
+
+    if packet.protocol != INPUT_PROTOCOL {
+        return false;
+    }
+
+    if !packet_targets_local(layout, &packet.target_device_id, local_peer_id) {
+        return true;
+    }
+
+    if packet.origin_port != 0 {
+        let device_id = if packet.origin_device_id.trim().is_empty() {
+            source.ip().to_string()
+        } else {
+            packet.origin_device_id.clone()
+        };
+        set_clipboard_target(
+            clipboard_target,
+            device_id,
+            format!("{}:{}", source.ip(), packet.origin_port),
+            Some(Duration::from_secs(3)),
+        );
+    }
+
+    let injected = inject_input_event(layout, packet.event);
+    if injected {
+        input_events.fetch_add(1, Ordering::Relaxed);
+    }
+
+    true
+}
+
+fn packet_targets_local(layout: &LayoutState, target_device_id: &str, local_peer_id: &str) -> bool {
+    if target_device_id.trim().is_empty() {
+        return true;
+    }
+    if target_device_id == local_peer_id {
+        return true;
+    }
+
+    layout
+        .devices
+        .iter()
+        .any(|device| device.role == "local" && device.id == target_device_id)
+}
+
+fn decode_input_packet(payload: &[u8]) -> Option<InputPacket> {
+    rmp_serde::from_slice::<InputPacket>(payload).ok()
+}
+
+fn local_device(layout: &LayoutState) -> Option<&Device> {
+    layout
+        .devices
+        .iter()
+        .find(|device| device.role == "local")
+        .or_else(|| layout.devices.first())
+}
+
+fn local_screen_for_event<'a>(layout: &'a LayoutState, screen_id: &str) -> Option<&'a Screen> {
+    let device = local_device(layout)?;
+    device
+        .screens
+        .iter()
+        .find(|screen| screen.id == screen_id)
+        .or_else(|| device.screens.iter().find(|screen| screen.is_primary))
+        .or_else(|| device.screens.first())
+}
+
+fn remote_mouse_state() -> &'static Mutex<RemoteMouseState> {
+    REMOTE_MOUSE_STATE.get_or_init(|| Mutex::new(RemoteMouseState::default()))
+}
+
+fn update_remote_mouse_position(x: i32, y: i32) -> Option<MouseButton> {
+    let Ok(mut state) = remote_mouse_state().lock() else {
+        return None;
+    };
+    state.x = x;
+    state.y = y;
+    primary_button_from_mask(state.buttons)
+}
+
+fn update_remote_mouse_button(button: MouseButton, down: bool) -> (i32, i32) {
+    let Ok(mut state) = remote_mouse_state().lock() else {
+        return (0, 0);
+    };
+    if down {
+        state.buttons |= mouse_button_mask(button);
+    } else {
+        state.buttons &= !mouse_button_mask(button);
+    }
+    (state.x, state.y)
+}
+
+fn mouse_button_mask(button: MouseButton) -> u64 {
+    match button {
+        MouseButton::Left => LEFT_BUTTON_MASK,
+        MouseButton::Right => RIGHT_BUTTON_MASK,
+        MouseButton::Middle => MIDDLE_BUTTON_MASK,
+    }
+}
+
+fn primary_button_from_mask(mask: u64) -> Option<MouseButton> {
+    if mask & LEFT_BUTTON_MASK != 0 {
+        Some(MouseButton::Left)
+    } else if mask & RIGHT_BUTTON_MASK != 0 {
+        Some(MouseButton::Right)
+    } else if mask & MIDDLE_BUTTON_MASK != 0 {
+        Some(MouseButton::Middle)
+    } else {
+        None
+    }
+}
+
+fn inject_input_event(layout: &LayoutState, event: InputEvent) -> bool {
+    match event {
+        InputEvent::MouseMove { screen_id, x, y } => {
+            if let Some(screen) = local_screen_for_event(layout, &screen_id) {
+                let absolute_x = screen.x + x;
+                let absolute_y = screen.y + y;
+                let drag_button = update_remote_mouse_position(absolute_x, absolute_y);
+                inject_mouse_move(absolute_x, absolute_y, drag_button);
+                return true;
+            }
+            false
+        }
+        InputEvent::MouseButton { button, down } => {
+            let (x, y) = update_remote_mouse_button(button, down);
+            inject_mouse_button(button, down, x, y);
+            true
+        }
+        InputEvent::Scroll { delta_x, delta_y } => {
+            inject_scroll(delta_x, delta_y);
+            true
+        }
+        InputEvent::Key { key_code, down } => {
+            inject_key(key_code, down);
+            true
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+struct MacCaptureContext {
+    socket: UdpSocket,
+    layout_state: Arc<Mutex<LayoutState>>,
+    native_layout: LayoutState,
+    active: Mutex<Option<ActiveTarget>>,
+    remote_active: Arc<AtomicBool>,
+    clipboard_target: Arc<Mutex<Option<ClipboardTarget>>>,
+    input_events: Arc<AtomicU64>,
+    anchor: Mutex<Option<(f64, f64)>>,
+    cursor_hidden: Mutex<bool>,
+    last_mouse_move_sent: Mutex<Option<Instant>>,
+    remote_button_mask: AtomicU64,
+    pressed_modifiers: Mutex<Vec<u16>>,
+    local_y_bounds: Option<(f64, f64)>,
+}
+
+#[cfg(target_os = "windows")]
+static WINDOWS_CAPTURE_CONTEXT: Mutex<Option<Arc<WindowsCaptureContext>>> = Mutex::new(None);
+
+#[cfg(target_os = "windows")]
+struct WindowsCaptureContext {
+    socket: UdpSocket,
+    layout_state: Arc<Mutex<LayoutState>>,
+    native_layout: LayoutState,
+    active: Mutex<Option<ActiveTarget>>,
+    remote_active: Arc<AtomicBool>,
+    clipboard_target: Arc<Mutex<Option<ClipboardTarget>>>,
+    input_events: Arc<AtomicU64>,
+    anchor: Mutex<Option<(f64, f64)>>,
+    last_point: Mutex<Option<(f64, f64)>>,
+    last_mouse_move_sent: Mutex<Option<Instant>>,
+    remote_button_mask: AtomicU64,
+    cursor_hide_calls: Mutex<u8>,
+}
+
+#[cfg(target_os = "windows")]
+fn windows_capture_context() -> Option<Arc<WindowsCaptureContext>> {
+    WINDOWS_CAPTURE_CONTEXT
+        .lock()
+        .ok()
+        .and_then(|context| context.clone())
+}
+
+#[cfg(target_os = "windows")]
+fn clear_windows_capture_context() {
+    if let Ok(mut context) = WINDOWS_CAPTURE_CONTEXT.lock() {
+        *context = None;
+    }
+}
+
+fn should_send_mouse_move(last_sent: &Mutex<Option<Instant>>, dragging: bool) -> bool {
+    let interval = Duration::from_millis(if dragging {
+        DRAG_MOVE_SEND_INTERVAL_MS
+    } else {
+        MOUSE_MOVE_SEND_INTERVAL_MS
+    });
+    let Ok(mut last_sent) = last_sent.lock() else {
+        return true;
+    };
+    let now = Instant::now();
+    if last_sent
+        .as_ref()
+        .map(|sent| now.duration_since(*sent) < interval)
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    *last_sent = Some(now);
+    true
+}
+
+fn mark_mouse_move_sent(last_sent: &Mutex<Option<Instant>>) {
+    if let Ok(mut last_sent) = last_sent.lock() {
+        *last_sent = Some(Instant::now());
+    }
+}
+
+fn reset_mouse_move_timer(last_sent: &Mutex<Option<Instant>>) {
+    if let Ok(mut last_sent) = last_sent.lock() {
+        *last_sent = None;
+    }
+}
+
+fn remote_button_is_down(mask: &AtomicU64) -> bool {
+    mask.load(Ordering::Relaxed) != 0
+}
+
+fn update_remote_button_mask(mask: &AtomicU64, button: MouseButton, down: bool) {
+    let bit = mouse_button_mask(button);
+    if down {
+        mask.fetch_or(bit, Ordering::Relaxed);
+    } else {
+        mask.fetch_and(!bit, Ordering::Relaxed);
+    }
+}
+
+fn reset_remote_button_mask(mask: &AtomicU64) {
+    mask.store(0, Ordering::Relaxed);
+}
+
+pub fn clear_clipboard_target(target: &Arc<Mutex<Option<ClipboardTarget>>>) {
+    if let Ok(mut target) = target.lock() {
+        *target = None;
+    }
+}
+
+pub fn current_clipboard_target(
+    target: &Arc<Mutex<Option<ClipboardTarget>>>,
+) -> Option<ClipboardTarget> {
+    let Ok(mut target) = target.lock() else {
+        return None;
+    };
+    if target
+        .as_ref()
+        .and_then(|target| target.expires_at)
+        .map(|expires_at| Instant::now() >= expires_at)
+        .unwrap_or(false)
+    {
+        *target = None;
+        return None;
+    }
+
+    target.clone()
+}
+
+fn set_clipboard_target(
+    target: &Arc<Mutex<Option<ClipboardTarget>>>,
+    device_id: String,
+    addr: String,
+    expires_in: Option<Duration>,
+) {
+    if let Ok(mut target) = target.lock() {
+        *target = Some(ClipboardTarget {
+            device_id,
+            addr,
+            expires_at: expires_in.map(|duration| Instant::now() + duration),
+        });
+    }
+}
+
+fn set_control_clipboard_target(
+    target: &Arc<Mutex<Option<ClipboardTarget>>>,
+    active: &ActiveTarget,
+    layout_state: &Arc<Mutex<LayoutState>>,
+) {
+    if let Some((addr, _port)) = live_target_endpoint(&active.target, layout_state) {
+        set_clipboard_target(target, active.target.device_id.clone(), addr, None);
+    }
+}
+
+#[cfg(target_os = "windows")]
+unsafe extern "system" fn windows_mouse_proc(code: i32, wparam: usize, lparam: isize) -> isize {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        CallNextHookEx, MSLLHOOKSTRUCT, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP,
+        WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP,
+    };
+
+    if code < 0 {
+        return unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) };
+    }
+
+    let Some(context) = windows_capture_context() else {
+        return unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) };
+    };
+    let event = unsafe { *(lparam as *const MSLLHOOKSTRUCT) };
+    let message = wparam as u32;
+    let handled = match message {
+        WM_MOUSEMOVE => handle_windows_mouse_move(&context, event.pt.x as f64, event.pt.y as f64),
+        WM_LBUTTONDOWN | WM_LBUTTONUP | WM_RBUTTONDOWN | WM_RBUTTONUP | WM_MBUTTONDOWN
+        | WM_MBUTTONUP => handle_windows_mouse_button(&context, message),
+        WM_MOUSEWHEEL | WM_MOUSEHWHEEL => handle_windows_scroll(&context, message, event.mouseData),
+        _ => false,
+    };
+
+    if handled {
+        1
+    } else {
+        unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) }
+    }
+}
+
+#[cfg(target_os = "windows")]
+unsafe extern "system" fn windows_keyboard_proc(code: i32, wparam: usize, lparam: isize) -> isize {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        CallNextHookEx, KBDLLHOOKSTRUCT, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
+    };
+
+    if code < 0 {
+        return unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) };
+    }
+
+    let Some(context) = windows_capture_context() else {
+        return unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) };
+    };
+    let active = context
+        .active
+        .lock()
+        .ok()
+        .and_then(|active| active.as_ref().map(|active| active.target.clone()));
+    let Some(target) = active else {
+        return unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) };
+    };
+
+    let event = unsafe { *(lparam as *const KBDLLHOOKSTRUCT) };
+    let message = wparam as u32;
+    if matches!(message, WM_KEYDOWN | WM_SYSKEYDOWN | WM_KEYUP | WM_SYSKEYUP) {
+        if send_packet(
+            &context.socket,
+            &target,
+            InputEvent::Key {
+                key_code: event.vkCode as u16,
+                down: matches!(message, WM_KEYDOWN | WM_SYSKEYDOWN),
+            },
+            &context.layout_state,
+            &context.input_events,
+        ) {
+            return 1;
+        }
+    }
+
+    unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) }
+}
+
+#[cfg(target_os = "windows")]
+fn handle_windows_mouse_move(context: &WindowsCaptureContext, x: f64, y: f64) -> bool {
+    let mut active = match context.active.lock() {
+        Ok(active) => active,
+        Err(_) => return false,
+    };
+
+    if let Some(active_target) = active.as_mut() {
+        let anchor = context
+            .anchor
+            .lock()
+            .ok()
+            .and_then(|anchor| *anchor)
+            .unwrap_or((x, y));
+        let dx = x - anchor.0;
+        let dy = y - anchor.1;
+
+        if dx.abs() < 0.1 && dy.abs() < 0.1 {
+            return true;
+        }
+
+        active_target.x += dx;
+        active_target.y += dy;
+
+        if should_return_to_local(active_target, dx, dy) {
+            let point = local_return_point(active_target);
+            *active = None;
+            context.remote_active.store(false, Ordering::Relaxed);
+            clear_clipboard_target(&context.clipboard_target);
+            reset_mouse_move_timer(&context.last_mouse_move_sent);
+            reset_remote_button_mask(&context.remote_button_mask);
+            show_windows_cursor_if_needed(context);
+            set_windows_cursor(point.0.round() as i32, point.1.round() as i32);
+            if let Ok(mut anchor) = context.anchor.lock() {
+                *anchor = None;
+            }
+            return true;
+        }
+
+        active_target.x = active_target
+            .x
+            .clamp(0.0, (active_target.target.remote_screen.width - 1) as f64);
+        active_target.y = active_target
+            .y
+            .clamp(0.0, (active_target.target.remote_screen.height - 1) as f64);
+        let dragging = remote_button_is_down(&context.remote_button_mask);
+        if should_send_mouse_move(&context.last_mouse_move_sent, dragging) {
+            if !send_remote_mouse_move(
+                &context.socket,
+                active_target,
+                &context.layout_state,
+                &context.input_events,
+            ) {
+                *active = None;
+                context.remote_active.store(false, Ordering::Relaxed);
+                clear_clipboard_target(&context.clipboard_target);
+                reset_mouse_move_timer(&context.last_mouse_move_sent);
+                reset_remote_button_mask(&context.remote_button_mask);
+                show_windows_cursor_if_needed(context);
+                if let Ok(mut anchor) = context.anchor.lock() {
+                    *anchor = None;
+                }
+                return false;
+            }
+        }
+        hide_windows_cursor_if_needed(context);
+        set_windows_cursor(anchor.0.round() as i32, anchor.1.round() as i32);
+        return true;
+    }
+
+    let previous = context
+        .last_point
+        .lock()
+        .ok()
+        .and_then(|last_point| *last_point);
+    let (dx, dy) = previous
+        .map(|point| (x - point.0, y - point.1))
+        .unwrap_or((0.0, 0.0));
+
+    if let Ok(mut last_point) = context.last_point.lock() {
+        *last_point = Some((x, y));
+    }
+
+    let targets = current_input_targets(&context.layout_state, &context.native_layout);
+    if let Some(active_target) = crossing_target(&targets, x, y, dx, dy, &context.layout_state) {
+        let anchor = local_anchor_point(&active_target);
+        hide_windows_cursor_if_needed(context);
+        set_windows_cursor(anchor.0.round() as i32, anchor.1.round() as i32);
+        if !send_remote_mouse_move(
+            &context.socket,
+            &active_target,
+            &context.layout_state,
+            &context.input_events,
+        ) {
+            reset_mouse_move_timer(&context.last_mouse_move_sent);
+            reset_remote_button_mask(&context.remote_button_mask);
+            show_windows_cursor_if_needed(context);
+            return false;
+        }
+        mark_mouse_move_sent(&context.last_mouse_move_sent);
+        reset_remote_button_mask(&context.remote_button_mask);
+        context.remote_active.store(true, Ordering::Relaxed);
+        set_control_clipboard_target(
+            &context.clipboard_target,
+            &active_target,
+            &context.layout_state,
+        );
+        *active = Some(active_target);
+        if let Ok(mut anchor_state) = context.anchor.lock() {
+            *anchor_state = Some(anchor);
+        }
+        return true;
+    }
+
+    false
+}
+
+#[cfg(target_os = "windows")]
+fn handle_windows_mouse_button(context: &WindowsCaptureContext, message: u32) -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_RBUTTONDOWN, WM_RBUTTONUP,
+    };
+
+    let active = context
+        .active
+        .lock()
+        .ok()
+        .and_then(|active| active.as_ref().cloned());
+    let Some(active_target) = active else {
+        return false;
+    };
+    let (button, down) = match message {
+        WM_LBUTTONDOWN => (MouseButton::Left, true),
+        WM_LBUTTONUP => (MouseButton::Left, false),
+        WM_RBUTTONDOWN => (MouseButton::Right, true),
+        WM_RBUTTONUP => (MouseButton::Right, false),
+        WM_MBUTTONDOWN => (MouseButton::Middle, true),
+        WM_MBUTTONUP => (MouseButton::Middle, false),
+        _ => return false,
+    };
+
+    if !send_remote_mouse_move(
+        &context.socket,
+        &active_target,
+        &context.layout_state,
+        &context.input_events,
+    ) {
+        return false;
+    }
+    mark_mouse_move_sent(&context.last_mouse_move_sent);
+
+    let sent = send_packet(
+        &context.socket,
+        &active_target.target,
+        InputEvent::MouseButton { button, down },
+        &context.layout_state,
+        &context.input_events,
+    );
+    if sent {
+        update_remote_button_mask(&context.remote_button_mask, button, down);
+    }
+    sent
+}
+
+#[cfg(target_os = "windows")]
+fn handle_windows_scroll(context: &WindowsCaptureContext, message: u32, mouse_data: u32) -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{WM_MOUSEHWHEEL, WM_MOUSEWHEEL};
+
+    let active = context
+        .active
+        .lock()
+        .ok()
+        .and_then(|active| active.as_ref().cloned());
+    let Some(active_target) = active else {
+        return false;
+    };
+    let delta = ((mouse_data >> 16) as i16 / 120) as i32;
+    let (delta_x, delta_y) = if message == WM_MOUSEHWHEEL {
+        (delta, 0)
+    } else if message == WM_MOUSEWHEEL {
+        (0, delta)
+    } else {
+        return false;
+    };
+
+    if !send_remote_mouse_move(
+        &context.socket,
+        &active_target,
+        &context.layout_state,
+        &context.input_events,
+    ) {
+        return false;
+    }
+    mark_mouse_move_sent(&context.last_mouse_move_sent);
+
+    send_packet(
+        &context.socket,
+        &active_target.target,
+        InputEvent::Scroll { delta_x, delta_y },
+        &context.layout_state,
+        &context.input_events,
+    )
+}
+
+#[cfg(target_os = "windows")]
+fn set_windows_cursor(x: i32, y: i32) {
+    unsafe {
+        let _ = windows_sys::Win32::UI::WindowsAndMessaging::SetCursorPos(x, y);
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn hide_windows_cursor_if_needed(context: &WindowsCaptureContext) {
+    let Ok(mut calls) = context.cursor_hide_calls.lock() else {
+        return;
+    };
+    if *calls != 0 {
+        return;
+    }
+
+    for _ in 0..8 {
+        let count = unsafe { windows_sys::Win32::UI::WindowsAndMessaging::ShowCursor(0) };
+        *calls += 1;
+        if count < 0 {
+            break;
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn show_windows_cursor_if_needed(context: &WindowsCaptureContext) {
+    let Ok(mut calls) = context.cursor_hide_calls.lock() else {
+        return;
+    };
+
+    for _ in 0..*calls {
+        unsafe {
+            let _ = windows_sys::Win32::UI::WindowsAndMessaging::ShowCursor(1);
+        }
+    }
+    *calls = 0;
+}
+
+#[cfg(target_os = "macos")]
+fn send_macos_mouse_button(
+    context: &MacCaptureContext,
+    active_target: &ActiveTarget,
+    button: MouseButton,
+    down: bool,
+) -> bool {
+    if !send_remote_mouse_move(
+        &context.socket,
+        active_target,
+        &context.layout_state,
+        &context.input_events,
+    ) {
+        return false;
+    }
+    mark_mouse_move_sent(&context.last_mouse_move_sent);
+
+    let sent = send_packet(
+        &context.socket,
+        &active_target.target,
+        InputEvent::MouseButton { button, down },
+        &context.layout_state,
+        &context.input_events,
+    );
+    if sent {
+        update_remote_button_mask(&context.remote_button_mask, button, down);
+    }
+    sent
+}
+
+#[cfg(target_os = "macos")]
+fn handle_macos_event(
+    context: &MacCaptureContext,
+    event_type: core_graphics::event::CGEventType,
+    event: &core_graphics::event::CGEvent,
+) -> core_graphics::event::CallbackResult {
+    use core_graphics::event::{CGEventType, CallbackResult, EventField};
+
+    if matches!(
+        event_type,
+        CGEventType::TapDisabledByTimeout | CGEventType::TapDisabledByUserInput
+    ) {
+        return CallbackResult::Keep;
+    }
+
+    let dx = event.get_integer_value_field(EventField::MOUSE_EVENT_DELTA_X) as f64;
+    let dy = event.get_integer_value_field(EventField::MOUSE_EVENT_DELTA_Y) as f64;
+
+    if matches!(
+        event_type,
+        CGEventType::MouseMoved
+            | CGEventType::LeftMouseDragged
+            | CGEventType::RightMouseDragged
+            | CGEventType::OtherMouseDragged
+    ) {
+        return handle_macos_mouse_move(context, event, dx, dy);
+    }
+
+    let Ok(active) = context.active.lock() else {
+        return CallbackResult::Keep;
+    };
+    let Some(active_target) = active.as_ref().cloned() else {
+        drop(active);
+        return handle_macos_modifier_event(context, event_type, event);
+    };
+    drop(active);
+    let target = active_target.target.clone();
+
+    let sent = match event_type {
+        CGEventType::LeftMouseDown => {
+            send_macos_mouse_button(context, &active_target, MouseButton::Left, true)
+        }
+        CGEventType::LeftMouseUp => {
+            send_macos_mouse_button(context, &active_target, MouseButton::Left, false)
+        }
+        CGEventType::RightMouseDown => {
+            send_macos_mouse_button(context, &active_target, MouseButton::Right, true)
+        }
+        CGEventType::RightMouseUp => {
+            send_macos_mouse_button(context, &active_target, MouseButton::Right, false)
+        }
+        CGEventType::OtherMouseDown => {
+            send_macos_mouse_button(context, &active_target, MouseButton::Middle, true)
+        }
+        CGEventType::OtherMouseUp => {
+            send_macos_mouse_button(context, &active_target, MouseButton::Middle, false)
+        }
+        CGEventType::ScrollWheel => {
+            let delta_y =
+                event.get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_DELTA_AXIS_1) as i32;
+            let delta_x =
+                event.get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_DELTA_AXIS_2) as i32;
+            if !send_remote_mouse_move(
+                &context.socket,
+                &active_target,
+                &context.layout_state,
+                &context.input_events,
+            ) {
+                return CallbackResult::Keep;
+            }
+            mark_mouse_move_sent(&context.last_mouse_move_sent);
+            send_packet(
+                &context.socket,
+                &target,
+                InputEvent::Scroll { delta_x, delta_y },
+                &context.layout_state,
+                &context.input_events,
+            )
+        }
+        CGEventType::KeyDown | CGEventType::KeyUp => {
+            let mac_code = event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE) as u16;
+            if let Some(key_code) = mac_key_to_windows_vk(mac_code) {
+                send_packet(
+                    &context.socket,
+                    &target,
+                    InputEvent::Key {
+                        key_code,
+                        down: matches!(event_type, CGEventType::KeyDown),
+                    },
+                    &context.layout_state,
+                    &context.input_events,
+                )
+            } else {
+                false
+            }
+        }
+        CGEventType::FlagsChanged => {
+            send_modifier_changes(context, &target, event);
+            true
+        }
+        _ => false,
+    };
+
+    if sent {
+        CallbackResult::Drop
+    } else {
+        CallbackResult::Keep
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn handle_macos_mouse_move(
+    context: &MacCaptureContext,
+    event: &core_graphics::event::CGEvent,
+    dx: f64,
+    dy: f64,
+) -> core_graphics::event::CallbackResult {
+    use core_graphics::{display::CGDisplay, event::CallbackResult, geometry::CGPoint};
+
+    if let Ok(mut active) = context.active.lock() {
+        if let Some(active_target) = active.as_mut() {
+            let dy = if active_target.invert_y { -dy } else { dy };
+            active_target.x += dx;
+            active_target.y += dy;
+
+            if should_return_to_local(active_target, dx, dy) {
+                let point = local_return_point(active_target);
+                let invert_y = active_target.invert_y;
+                *active = None;
+                context.remote_active.store(false, Ordering::Relaxed);
+                clear_clipboard_target(&context.clipboard_target);
+                reset_mouse_move_timer(&context.last_mouse_move_sent);
+                reset_remote_button_mask(&context.remote_button_mask);
+                if let Ok(mut anchor) = context.anchor.lock() {
+                    *anchor = None;
+                }
+                show_macos_cursor_if_needed(context);
+                let point = mac_cursor_point(context, point, invert_y);
+                let _ = CGDisplay::warp_mouse_cursor_position(CGPoint::new(point.0, point.1));
+                return CallbackResult::Drop;
+            }
+
+            active_target.x = active_target
+                .x
+                .clamp(0.0, (active_target.target.remote_screen.width - 1) as f64);
+            active_target.y = active_target
+                .y
+                .clamp(0.0, (active_target.target.remote_screen.height - 1) as f64);
+            let dragging = remote_button_is_down(&context.remote_button_mask);
+            if should_send_mouse_move(&context.last_mouse_move_sent, dragging) {
+                if !send_remote_mouse_move(
+                    &context.socket,
+                    active_target,
+                    &context.layout_state,
+                    &context.input_events,
+                ) {
+                    *active = None;
+                    context.remote_active.store(false, Ordering::Relaxed);
+                    clear_clipboard_target(&context.clipboard_target);
+                    reset_mouse_move_timer(&context.last_mouse_move_sent);
+                    reset_remote_button_mask(&context.remote_button_mask);
+                    if let Ok(mut anchor) = context.anchor.lock() {
+                        *anchor = None;
+                    }
+                    show_macos_cursor_if_needed(context);
+                    return CallbackResult::Keep;
+                }
+            }
+            hide_macos_cursor_if_needed(context);
+            if let Some(anchor) = context.anchor.lock().ok().and_then(|anchor| *anchor) {
+                let _ = CGDisplay::warp_mouse_cursor_position(CGPoint::new(anchor.0, anchor.1));
+            }
+            return CallbackResult::Drop;
+        }
+    }
+
+    let location = event.location();
+    let targets = current_input_targets(&context.layout_state, &context.native_layout);
+    if let Some(active_target) =
+        mac_crossing_target(context, &targets, location.x, location.y, dx, dy)
+    {
+        let anchor = mac_cursor_point(
+            context,
+            local_anchor_point(&active_target),
+            active_target.invert_y,
+        );
+        hide_macos_cursor_if_needed(context);
+        if !send_remote_mouse_move(
+            &context.socket,
+            &active_target,
+            &context.layout_state,
+            &context.input_events,
+        ) {
+            reset_mouse_move_timer(&context.last_mouse_move_sent);
+            reset_remote_button_mask(&context.remote_button_mask);
+            show_macos_cursor_if_needed(context);
+            return CallbackResult::Keep;
+        }
+        mark_mouse_move_sent(&context.last_mouse_move_sent);
+        reset_remote_button_mask(&context.remote_button_mask);
+        context.remote_active.store(true, Ordering::Relaxed);
+        set_control_clipboard_target(
+            &context.clipboard_target,
+            &active_target,
+            &context.layout_state,
+        );
+        if let Ok(mut active) = context.active.lock() {
+            *active = Some(active_target.clone());
+        }
+        if let Ok(mut anchor_state) = context.anchor.lock() {
+            *anchor_state = Some(anchor);
+        }
+        let _ = CGDisplay::warp_mouse_cursor_position(CGPoint::new(anchor.0, anchor.1));
+        return CallbackResult::Drop;
+    }
+
+    CallbackResult::Keep
+}
+
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn crossing_target(
+    targets: &[InputTarget],
+    x: f64,
+    y: f64,
+    dx: f64,
+    dy: f64,
+    layout_state: &Arc<Mutex<LayoutState>>,
+) -> Option<ActiveTarget> {
+    crossing_target_with_transform(targets, x, y, dx, dy, false, layout_state)
+}
+
+fn crossing_target_with_transform(
+    targets: &[InputTarget],
+    x: f64,
+    y: f64,
+    dx: f64,
+    dy: f64,
+    invert_y: bool,
+    layout_state: &Arc<Mutex<LayoutState>>,
+) -> Option<ActiveTarget> {
+    targets
+        .iter()
+        .find_map(|target| {
+            if !target_is_online(target, layout_state) {
+                return None;
+            }
+
+            crossing_layout_point(target, x, y, dx, dy).map(|point| (target, point))
+        })
+        .map(|(target, (mapped_x, mapped_y))| {
+            let remote_x = match target.edge {
+                Edge::Right => 1.0,
+                Edge::Left => (target.remote_screen.width - 2) as f64,
+                _ => (mapped_x - target.remote_screen.x as f64)
+                    .clamp(0.0, (target.remote_screen.width - 1) as f64),
+            };
+            let remote_y = match target.edge {
+                Edge::Bottom => 1.0,
+                Edge::Top => (target.remote_screen.height - 2) as f64,
+                _ => (mapped_y - target.remote_screen.y as f64)
+                    .clamp(0.0, (target.remote_screen.height - 1) as f64),
+            };
+
+            ActiveTarget {
+                target: target.clone(),
+                x: remote_x,
+                y: remote_y,
+                invert_y,
+            }
+        })
+}
+
+fn crossing_layout_point(
+    target: &InputTarget,
+    x: f64,
+    y: f64,
+    dx: f64,
+    dy: f64,
+) -> Option<(f64, f64)> {
+    if is_crossing_screen(&target.local_screen, target.edge, x, y, dx, dy) {
+        return Some(native_to_layout_point(target, x, y));
+    }
+
+    let mapped = native_to_layout_point(target, x, y);
+    let mapped_dx = dx * target.layout_local_screen.width.max(1) as f64
+        / target.local_screen.width.max(1) as f64;
+    let mapped_dy = dy * target.layout_local_screen.height.max(1) as f64
+        / target.local_screen.height.max(1) as f64;
+    if is_crossing_screen(
+        &target.layout_local_screen,
+        target.edge,
+        mapped.0,
+        mapped.1,
+        mapped_dx,
+        mapped_dy,
+    ) {
+        return Some(mapped);
+    }
+
+    if is_crossing_screen(&target.layout_local_screen, target.edge, x, y, dx, dy) {
+        return Some((x, y));
+    }
+
+    None
+}
+
+fn native_to_layout_point(target: &InputTarget, x: f64, y: f64) -> (f64, f64) {
+    let native = &target.local_screen;
+    let layout = &target.layout_local_screen;
+    let ratio_x = (x - native.x as f64) / native.width.max(1) as f64;
+    let ratio_y = (y - native.y as f64) / native.height.max(1) as f64;
+
+    (
+        layout.x as f64 + ratio_x * layout.width.max(1) as f64,
+        layout.y as f64 + ratio_y * layout.height.max(1) as f64,
+    )
+}
+
+fn is_crossing_screen(screen: &Screen, edge: Edge, x: f64, y: f64, dx: f64, dy: f64) -> bool {
+    let left = screen.x as f64;
+    let right = (screen.x + screen.width) as f64;
+    let top = screen.y as f64;
+    let bottom = (screen.y + screen.height) as f64;
+
+    match edge {
+        Edge::Right => {
+            dx >= MIN_CROSSING_DELTA
+                && dx.abs() >= dy.abs() * CROSSING_AXIS_DOMINANCE
+                && x >= right - CROSSING_MARGIN
+                && y >= top - CROSSING_MARGIN
+                && y <= bottom + CROSSING_MARGIN
+        }
+        Edge::Left => {
+            dx <= -MIN_CROSSING_DELTA
+                && dx.abs() >= dy.abs() * CROSSING_AXIS_DOMINANCE
+                && x <= left + CROSSING_MARGIN
+                && y >= top - CROSSING_MARGIN
+                && y <= bottom + CROSSING_MARGIN
+        }
+        Edge::Bottom => {
+            dy >= MIN_CROSSING_DELTA
+                && dy.abs() >= dx.abs() * CROSSING_AXIS_DOMINANCE
+                && y >= bottom - CROSSING_MARGIN
+                && x >= left - CROSSING_MARGIN
+                && x <= right + CROSSING_MARGIN
+        }
+        Edge::Top => {
+            dy <= -MIN_CROSSING_DELTA
+                && dy.abs() >= dx.abs() * CROSSING_AXIS_DOMINANCE
+                && y <= top + CROSSING_MARGIN
+                && x >= left - CROSSING_MARGIN
+                && x <= right + CROSSING_MARGIN
+        }
+    }
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn local_y_bounds(targets: &[InputTarget]) -> Option<(f64, f64)> {
+    let mut min_y: Option<i32> = None;
+    let mut max_y: Option<i32> = None;
+
+    for target in targets {
+        let top = target.local_screen.y;
+        let bottom = target.local_screen.y + target.local_screen.height;
+        min_y = Some(min_y.map_or(top, |current| current.min(top)));
+        max_y = Some(max_y.map_or(bottom, |current| current.max(bottom)));
+    }
+
+    Some((min_y? as f64, max_y? as f64))
+}
+
+#[cfg(target_os = "macos")]
+fn mac_crossing_target(
+    context: &MacCaptureContext,
+    targets: &[InputTarget],
+    x: f64,
+    y: f64,
+    dx: f64,
+    dy: f64,
+) -> Option<ActiveTarget> {
+    if let Some(target) =
+        crossing_target_with_transform(targets, x, y, dx, dy, false, &context.layout_state)
+    {
+        return Some(target);
+    }
+
+    let Some((min_y, max_y)) = local_y_bounds(targets).or(context.local_y_bounds) else {
+        return None;
+    };
+    let flipped_y = min_y + max_y - y;
+    if (flipped_y - y).abs() < 0.5 {
+        return None;
+    }
+
+    crossing_target_with_transform(targets, x, flipped_y, dx, -dy, true, &context.layout_state)
+}
+
+#[cfg(target_os = "macos")]
+fn mac_cursor_point(context: &MacCaptureContext, point: (f64, f64), invert_y: bool) -> (f64, f64) {
+    if !invert_y {
+        return point;
+    }
+
+    local_y_bounds(&current_input_targets(
+        &context.layout_state,
+        &context.native_layout,
+    ))
+    .or(context.local_y_bounds)
+    .map(|(min_y, max_y)| (point.0, min_y + max_y - point.1))
+    .unwrap_or(point)
+}
+
+fn should_return_to_local(active: &ActiveTarget, dx: f64, dy: f64) -> bool {
+    match active.target.edge {
+        Edge::Right => active.x <= 0.0 && dx < 0.0,
+        Edge::Left => active.x >= (active.target.remote_screen.width - 1) as f64 && dx > 0.0,
+        Edge::Bottom => active.y <= 0.0 && dy < 0.0,
+        Edge::Top => active.y >= (active.target.remote_screen.height - 1) as f64 && dy > 0.0,
+    }
+}
+
+fn local_return_point(active: &ActiveTarget) -> (f64, f64) {
+    let local = &active.target.local_screen;
+    let layout_local = &active.target.layout_local_screen;
+    let remote = &active.target.remote_screen;
+    let global_x = remote.x as f64 + active.x;
+    let global_y = remote.y as f64 + active.y;
+    let ratio_x = (global_x - layout_local.x as f64) / layout_local.width.max(1) as f64;
+    let ratio_y = (global_y - layout_local.y as f64) / layout_local.height.max(1) as f64;
+    let native_x = local.x as f64 + ratio_x * local.width.max(1) as f64;
+    let native_y = local.y as f64 + ratio_y * local.height.max(1) as f64;
+
+    match active.target.edge {
+        Edge::Right => (
+            (local.x + local.width - 2) as f64,
+            native_y.clamp(local.y as f64, (local.y + local.height - 1) as f64),
+        ),
+        Edge::Left => (
+            (local.x + 1) as f64,
+            native_y.clamp(local.y as f64, (local.y + local.height - 1) as f64),
+        ),
+        Edge::Bottom => (
+            native_x.clamp(local.x as f64, (local.x + local.width - 1) as f64),
+            (local.y + local.height - 2) as f64,
+        ),
+        Edge::Top => (
+            native_x.clamp(local.x as f64, (local.x + local.width - 1) as f64),
+            (local.y + 1) as f64,
+        ),
+    }
+}
+
+fn send_remote_mouse_move(
+    socket: &UdpSocket,
+    active: &ActiveTarget,
+    layout_state: &Arc<Mutex<LayoutState>>,
+    input_events: &Arc<AtomicU64>,
+) -> bool {
+    send_packet(
+        socket,
+        &active.target,
+        InputEvent::MouseMove {
+            screen_id: active.target.screen_id.clone(),
+            x: active.x.round() as i32,
+            y: active.y.round() as i32,
+        },
+        layout_state,
+        input_events,
+    )
+}
+
+fn local_anchor_point(active: &ActiveTarget) -> (f64, f64) {
+    local_return_point(active)
+}
+
+#[cfg(target_os = "macos")]
+fn hide_macos_cursor_if_needed(context: &MacCaptureContext) {
+    let Ok(mut hidden) = context.cursor_hidden.lock() else {
+        return;
+    };
+    if *hidden {
+        return;
+    }
+
+    if let Ok(displays) = core_graphics::display::CGDisplay::active_displays() {
+        for display_id in displays {
+            let _ = core_graphics::display::CGDisplay::new(display_id).hide_cursor();
+        }
+    } else {
+        let _ = core_graphics::display::CGDisplay::main().hide_cursor();
+    }
+    *hidden = true;
+}
+
+#[cfg(target_os = "macos")]
+fn show_macos_cursor_if_needed(context: &MacCaptureContext) {
+    let Ok(mut hidden) = context.cursor_hidden.lock() else {
+        return;
+    };
+    if !*hidden {
+        return;
+    }
+
+    if let Ok(displays) = core_graphics::display::CGDisplay::active_displays() {
+        for display_id in displays {
+            let _ = core_graphics::display::CGDisplay::new(display_id).show_cursor();
+        }
+    } else {
+        let _ = core_graphics::display::CGDisplay::main().show_cursor();
+    }
+    *hidden = false;
+}
+
+#[cfg(target_os = "macos")]
+fn handle_macos_modifier_event(
+    context: &MacCaptureContext,
+    event_type: core_graphics::event::CGEventType,
+    event: &core_graphics::event::CGEvent,
+) -> core_graphics::event::CallbackResult {
+    if matches!(event_type, core_graphics::event::CGEventType::FlagsChanged) {
+        if let Ok(mut pressed) = context.pressed_modifiers.lock() {
+            *pressed = mac_modifier_vks(event);
+        }
+    }
+
+    core_graphics::event::CallbackResult::Keep
+}
+
+#[cfg(target_os = "macos")]
+fn send_modifier_changes(
+    context: &MacCaptureContext,
+    target: &InputTarget,
+    event: &core_graphics::event::CGEvent,
+) {
+    let next = mac_modifier_vks(event);
+    let Ok(mut previous) = context.pressed_modifiers.lock() else {
+        return;
+    };
+
+    for key_code in next.iter().filter(|key_code| !previous.contains(key_code)) {
+        send_packet(
+            &context.socket,
+            target,
+            InputEvent::Key {
+                key_code: *key_code,
+                down: true,
+            },
+            &context.layout_state,
+            &context.input_events,
+        );
+    }
+
+    for key_code in previous.iter().filter(|key_code| !next.contains(key_code)) {
+        send_packet(
+            &context.socket,
+            target,
+            InputEvent::Key {
+                key_code: *key_code,
+                down: false,
+            },
+            &context.layout_state,
+            &context.input_events,
+        );
+    }
+
+    *previous = next;
+}
+
+#[cfg(target_os = "macos")]
+fn mac_modifier_vks(event: &core_graphics::event::CGEvent) -> Vec<u16> {
+    use core_graphics::event::CGEventFlags;
+
+    let flags = event.get_flags();
+    let mut keys = Vec::new();
+    if flags.contains(CGEventFlags::CGEventFlagShift) {
+        keys.push(0x10);
+    }
+    if flags.contains(CGEventFlags::CGEventFlagControl) {
+        keys.push(0x11);
+    }
+    if flags.contains(CGEventFlags::CGEventFlagAlternate) {
+        keys.push(0x12);
+    }
+    if flags.contains(CGEventFlags::CGEventFlagCommand) {
+        keys.push(0x5B);
+    }
+    keys
+}
+
+#[cfg(target_os = "macos")]
+fn mac_key_to_windows_vk(code: u16) -> Option<u16> {
+    Some(match code {
+        0 => 0x41,
+        1 => 0x53,
+        2 => 0x44,
+        3 => 0x46,
+        4 => 0x48,
+        5 => 0x47,
+        6 => 0x5A,
+        7 => 0x58,
+        8 => 0x43,
+        9 => 0x56,
+        11 => 0x42,
+        12 => 0x51,
+        13 => 0x57,
+        14 => 0x45,
+        15 => 0x52,
+        16 => 0x59,
+        17 => 0x54,
+        18 => 0x31,
+        19 => 0x32,
+        20 => 0x33,
+        21 => 0x34,
+        22 => 0x36,
+        23 => 0x35,
+        24 => 0xBB,
+        25 => 0x39,
+        26 => 0x37,
+        27 => 0xBD,
+        28 => 0x38,
+        29 => 0x30,
+        30 => 0xDD,
+        31 => 0x4F,
+        32 => 0x55,
+        33 => 0xDB,
+        34 => 0x49,
+        35 => 0x50,
+        36 => 0x0D,
+        37 => 0x4C,
+        38 => 0x4A,
+        39 => 0xDE,
+        40 => 0x4B,
+        41 => 0xBA,
+        42 => 0xDC,
+        43 => 0xBC,
+        44 => 0xBF,
+        45 => 0x4E,
+        46 => 0x4D,
+        47 => 0xBE,
+        48 => 0x09,
+        49 => 0x20,
+        50 => 0xC0,
+        51 => 0x08,
+        53 => 0x1B,
+        55 => 0x5B,
+        56 | 60 => 0x10,
+        57 => 0x14,
+        58 | 61 => 0x12,
+        59 | 62 => 0x11,
+        63 => 0x5B,
+        64 => 0x79,
+        65 => 0x6E,
+        67 => 0x6A,
+        69 => 0x6B,
+        71 => 0x90,
+        75 => 0x6F,
+        76 => 0x0D,
+        78 => 0x6D,
+        81 => 0x6D,
+        82 => 0x60,
+        83 => 0x61,
+        84 => 0x62,
+        85 => 0x63,
+        86 => 0x64,
+        87 => 0x65,
+        88 => 0x66,
+        89 => 0x67,
+        91 => 0x68,
+        92 => 0x69,
+        96 => 0x74,
+        97 => 0x75,
+        98 => 0x76,
+        99 => 0x77,
+        100 => 0x73,
+        101 => 0x78,
+        103 => 0x7A,
+        105 => 0x7C,
+        106 => 0x7B,
+        107 => 0x7D,
+        109 => 0x79,
+        111 => 0x7A,
+        114 => 0x2D,
+        115 => 0x24,
+        116 => 0x21,
+        117 => 0x2E,
+        118 => 0x70,
+        119 => 0x23,
+        120 => 0x71,
+        121 => 0x22,
+        122 => 0x72,
+        123 => 0x25,
+        124 => 0x27,
+        125 => 0x28,
+        126 => 0x26,
+        _ => return None,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn windows_vk_to_mac_key(code: u16) -> Option<u16> {
+    mac_key_to_windows_vk_pairs()
+        .iter()
+        .find(|(_, vk)| *vk == code)
+        .map(|(mac, _)| *mac)
+}
+
+#[cfg(target_os = "macos")]
+fn mac_key_to_windows_vk_pairs() -> &'static [(u16, u16)] {
+    &[
+        (0, 0x41),
+        (1, 0x53),
+        (2, 0x44),
+        (3, 0x46),
+        (4, 0x48),
+        (5, 0x47),
+        (6, 0x5A),
+        (7, 0x58),
+        (8, 0x43),
+        (9, 0x56),
+        (11, 0x42),
+        (12, 0x51),
+        (13, 0x57),
+        (14, 0x45),
+        (15, 0x52),
+        (16, 0x59),
+        (17, 0x54),
+        (18, 0x31),
+        (19, 0x32),
+        (20, 0x33),
+        (21, 0x34),
+        (22, 0x36),
+        (23, 0x35),
+        (24, 0xBB),
+        (25, 0x39),
+        (26, 0x37),
+        (27, 0xBD),
+        (28, 0x38),
+        (29, 0x30),
+        (30, 0xDD),
+        (31, 0x4F),
+        (32, 0x55),
+        (33, 0xDB),
+        (34, 0x49),
+        (35, 0x50),
+        (36, 0x0D),
+        (37, 0x4C),
+        (38, 0x4A),
+        (39, 0xDE),
+        (40, 0x4B),
+        (41, 0xBA),
+        (42, 0xDC),
+        (43, 0xBC),
+        (44, 0xBF),
+        (45, 0x4E),
+        (46, 0x4D),
+        (47, 0xBE),
+        (48, 0x09),
+        (49, 0x20),
+        (50, 0xC0),
+        (51, 0x08),
+        (53, 0x1B),
+        (55, 0x5B),
+        (56, 0x10),
+        (58, 0x12),
+        (59, 0x11),
+        (114, 0x2D),
+        (115, 0x24),
+        (116, 0x21),
+        (117, 0x2E),
+        (118, 0x70),
+        (119, 0x23),
+        (120, 0x71),
+        (121, 0x22),
+        (122, 0x72),
+        (123, 0x25),
+        (124, 0x27),
+        (125, 0x28),
+        (126, 0x26),
+    ]
+}
+
+#[cfg(target_os = "macos")]
+fn inject_mouse_move(x: i32, y: i32, drag_button: Option<MouseButton>) {
+    use core_graphics::{
+        display::CGDisplay,
+        event::{CGEvent, CGEventTapLocation, CGEventType, CGMouseButton},
+        event_source::{CGEventSource, CGEventSourceStateID},
+        geometry::CGPoint,
+    };
+
+    let point = CGPoint::new(x as f64, y as f64);
+    let (event_type, mouse_button) = match drag_button {
+        Some(MouseButton::Left) => (CGEventType::LeftMouseDragged, CGMouseButton::Left),
+        Some(MouseButton::Right) => (CGEventType::RightMouseDragged, CGMouseButton::Right),
+        Some(MouseButton::Middle) => (CGEventType::OtherMouseDragged, CGMouseButton::Center),
+        None => (CGEventType::MouseMoved, CGMouseButton::Left),
+    };
+
+    if let Ok(source) = CGEventSource::new(CGEventSourceStateID::HIDSystemState) {
+        if let Ok(event) = CGEvent::new_mouse_event(source, event_type, point, mouse_button) {
+            event.post(CGEventTapLocation::HID);
+            return;
+        }
+    }
+
+    let _ = CGDisplay::warp_mouse_cursor_position(point);
+}
+
+#[cfg(target_os = "macos")]
+fn inject_mouse_button(button: MouseButton, down: bool, x: i32, y: i32) {
+    use core_graphics::{
+        event::{CGEvent, CGEventTapLocation, CGEventType, CGMouseButton},
+        event_source::{CGEventSource, CGEventSourceStateID},
+        geometry::CGPoint,
+    };
+
+    let Ok(source) = CGEventSource::new(CGEventSourceStateID::HIDSystemState) else {
+        return;
+    };
+    let (event_type, mouse_button) = match (button, down) {
+        (MouseButton::Left, true) => (CGEventType::LeftMouseDown, CGMouseButton::Left),
+        (MouseButton::Left, false) => (CGEventType::LeftMouseUp, CGMouseButton::Left),
+        (MouseButton::Right, true) => (CGEventType::RightMouseDown, CGMouseButton::Right),
+        (MouseButton::Right, false) => (CGEventType::RightMouseUp, CGMouseButton::Right),
+        (MouseButton::Middle, true) => (CGEventType::OtherMouseDown, CGMouseButton::Center),
+        (MouseButton::Middle, false) => (CGEventType::OtherMouseUp, CGMouseButton::Center),
+    };
+
+    if let Ok(event) = CGEvent::new_mouse_event(
+        source,
+        event_type,
+        CGPoint::new(x as f64, y as f64),
+        mouse_button,
+    ) {
+        event.post(CGEventTapLocation::HID);
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn inject_scroll(delta_x: i32, delta_y: i32) {
+    use core_graphics::{
+        event::{CGEvent, CGEventTapLocation, ScrollEventUnit},
+        event_source::{CGEventSource, CGEventSourceStateID},
+    };
+
+    let Ok(source) = CGEventSource::new(CGEventSourceStateID::HIDSystemState) else {
+        return;
+    };
+    if let Ok(event) =
+        CGEvent::new_scroll_event(source, ScrollEventUnit::LINE, 2, delta_y, delta_x, 0)
+    {
+        event.post(CGEventTapLocation::HID);
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn inject_key(key_code: u16, down: bool) {
+    use core_graphics::{
+        event::{CGEvent, CGEventTapLocation},
+        event_source::{CGEventSource, CGEventSourceStateID},
+    };
+
+    let Some(mac_code) = windows_vk_to_mac_key(key_code) else {
+        return;
+    };
+    let Ok(source) = CGEventSource::new(CGEventSourceStateID::HIDSystemState) else {
+        return;
+    };
+    if let Ok(event) = CGEvent::new_keyboard_event(source, mac_code, down) {
+        event.post(CGEventTapLocation::HID);
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn inject_mouse_move(x: i32, y: i32, _drag_button: Option<MouseButton>) {
+    use windows_sys::Win32::UI::{
+        Input::KeyboardAndMouse::{
+            SendInput, INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_MOVE,
+            MOUSEEVENTF_VIRTUALDESK, MOUSEINPUT,
+        },
+        WindowsAndMessaging::{
+            GetSystemMetrics, SetCursorPos, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
+            SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+        },
+    };
+
+    unsafe {
+        let virtual_x = GetSystemMetrics(SM_XVIRTUALSCREEN);
+        let virtual_y = GetSystemMetrics(SM_YVIRTUALSCREEN);
+        let virtual_width = GetSystemMetrics(SM_CXVIRTUALSCREEN).max(1);
+        let virtual_height = GetSystemMetrics(SM_CYVIRTUALSCREEN).max(1);
+        let normalized_x =
+            ((x - virtual_x) as i64 * 65_535 / (virtual_width - 1).max(1) as i64) as i32;
+        let normalized_y =
+            ((y - virtual_y) as i64 * 65_535 / (virtual_height - 1).max(1) as i64) as i32;
+        let input = INPUT {
+            r#type: INPUT_MOUSE,
+            Anonymous: INPUT_0 {
+                mi: MOUSEINPUT {
+                    dx: normalized_x.clamp(0, 65_535),
+                    dy: normalized_y.clamp(0, 65_535),
+                    mouseData: 0,
+                    dwFlags: MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
+                    time: 0,
+                    dwExtraInfo: 0,
+                },
+            },
+        };
+        if SendInput(1, &input, std::mem::size_of::<INPUT>() as i32) == 0 {
+            let _ = SetCursorPos(x, y);
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn inject_mouse_button(button: MouseButton, down: bool, _x: i32, _y: i32) {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+        SendInput, INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
+        MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP,
+        MOUSEINPUT,
+    };
+
+    let flag = match (button, down) {
+        (MouseButton::Left, true) => MOUSEEVENTF_LEFTDOWN,
+        (MouseButton::Left, false) => MOUSEEVENTF_LEFTUP,
+        (MouseButton::Right, true) => MOUSEEVENTF_RIGHTDOWN,
+        (MouseButton::Right, false) => MOUSEEVENTF_RIGHTUP,
+        (MouseButton::Middle, true) => MOUSEEVENTF_MIDDLEDOWN,
+        (MouseButton::Middle, false) => MOUSEEVENTF_MIDDLEUP,
+    };
+    let input = INPUT {
+        r#type: INPUT_MOUSE,
+        Anonymous: INPUT_0 {
+            mi: MOUSEINPUT {
+                dx: 0,
+                dy: 0,
+                mouseData: 0,
+                dwFlags: flag,
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    };
+
+    unsafe {
+        let _ = SendInput(1, &input, std::mem::size_of::<INPUT>() as i32);
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn inject_scroll(delta_x: i32, delta_y: i32) {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+        SendInput, INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_WHEEL, MOUSEINPUT,
+    };
+
+    for (flag, delta) in [(MOUSEEVENTF_WHEEL, delta_y), (MOUSEEVENTF_HWHEEL, delta_x)] {
+        if delta == 0 {
+            continue;
+        }
+
+        let input = INPUT {
+            r#type: INPUT_MOUSE,
+            Anonymous: INPUT_0 {
+                mi: MOUSEINPUT {
+                    dx: 0,
+                    dy: 0,
+                    mouseData: (delta * 120) as u32,
+                    dwFlags: flag,
+                    time: 0,
+                    dwExtraInfo: 0,
+                },
+            },
+        };
+
+        unsafe {
+            let _ = SendInput(1, &input, std::mem::size_of::<INPUT>() as i32);
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn inject_key(key_code: u16, down: bool) {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+        SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP,
+    };
+
+    let input = INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: key_code,
+                wScan: 0,
+                dwFlags: if down { 0 } else { KEYEVENTF_KEYUP },
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    };
+
+    unsafe {
+        let _ = SendInput(1, &input, std::mem::size_of::<INPUT>() as i32);
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn inject_mouse_move(_x: i32, _y: i32, _drag_button: Option<MouseButton>) {}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn inject_mouse_button(_button: MouseButton, _down: bool, _x: i32, _y: i32) {}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn inject_scroll(_delta_x: i32, _delta_y: i32) {}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn inject_key(_key_code: u16, _down: bool) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn screen(device_id: &str, id: &str, x: i32, y: i32, width: i32, height: i32) -> Screen {
+        Screen {
+            id: id.into(),
+            device_id: device_id.into(),
+            name: id.into(),
+            x,
+            y,
+            width,
+            height,
+            scale: 1.0,
+            is_primary: true,
+        }
+    }
+
+    fn target_for_coordinate_tests() -> InputTarget {
+        InputTarget {
+            device_id: "peer-device".into(),
+            target_addr: "10.0.0.2:47833".into(),
+            target_port: 47833,
+            screen_id: "local-display-1".into(),
+            local_screen: screen("local-device", "local-display-1", 0, 0, 1920, 1080),
+            layout_local_screen: screen(
+                "local-device",
+                "local-display-1",
+                -11960,
+                -9000,
+                2560,
+                1440,
+            ),
+            remote_screen: screen(
+                "peer-device",
+                "peer-device-local-display-1",
+                -9400,
+                -9000,
+                2560,
+                1440,
+            ),
+            edge: Edge::Right,
+        }
+    }
+
+    fn layout_for_target_tests() -> LayoutState {
+        LayoutState {
+            devices: vec![
+                Device {
+                    id: "local-device".into(),
+                    name: "Local".into(),
+                    platform: "macos".into(),
+                    host: "192.168.66.92".into(),
+                    transport_port: 47833,
+                    color: "#2f7af8".into(),
+                    online: true,
+                    input_ready: false,
+                    role: "local".into(),
+                    source: "detected".into(),
+                    screens: vec![screen("local-device", "local-display-1", 0, 0, 1920, 1080)],
+                },
+                Device {
+                    id: "peer-device".into(),
+                    name: "Client".into(),
+                    platform: "windows".into(),
+                    host: "10.0.0.2".into(),
+                    transport_port: 52000,
+                    color: "#0f766e".into(),
+                    online: true,
+                    input_ready: true,
+                    role: "client".into(),
+                    source: "detected".into(),
+                    screens: vec![screen(
+                        "peer-device",
+                        "peer-device-local-display-1",
+                        1920,
+                        0,
+                        1920,
+                        1080,
+                    )],
+                },
+            ],
+            active_device_id: "local-device".into(),
+            selected_screen_id: "local-display-1".into(),
+            input_mode: "control".into(),
+            machine_role: "server".into(),
+            clipboard_sync: false,
+            language: "cn".into(),
+            theme_mode: "system".into(),
+            performance_monitor: false,
+            transport_port_mode: "auto".into(),
+            transport_port: 47833,
+        }
+    }
+
+    #[test]
+    fn input_packet_round_trips_as_messagepack() {
+        let packet = InputPacket {
+            protocol: INPUT_PROTOCOL.into(),
+            target_device_id: "peer-device".into(),
+            origin_device_id: "local-device".into(),
+            origin_port: 47833,
+            event: InputEvent::MouseMove {
+                screen_id: "display-1".into(),
+                x: 320,
+                y: 240,
+            },
+        };
+        let payload = rmp_serde::to_vec_named(&packet).expect("encode input packet");
+        let decoded = decode_input_packet(&payload).expect("decode input packet");
+
+        assert_eq!(decoded.protocol, INPUT_PROTOCOL);
+        assert_eq!(decoded.target_device_id, "peer-device");
+        assert_eq!(decoded.origin_device_id, "local-device");
+        assert_eq!(decoded.origin_port, 47833);
+        match decoded.event {
+            InputEvent::MouseMove { screen_id, x, y } => {
+                assert_eq!(screen_id, "display-1");
+                assert_eq!(x, 320);
+                assert_eq!(y, 240);
+            }
+            _ => panic!("decoded the wrong input event"),
+        }
+    }
+
+    #[test]
+    fn clipboard_target_expires() {
+        let target = Arc::new(Mutex::new(Some(ClipboardTarget {
+            device_id: "peer-device".into(),
+            addr: "10.0.0.2:47833".into(),
+            expires_at: Some(Instant::now() - Duration::from_millis(1)),
+        })));
+
+        assert!(current_clipboard_target(&target).is_none());
+        assert!(target.lock().expect("target lock").is_none());
+    }
+
+    #[test]
+    fn crossing_accepts_native_screen_coordinates() {
+        let target = target_for_coordinate_tests();
+
+        let mapped = crossing_layout_point(&target, 1918.0, 500.0, 5.0, 0.0)
+            .expect("native edge should cross");
+
+        assert!(mapped.0 > -9404.0);
+        assert!(mapped.0 <= -9400.0);
+    }
+
+    #[test]
+    fn crossing_accepts_layout_screen_coordinates() {
+        let target = target_for_coordinate_tests();
+
+        let mapped = crossing_layout_point(&target, -9401.0, -8500.0, 5.0, 0.0)
+            .expect("layout edge should cross");
+
+        assert_eq!(mapped, (-9401.0, -8500.0));
+    }
+
+    #[test]
+    fn input_targets_use_peer_transport_port() {
+        let layout = layout_for_target_tests();
+        let targets = build_input_targets(&layout, &layout);
+
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].target_addr, "10.0.0.2:52000");
+    }
+
+    #[test]
+    fn input_targets_require_peer_input_ready() {
+        let mut layout = layout_for_target_tests();
+        layout.devices[1].input_ready = false;
+
+        let targets = build_input_targets(&layout, &layout);
+
+        assert!(targets.is_empty());
+    }
+}
