@@ -32,10 +32,6 @@ const PEER_TTL_MS: u64 = 30_000;
 const MAX_DISCOVERY_PEERS: usize = 128;
 const CLIPBOARD_PROTOCOL: &str = "mykvm.clipboard.v1";
 const CLIPBOARD_MAX_TEXT_BYTES: usize = 256 * 1024;
-const REMOTE_SCREEN_GAP: i32 = 0;
-const DEVICE_COLORS: [&str; 6] = [
-    "#2f7af8", "#0f766e", "#b45309", "#7c3aed", "#be123c", "#0891b2",
-];
 
 static HOSTNAME_CACHE: OnceLock<Option<String>> = OnceLock::new();
 
@@ -1178,9 +1174,9 @@ fn current_privilege_status() -> PrivilegeStatus {
         is_elevated,
         can_elevate: !is_elevated,
         detail: if is_elevated {
-            "Running as administrator. MyKVM can inject into elevated desktop windows."
+            "Running as administrator. MyKVM can inject into elevated desktop windows, but Windows UAC secure desktop prompts still require local confirmation."
         } else {
-            "Standard user mode. Restart as administrator to control Task Manager and elevated windows."
+            "Standard user mode. Restart as administrator to control elevated desktop windows; UAC secure desktop prompts still require local confirmation."
         }
         .into(),
     }
@@ -1897,19 +1893,6 @@ fn apply_peer_presence(layout: &mut LayoutState, peers: &[LanPeer]) {
             device.input_ready = false;
         }
     }
-
-    for peer in peers {
-        if peer.screens.is_empty()
-            || layout
-                .devices
-                .iter()
-                .any(|device| device_matches_peer(device, peer))
-        {
-            continue;
-        }
-
-        layout.devices.push(create_device_from_peer(layout, peer));
-    }
 }
 
 fn device_matches_peer(device: &Device, peer: &LanPeer) -> bool {
@@ -1983,47 +1966,11 @@ fn update_device_from_peer(device: &mut Device, peer: &LanPeer) {
         device.name = peer.name.clone();
     }
     if !peer.screens.is_empty() {
-        device.screens = screens_from_peer(peer, &device.id, &device.screens, None);
+        device.screens = screens_from_peer(peer, &device.id, &device.screens);
     }
 }
 
-fn create_device_from_peer(layout: &LayoutState, peer: &LanPeer) -> Device {
-    let id = peer_device_id(peer);
-    let color = DEVICE_COLORS[layout.devices.len() % DEVICE_COLORS.len()].to_string();
-
-    Device {
-        id: id.clone(),
-        name: peer
-            .name
-            .trim()
-            .is_empty()
-            .then(|| "LAN device".to_string())
-            .unwrap_or_else(|| peer.name.clone()),
-        platform: normalize_peer_platform(&peer.platform).into(),
-        host: if peer.ip.trim().is_empty() {
-            peer.host.clone()
-        } else {
-            peer.ip.clone()
-        },
-        transport_port: peer.transport_port,
-        quic_port: normalize_quic_port(peer.transport_port, peer.quic_port),
-        transport_public_key: peer.transport_public_key.clone(),
-        protocol_version: peer.protocol_version,
-        color,
-        online: peer.input_ready,
-        input_ready: peer.input_ready,
-        role: "client".into(),
-        source: "detected".into(),
-        screens: screens_from_peer(peer, &id, &[], Some(layout)),
-    }
-}
-
-fn screens_from_peer(
-    peer: &LanPeer,
-    device_id: &str,
-    existing_screens: &[Screen],
-    layout: Option<&LayoutState>,
-) -> Vec<Screen> {
+fn screens_from_peer(peer: &LanPeer, device_id: &str, existing_screens: &[Screen]) -> Vec<Screen> {
     if peer.screens.is_empty() {
         return existing_screens.to_vec();
     }
@@ -2040,10 +1987,6 @@ fn screens_from_peer(
         .map(|screen| screen.y)
         .min()
         .unwrap_or_default();
-    let local_bounds = layout.and_then(local_screen_bounds);
-    let start_x = local_bounds.map(|bounds| bounds.max_x).unwrap_or_default() + REMOTE_SCREEN_GAP;
-    let start_y = local_bounds.map(|bounds| bounds.min_y).unwrap_or_default();
-
     peer.screens
         .iter()
         .enumerate()
@@ -2061,10 +2004,10 @@ fn screens_from_peer(
                 },
                 x: existing_screen
                     .map(|screen| screen.x)
-                    .unwrap_or(start_x + (peer_screen.x - peer_min_x)),
+                    .unwrap_or(peer_screen.x - peer_min_x),
                 y: existing_screen
                     .map(|screen| screen.y)
-                    .unwrap_or(start_y + (peer_screen.y - peer_min_y)),
+                    .unwrap_or(peer_screen.y - peer_min_y),
                 width: peer_screen.width,
                 height: peer_screen.height,
                 scale: peer_screen.scale,
@@ -2072,26 +2015,6 @@ fn screens_from_peer(
             }
         })
         .collect()
-}
-
-#[derive(Clone, Copy)]
-struct LayoutBounds {
-    min_y: i32,
-    max_x: i32,
-}
-
-fn local_screen_bounds(layout: &LayoutState) -> Option<LayoutBounds> {
-    let screens = layout
-        .devices
-        .iter()
-        .find(|device| device.role == "local")
-        .or_else(|| layout.devices.first())
-        .map(|device| device.screens.as_slice())?;
-
-    Some(LayoutBounds {
-        min_y: screens.iter().map(|screen| screen.y).min()?,
-        max_x: screens.iter().map(|screen| screen.x + screen.width).max()?,
-    })
 }
 
 fn unique_peer_screen_id(device_id: &str, screen: &LanPeerScreen, index: usize) -> String {
@@ -2839,22 +2762,14 @@ mod tests {
     }
 
     #[test]
-    fn peer_presence_adds_new_online_peer_screens() {
+    fn peer_presence_does_not_add_unapproved_peer_screens() {
         let mut layout = test_layout();
         layout.devices.truncate(1);
         let peer = test_peer();
 
         apply_peer_presence(&mut layout, &[peer]);
 
-        assert_eq!(layout.devices.len(), 2);
-        assert_eq!(layout.devices[1].id, "peer-client-10-0-0-2");
-        assert!(layout.devices[1].online);
-        assert!(layout.devices[1].input_ready);
-        assert_eq!(layout.devices[1].screens.len(), 1);
-        assert_eq!(
-            layout.devices[1].screens[0].id,
-            "peer-client-10-0-0-2-local-display-1"
-        );
-        assert_eq!(layout.devices[1].screens[0].x, 1920);
+        assert_eq!(layout.devices.len(), 1);
+        assert_eq!(layout.devices[0].id, "local-device");
     }
 }

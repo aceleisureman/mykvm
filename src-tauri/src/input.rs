@@ -295,7 +295,7 @@ fn start_platform_capture(
 
         if result.is_err() {
             let _ = ready_tx.send(Err(
-                "macOS input capture needs Accessibility and Input Monitoring permission.".into(),
+                "macOS 生产包需要单独授权辅助功能和输入监控。请到 系统设置 > 隐私与安全性 > 辅助功能 / 输入监控 启用 MyKVM，然后完全退出并重新打开应用。".into(),
             ));
         }
     });

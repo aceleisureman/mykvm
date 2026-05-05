@@ -686,6 +686,9 @@ function App() {
       const nextRuntime = nextStarted
         ? await startRuntime()
         : await stopRuntime();
+      if (nextStarted && nextRuntime.capture.state === "error") {
+        setErrorMessage(nextRuntime.capture.detail);
+      }
       setSnapshot((current) =>
         current
           ? {
@@ -2139,18 +2142,7 @@ function applyPeerPresence(layout: LayoutState, peers: LanPeer[]): LayoutState {
     }),
   };
 
-  const autoDevices = peers
-    .filter(
-      (peer) =>
-        peer.screens.length > 0 &&
-        !nextLayout.devices.some((device) => deviceMatchesPeer(device, peer)),
-    )
-    .map((peer) => createDeviceFromPeer(nextLayout, peer));
-
-  return {
-    ...nextLayout,
-    devices: [...nextLayout.devices, ...autoDevices],
-  };
+  return nextLayout;
 }
 
 function upsertPeerDevice(

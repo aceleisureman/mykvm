@@ -889,8 +889,8 @@
 }
 
 .page-panel {
-  flex: 1;
-  min-height: 0;
+  flex: 0 0 auto;
+  min-height: auto;
   display: flex;
   flex-direction: column;
   gap: 16px;
@@ -1474,8 +1474,8 @@
 }
 
 .settings-layout {
-  flex: 1;
-  min-height: 0;
+  flex: 0 0 auto;
+  min-height: auto;
   display: grid;
   grid-template-columns: minmax(360px, 0.92fr) minmax(420px, 1fr);
   gap: 12px;
