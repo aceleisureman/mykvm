@@ -675,7 +675,7 @@ fn read_runtime_status(state: tauri::State<'_, AppRuntime>) -> RuntimeStatus {
 fn save_layout(
     layout: LayoutState,
     state: tauri::State<'_, AppRuntime>,
-) -> Result<LayoutState, String> {
+) -> Result<AppStateSnapshot, String> {
     write_layout_to_disk(&state.config_path, &layout)?;
     let previous_layout = {
         let mut stored_layout = state
@@ -694,7 +694,7 @@ fn save_layout(
             state.stop_discovery();
             thread::sleep(Duration::from_millis(200));
         }
-        restart_runtime_services_if_running(&state, layout.clone())?;
+        restart_runtime_services_if_running(&state)?;
         if !state
             .runtime
             .lock()
@@ -704,7 +704,7 @@ fn save_layout(
             state.start_discovery()?;
         }
     }
-    Ok(layout)
+    Ok(state.snapshot())
 }
 
 fn runtime_relevant_layout_changed(previous: &LayoutState, next: &LayoutState) -> bool {
@@ -716,10 +716,7 @@ fn runtime_relevant_layout_changed(previous: &LayoutState, next: &LayoutState) -
         || previous.transport_port != next.transport_port
 }
 
-fn restart_runtime_services_if_running(
-    state: &AppRuntime,
-    layout: LayoutState,
-) -> Result<(), String> {
+fn restart_runtime_services_if_running(state: &AppRuntime) -> Result<(), String> {
     let started = state
         .runtime
         .lock()
@@ -735,16 +732,20 @@ fn restart_runtime_services_if_running(
     state.stop_discovery();
     thread::sleep(Duration::from_millis(300));
     state.start_discovery()?;
+    let layout = state.layout_snapshot();
     let (capture, inject) = state.start_input(layout.clone());
-    let clipboard = state.start_clipboard(layout);
+    let clipboard = state.start_clipboard(layout.clone());
+    let discovery = state.discovery_status_for_layout(&layout);
     let mut runtime = state
         .runtime
         .lock()
         .map_err(|_| "runtime state lock poisoned".to_string())?;
 
+    runtime.transport = ready_transport_status(&discovery);
     runtime.capture = capture;
     runtime.inject = inject;
     runtime.clipboard = clipboard;
+    runtime.discovery = discovery;
     Ok(())
 }
 
@@ -767,13 +768,7 @@ fn start_runtime(state: tauri::State<'_, AppRuntime>) -> Result<RuntimeStatus, S
 
     *runtime = RuntimeStatus {
         started: true,
-        transport: NativeStageStatus {
-            state: "ready".into(),
-            detail: format!(
-                "UDP discovery is ready on {}; QUIC is ready on {} for input datagrams and clipboard streams.",
-                discovery.port, discovery.local_peer.quic_port
-            ),
-        },
+        transport: ready_transport_status(&discovery),
         capture,
         inject,
         clipboard,
@@ -782,6 +777,16 @@ fn start_runtime(state: tauri::State<'_, AppRuntime>) -> Result<RuntimeStatus, S
     };
 
     Ok(runtime.clone())
+}
+
+fn ready_transport_status(discovery: &DiscoveryStatus) -> NativeStageStatus {
+    NativeStageStatus {
+        state: "ready".into(),
+        detail: format!(
+            "UDP discovery is ready on {}; QUIC is ready on {} for input datagrams and clipboard streams.",
+            discovery.port, discovery.local_peer.quic_port
+        ),
+    }
 }
 
 #[tauri::command]

@@ -595,15 +595,8 @@ function App() {
   async function persistLayout(nextLayout: LayoutState) {
     setIsSaving(true);
     try {
-      const persistedLayout = await saveLayout(nextLayout);
-      setSnapshot((current) =>
-        current
-          ? {
-              ...current,
-              layout: persistedLayout,
-            }
-          : current,
-      );
+      const persistedSnapshot = await saveLayout(nextLayout);
+      setSnapshot(persistedSnapshot);
     } catch (error: unknown) {
       setErrorMessage(
         error instanceof Error ? error.message : ui.errors.saveLayout,

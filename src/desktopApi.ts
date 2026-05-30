@@ -90,12 +90,15 @@ export async function loadAppState(): Promise<AppStateSnapshot> {
   return invoke<AppStateSnapshot>('load_app_state')
 }
 
-export async function saveLayout(layout: LayoutState): Promise<LayoutState> {
+export async function saveLayout(layout: LayoutState): Promise<AppStateSnapshot> {
   if (!isTauri()) {
-    return layout
+    return {
+      layout,
+      runtime: browserRuntime,
+    }
   }
 
-  return invoke<LayoutState>('save_layout', { layout })
+  return invoke<AppStateSnapshot>('save_layout', { layout })
 }
 
 export async function startRuntime(): Promise<RuntimeStatus> {
