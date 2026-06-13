@@ -27,6 +27,11 @@ mod quic_transport;
 const DISCOVERY_PORT: u16 = 47833;
 const TRANSPORT_PORT_MIN: u16 = 1024;
 const TRANSPORT_PORT_MAX: u16 = 65_535;
+// A peer that wanted the discovery port but found it taken drifts upward (see
+// `bind_available_udp_port`). We aim discovery traffic at this many consecutive
+// ports starting from the configured base, so two peers that landed on different
+// ports (e.g. 47833 and 47834) still reach each other.
+const DISCOVERY_PORT_SPAN: u16 = 8;
 const REPOSITORY_URL: &str = "https://github.com/XxMinor/mykvm";
 const RELEASES_URL: &str = "https://github.com/XxMinor/mykvm/releases/latest";
 const DISCOVERY_PROTOCOL: &str = "mykvm.discovery.v1";
@@ -504,7 +509,10 @@ impl AppRuntime {
         socket
             .set_read_timeout(Some(Duration::from_millis(500)))
             .map_err(|error| format!("failed to set discovery read timeout: {error}"))?;
-        let broadcast_targets = broadcast_addrs(actual_port);
+        // Aim announces at the configured base port and the span above it, not
+        // our own (possibly drifted) `actual_port`, so a peer that landed on a
+        // neighbouring port still receives them.
+        let broadcast_targets = broadcast_addrs(desired_port);
         sync_layout_peer_presence(&self.layout, &self.peers);
 
         thread::spawn(move || {
@@ -733,6 +741,9 @@ impl AppRuntime {
         }
         self.remote_input_active.store(false, Ordering::Relaxed);
         input::clear_clipboard_target(&self.clipboard_target);
+        // Drop any modifier flags we were holding for injection so a lost
+        // key-up cannot leave Shift/Ctrl/Cmd stuck for the next session.
+        input::reset_injected_modifiers();
     }
 
     fn stop_clipboard(&self) {
@@ -1002,7 +1013,7 @@ fn scan_lan_peers(state: tauri::State<'_, AppRuntime>) -> Result<DiscoveryStatus
     if let Some(transport) = state.quic_transport_handle() {
         apply_transport_to_peer(&mut local_peer, &transport);
     }
-    let discovered = scan_for_peers(&local_peer)?;
+    let discovered = scan_for_peers(&local_peer, discovery_base_port(&layout))?;
 
     for peer in discovered {
         merge_peer(&state.peers, peer);
@@ -1025,7 +1036,7 @@ fn probe_lan_peer(host: String, state: tauri::State<'_, AppRuntime>) -> Result<L
     if let Some(transport) = state.quic_transport_handle() {
         apply_transport_to_peer(&mut local_peer, &transport);
     }
-    let peer = probe_for_peer(&local_peer, &host)?;
+    let peer = probe_for_peer(&local_peer, &host, discovery_base_port(&layout))?;
     merge_peer(&state.peers, peer.clone());
     sync_layout_peer_presence(&state.layout, &state.peers);
     Ok(peer)
@@ -2000,12 +2011,12 @@ fn bind_available_udp_port(preferred: u16) -> Result<(UdpSocket, u16), String> {
             break;
         }
 
-        if let Ok(socket) = UdpSocket::bind(("0.0.0.0", candidate)) {
+        if let Ok(socket) = bind_reusable_udp_port(candidate) {
             return Ok((socket, candidate));
         }
     }
 
-    let socket = UdpSocket::bind("0.0.0.0:0")
+    let socket = bind_reusable_udp_port(0)
         .map_err(|error| format!("failed to bind any UDP transport port: {error}"))?;
     let port = socket
         .local_addr()
@@ -2013,6 +2024,24 @@ fn bind_available_udp_port(preferred: u16) -> Result<(UdpSocket, u16), String> {
         .port();
 
     Ok((socket, port))
+}
+
+/// Bind a UDP socket on `0.0.0.0:port` with address/port reuse enabled. Reuse
+/// lets a fresh discovery socket re-grab the same port while the previous one is
+/// still tearing down on a runtime restart (the old socket can sit in `recv_from`
+/// for up to its read timeout). Without it the rebind failed and the port
+/// silently drifted upward (47833 -> 47834), stranding two peers on mismatched
+/// discovery ports so they could never see each other again.
+fn bind_reusable_udp_port(port: u16) -> std::io::Result<UdpSocket> {
+    use socket2::{Domain, Protocol, Socket, Type};
+
+    let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+    socket.set_reuse_address(true)?;
+    #[cfg(unix)]
+    socket.set_reuse_port(true)?;
+    let address = std::net::SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, port));
+    socket.bind(&address.into())?;
+    Ok(socket.into())
 }
 
 fn clipboard_disabled_status() -> NativeStageStatus {
@@ -2928,7 +2957,7 @@ fn local_peer_id(host: &str, ip: &str) -> String {
     }
 }
 
-fn scan_for_peers(local_peer: &LanPeer) -> Result<Vec<LanPeer>, String> {
+fn scan_for_peers(local_peer: &LanPeer, base_port: u16) -> Result<Vec<LanPeer>, String> {
     let socket = UdpSocket::bind("0.0.0.0:0")
         .map_err(|error| format!("failed to open UDP scan socket: {error}"))?;
     socket
@@ -2938,11 +2967,11 @@ fn scan_for_peers(local_peer: &LanPeer) -> Result<Vec<LanPeer>, String> {
         .set_read_timeout(Some(Duration::from_millis(250)))
         .map_err(|error| format!("failed to set UDP scan timeout: {error}"))?;
 
-    for target in broadcast_addrs(local_peer.transport_port) {
+    for target in broadcast_addrs(base_port) {
         let _ = send_discovery_packet(&socket, "announce", local_peer, target);
     }
     // Fallback for networks that drop broadcast but forward unicast.
-    for target in unicast_sweep_targets(local_peer.transport_port) {
+    for target in unicast_sweep_targets(base_port) {
         let _ = send_discovery_packet(&socket, "announce", local_peer, target.as_str());
     }
 
@@ -2965,15 +2994,25 @@ fn scan_for_peers(local_peer: &LanPeer) -> Result<Vec<LanPeer>, String> {
     Ok(peers)
 }
 
-fn probe_for_peer(local_peer: &LanPeer, host: &str) -> Result<LanPeer, String> {
-    let target = format!("{}:{}", host.trim(), local_peer.transport_port);
+fn probe_for_peer(local_peer: &LanPeer, host: &str, base_port: u16) -> Result<LanPeer, String> {
+    let (host, explicit_port) = split_host_port(host.trim());
     let socket = UdpSocket::bind("0.0.0.0:0")
         .map_err(|error| format!("failed to open UDP probe socket: {error}"))?;
     socket
         .set_read_timeout(Some(Duration::from_millis(250)))
         .map_err(|error| format!("failed to set UDP probe timeout: {error}"))?;
 
-    send_discovery_packet(&socket, "probe", local_peer, target.as_str())?;
+    // With an explicit `host:port` probe exactly that port (e.g. a forwarded
+    // public endpoint reached across NAT); otherwise the peer may have drifted
+    // off the base port onto a neighbour, so probe the whole discovery span.
+    let ports = match explicit_port {
+        Some(port) => vec![port],
+        None => discovery_target_ports(base_port),
+    };
+    for port in &ports {
+        let target = format!("{host}:{port}");
+        let _ = send_discovery_packet(&socket, "probe", local_peer, target.as_str());
+    }
 
     let started = Instant::now();
     let mut buffer = [0_u8; 4096];
@@ -2989,10 +3028,31 @@ fn probe_for_peer(local_peer: &LanPeer, host: &str) -> Result<LanPeer, String> {
         }
     }
 
+    let port_hint = match (ports.first(), ports.last()) {
+        (Some(first), Some(last)) if first != last => format!("UDP {first}-{last}"),
+        (Some(only), _) => format!("UDP {only}"),
+        _ => format!("UDP {base_port}"),
+    };
     Err(format!(
-    "no mykvm peer answered at {host}:{}; make sure mykvm is running on that device and UDP {} is allowed",
-    local_peer.transport_port, local_peer.transport_port
-  ))
+        "no mykvm peer answered at {host} ({port_hint}); \
+         make sure mykvm is running on that device and UDP is allowed"
+    ))
+}
+
+/// Splits a manual `host` entry into a host and an optional explicit port. A
+/// parseable trailing `:<port>` (e.g. `203.0.113.7:47833`) pins the probe to
+/// that exact port — useful across NAT/port-forwarding where the peer is not on
+/// the default discovery port. Bare hosts return `None`.
+fn split_host_port(input: &str) -> (String, Option<u16>) {
+    if let Some((host, port)) = input.rsplit_once(':') {
+        let host = host.trim();
+        if !host.is_empty() {
+            if let Ok(port) = port.trim().parse::<u16>() {
+                return (host.to_string(), Some(port));
+            }
+        }
+    }
+    (input.trim().to_string(), None)
 }
 
 fn send_discovery_packet(
@@ -3110,19 +3170,55 @@ fn discovery_detail(peer_count: usize, listening: bool, port: u16) -> String {
     format!("UDP {port} is {mode}; {peer_count} LAN peer(s) detected.")
 }
 
-pub(crate) fn broadcast_addrs(port: u16) -> Vec<String> {
-    let mut addresses = vec![format!("255.255.255.255:{port}")];
-
-    if let Some(ip) = local_ip_address() {
+/// Broadcast destinations for discovery, fanned out across the discovery port
+/// span (`base_port ..= base_port + DISCOVERY_PORT_SPAN - 1`). Sending to the
+/// whole span — rather than a single port — lets us reach peers that drifted
+/// onto a neighbouring port when their preferred port was momentarily taken.
+pub(crate) fn broadcast_addrs(base_port: u16) -> Vec<String> {
+    let subnet_prefix = local_ip_address().and_then(|ip| {
         let parts = ip.split('.').collect::<Vec<_>>();
-        if parts.len() == 4 {
-            addresses.push(format!("{}.{}.{}.255:{port}", parts[0], parts[1], parts[2]));
+        (parts.len() == 4).then(|| format!("{}.{}.{}", parts[0], parts[1], parts[2]))
+    });
+
+    let mut addresses = Vec::new();
+    for port in discovery_target_ports(base_port) {
+        addresses.push(format!("255.255.255.255:{port}"));
+        if let Some(prefix) = &subnet_prefix {
+            addresses.push(format!("{prefix}.255:{port}"));
         }
     }
 
     addresses.sort();
     addresses.dedup();
     addresses
+}
+
+/// The consecutive discovery ports we aim traffic at, starting from `base`.
+fn discovery_target_ports(base: u16) -> Vec<u16> {
+    let base = normalize_transport_port(base);
+    let mut ports = Vec::new();
+    for offset in 0..DISCOVERY_PORT_SPAN {
+        let Some(port) = base.checked_add(offset) else {
+            break;
+        };
+        if port > TRANSPORT_PORT_MAX {
+            break;
+        }
+        ports.push(port);
+    }
+    ports
+}
+
+/// The base discovery port peers rendezvous on: the canonical port in auto mode,
+/// or the user's configured port when pinned. Discovery traffic fans out from
+/// here across `DISCOVERY_PORT_SPAN`, independent of whichever port we actually
+/// managed to bind locally.
+fn discovery_base_port(layout: &LayoutState) -> u16 {
+    if layout.transport_port_mode == "auto" {
+        default_transport_port()
+    } else {
+        normalize_transport_port(layout.transport_port)
+    }
 }
 
 /// Every other host address in our local /24, used as a fallback when a network
@@ -3357,5 +3453,48 @@ mod tests {
 
         assert_eq!(layout.devices.len(), 1);
         assert_eq!(layout.devices[0].id, "local-device");
+    }
+
+    #[test]
+    fn discovery_target_ports_spans_neighbouring_ports() {
+        let ports = discovery_target_ports(DISCOVERY_PORT);
+        assert_eq!(ports.len(), DISCOVERY_PORT_SPAN as usize);
+        assert_eq!(ports[0], DISCOVERY_PORT);
+        // A peer that drifted from 47833 to 47834 must still be a target.
+        assert!(ports.contains(&(DISCOVERY_PORT + 1)));
+        assert_eq!(*ports.last().unwrap(), DISCOVERY_PORT + DISCOVERY_PORT_SPAN - 1);
+    }
+
+    #[test]
+    fn discovery_target_ports_clamp_near_max() {
+        let ports = discovery_target_ports(TRANSPORT_PORT_MAX - 1);
+        assert_eq!(ports, vec![TRANSPORT_PORT_MAX - 1, TRANSPORT_PORT_MAX]);
+    }
+
+    #[test]
+    fn broadcast_addrs_reach_a_drifted_peer_port() {
+        // The exact failure we are fixing: one peer on 47833 must still address a
+        // peer that landed on 47834, via the global broadcast target.
+        let addrs = broadcast_addrs(DISCOVERY_PORT);
+        assert!(addrs.contains(&format!("255.255.255.255:{DISCOVERY_PORT}")));
+        assert!(addrs.contains(&format!("255.255.255.255:{}", DISCOVERY_PORT + 1)));
+    }
+
+    #[test]
+    fn split_host_port_parses_optional_port() {
+        assert_eq!(
+            split_host_port("192.168.1.5"),
+            ("192.168.1.5".to_string(), None)
+        );
+        assert_eq!(
+            split_host_port("192.168.1.5:47833"),
+            ("192.168.1.5".to_string(), Some(47833))
+        );
+        assert_eq!(
+            split_host_port("  host.local : 5000 "),
+            ("host.local".to_string(), Some(5000))
+        );
+        // A non-numeric trailing segment stays part of a bare host.
+        assert_eq!(split_host_port("myhost"), ("myhost".to_string(), None));
     }
 }

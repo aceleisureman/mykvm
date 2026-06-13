@@ -2854,12 +2854,58 @@ fn inject_scroll(delta_x: i32, delta_y: i32) {
     }
 }
 
+/// Held modifier flags to stamp on injected macOS events. Posting a bare
+/// modifier *keycode* does not make the window server apply that modifier to the
+/// key events posted after it, so capitals, shifted symbols and every shortcut
+/// (including the Ctrl<->Cmd remap) silently failed. We instead track the
+/// modifier key-downs/ups we inject and set the matching CGEventFlags on each
+/// event.
+#[cfg(target_os = "macos")]
+static MAC_INJECT_FLAGS: AtomicU64 = AtomicU64::new(0);
+
+/// Clears the tracked injected-modifier flags. Called when receiving stops so a
+/// dropped modifier key-up cannot leave Shift/Ctrl/Cmd stuck on for later keys.
+#[cfg(target_os = "macos")]
+pub fn reset_injected_modifiers() {
+    MAC_INJECT_FLAGS.store(0, Ordering::Relaxed);
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn reset_injected_modifiers() {}
+
+/// Maps a Windows virtual-key modifier (the wire format) to its macOS event
+/// flag bits, or `None` for non-modifier keys.
+#[cfg(target_os = "macos")]
+fn windows_vk_to_mac_flag(vk: u16) -> Option<u64> {
+    use core_graphics::event::CGEventFlags;
+    let flag = match vk {
+        0x10 | 0xA0 | 0xA1 => CGEventFlags::CGEventFlagShift,
+        0x11 | 0xA2 | 0xA3 => CGEventFlags::CGEventFlagControl,
+        0x12 | 0xA4 | 0xA5 => CGEventFlags::CGEventFlagAlternate,
+        0x5B | 0x5C => CGEventFlags::CGEventFlagCommand,
+        _ => return None,
+    };
+    Some(flag.bits())
+}
+
 #[cfg(target_os = "macos")]
 fn inject_key(key_code: u16, down: bool) {
     use core_graphics::{
-        event::{CGEvent, CGEventTapLocation},
+        event::{CGEvent, CGEventFlags, CGEventTapLocation},
         event_source::{CGEventSource, CGEventSourceStateID},
     };
+
+    // Keep the running modifier state in sync, so the modifier event itself and
+    // every later key carry the right flags.
+    if let Some(flag) = windows_vk_to_mac_flag(key_code) {
+        let mut flags = MAC_INJECT_FLAGS.load(Ordering::Relaxed);
+        if down {
+            flags |= flag;
+        } else {
+            flags &= !flag;
+        }
+        MAC_INJECT_FLAGS.store(flags, Ordering::Relaxed);
+    }
 
     let Some(mac_code) = windows_vk_to_mac_key(key_code) else {
         log::debug!("inject_key: no mac keycode for windows vk {key_code:#04x}; dropping");
@@ -2870,7 +2916,12 @@ fn inject_key(key_code: u16, down: bool) {
         return;
     };
     match CGEvent::new_keyboard_event(source, mac_code, down) {
-        Ok(event) => event.post(CGEventTapLocation::HID),
+        Ok(event) => {
+            event.set_flags(CGEventFlags::from_bits_truncate(
+                MAC_INJECT_FLAGS.load(Ordering::Relaxed),
+            ));
+            event.post(CGEventTapLocation::HID);
+        }
         Err(_) => log::warn!("inject_key: failed to build keyboard event for mac code {mac_code}"),
     }
 }
@@ -3046,6 +3097,20 @@ fn inject_key(_key_code: u16, _down: bool) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn windows_vk_to_mac_flag_covers_modifiers() {
+        // Modifiers (incl. sided variants and LWin/RWin -> Command) map to a flag.
+        assert!(windows_vk_to_mac_flag(0x10).is_some()); // Shift
+        assert!(windows_vk_to_mac_flag(0xA1).is_some()); // Right Shift
+        assert!(windows_vk_to_mac_flag(0x11).is_some()); // Control
+        assert!(windows_vk_to_mac_flag(0x12).is_some()); // Alt -> Option
+        assert!(windows_vk_to_mac_flag(0x5B).is_some()); // LWin -> Command
+        // Ordinary keys carry no modifier flag.
+        assert!(windows_vk_to_mac_flag(0x41).is_none()); // 'A'
+        assert!(windows_vk_to_mac_flag(0x20).is_none()); // Space
+    }
 
     fn screen(device_id: &str, id: &str, x: i32, y: i32, width: i32, height: i32) -> Screen {
         Screen {

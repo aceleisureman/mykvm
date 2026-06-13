@@ -321,6 +321,17 @@ function App() {
                 }
               : current,
           );
+
+          // Keep a persistent blocking condition visible. The inject stage holds
+          // the receiver-side reason keys/clicks get dropped (macOS Accessibility
+          // missing, or Secure Keyboard Entry on); it is otherwise never shown.
+          if (nextRuntime.started) {
+            if (nextRuntime.capture.state === "error") {
+              setErrorMessage(nextRuntime.capture.detail);
+            } else if (nextRuntime.inject.state === "error") {
+              setErrorMessage(nextRuntime.inject.detail);
+            }
+          }
         })
         .catch(() => {
           // Keep the current UI state if a transient refresh fails.
@@ -683,6 +694,11 @@ function App() {
         : await stopRuntime();
       if (nextStarted && nextRuntime.capture.state === "error") {
         setErrorMessage(nextRuntime.capture.detail);
+      } else if (nextStarted && nextRuntime.inject.state === "error") {
+        // On a client the capture stage is idle; the blocking reason (macOS
+        // Accessibility not granted, or Secure Keyboard Entry intercepting every
+        // key) lives in the inject stage, so surface that too.
+        setErrorMessage(nextRuntime.inject.detail);
       }
       setSnapshot((current) =>
         current

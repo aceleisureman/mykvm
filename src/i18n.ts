@@ -153,7 +153,7 @@ export const TEXT = {
       manual: "手动",
       noScreens: "无屏幕信息",
       deviceNamePlaceholder: "设备名称",
-      hostPlaceholder: "Host 或 IP",
+      hostPlaceholder: "Host 或 IP（可加 :端口，如 192.168.1.5:47833）",
       screensUnit: "屏",
     },
     errors: {
@@ -329,7 +329,7 @@ export const TEXT = {
       manual: "Manual",
       noScreens: "No screen data",
       deviceNamePlaceholder: "Device name",
-      hostPlaceholder: "Host or IP",
+      hostPlaceholder: "Host or IP (optional :port, e.g. 192.168.1.5:47833)",
       screensUnit: "screens",
     },
     errors: {
