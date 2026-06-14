@@ -221,6 +221,16 @@ export async function restartAsAdmin(): Promise<void> {
   await invoke('restart_as_admin')
 }
 
+export async function relaunchApp(): Promise<void> {
+  if (!isTauri()) {
+    window.location.reload()
+    return
+  }
+
+  const { relaunch } = await import('@tauri-apps/plugin-process')
+  await relaunch()
+}
+
 export async function syncWindowChrome(theme: 'dark' | 'light'): Promise<void> {
   if (!isTauri()) {
     return

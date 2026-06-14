@@ -9,8 +9,7 @@
         "minHeight": 760,
         "resizable": true,
         "theme": "Dark",
-        "fullscreen": false,
-        "transparent": true
+        "fullscreen": false
       }
     ]
   },

@@ -14,10 +14,13 @@ use crate::{quic_transport, Device, LayoutState, NativeStageStatus, Screen};
 
 const INPUT_PROTOCOL: &str = "mykvm.input.v1";
 const EDGE_TOLERANCE: i32 = 80;
-const EDGE_ACTIVATION_BAND: f64 = 32.0;
 const CROSSING_MARGIN: f64 = 4.0;
 const MIN_CROSSING_DELTA: f64 = 1.0;
-const CROSSING_AXIS_DOMINANCE: f64 = 0.6;
+const CROSSING_AXIS_DOMINANCE: f64 = 0.5;
+// On return to the local machine, drop the cursor this many pixels inside the
+// entry edge instead of flush against it. Clears CROSSING_MARGIN so a fast
+// return flick can't immediately bounce back across into the remote.
+const RETURN_EDGE_INSET: f64 = 12.0;
 const MOUSE_MOVE_SEND_INTERVAL_MS: u64 = 8;
 const DRAG_MOVE_SEND_INTERVAL_MS: u64 = 8;
 const LEFT_BUTTON_MASK: u64 = 1;
@@ -138,6 +141,7 @@ pub fn start_input_runtime(
     quic_transport: quic_transport::TransportHandle,
     stop: Arc<AtomicBool>,
     remote_active: Arc<AtomicBool>,
+    main_window_visible: Arc<AtomicBool>,
     clipboard_target: Arc<Mutex<Option<ClipboardTarget>>>,
     input_events: Arc<AtomicU64>,
 ) -> (NativeStageStatus, NativeStageStatus) {
@@ -156,6 +160,7 @@ pub fn start_input_runtime(
         quic_transport,
         stop,
         remote_active,
+        main_window_visible,
         clipboard_target,
         input_events,
     );
@@ -263,6 +268,7 @@ fn start_input_capture(
     quic_transport: quic_transport::TransportHandle,
     stop: Arc<AtomicBool>,
     remote_active: Arc<AtomicBool>,
+    main_window_visible: Arc<AtomicBool>,
     clipboard_target: Arc<Mutex<Option<ClipboardTarget>>>,
     input_events: Arc<AtomicU64>,
 ) -> NativeStageStatus {
@@ -273,6 +279,7 @@ fn start_input_capture(
         quic_transport,
         stop,
         remote_active,
+        main_window_visible,
         clipboard_target,
         input_events,
     )
@@ -286,6 +293,7 @@ fn start_platform_capture(
     quic_transport: quic_transport::TransportHandle,
     stop: Arc<AtomicBool>,
     remote_active: Arc<AtomicBool>,
+    main_window_visible: Arc<AtomicBool>,
     clipboard_target: Arc<Mutex<Option<ClipboardTarget>>>,
     input_events: Arc<AtomicU64>,
 ) -> NativeStageStatus {
@@ -305,17 +313,18 @@ fn start_platform_capture(
             native_layout,
             active: Mutex::new(None),
             remote_active,
+            main_window_visible,
             clipboard_target,
             input_events,
             anchor: Mutex::new(None),
             cursor_hidden: Mutex::new(false),
             last_mouse_move_sent: Mutex::new(None),
+            last_cursor_repin: Mutex::new(None),
             remote_button_mask: AtomicU64::new(0),
             pressed_modifiers: Mutex::new(Vec::new()),
             pressed_keys: Mutex::new(Vec::new()),
             tap_disabled: AtomicBool::new(false),
             local_y_bounds,
-            just_crossed: AtomicBool::new(false),
         });
         let callback_context = Arc::clone(&context);
         let event_types = vec![
@@ -367,6 +376,9 @@ fn start_platform_capture(
         };
         CFRunLoop::get_current().add_source(&loop_source, unsafe { kCFRunLoopCommonModes });
         tap.enable();
+        // Keep this background capture thread off App Nap so the run loop and
+        // its timers are not throttled while MyKVM is not frontmost/minimized.
+        set_macos_app_nap_suppressed(true);
         let _ = ready_tx.send(Ok(()));
 
         while !stop.load(Ordering::Relaxed) {
@@ -388,6 +400,7 @@ fn start_platform_capture(
         // otherwise the user's mouse stays frozen until the app restarts.
         set_macos_cursor_decoupled(false);
         show_macos_cursor_if_needed(&context);
+        set_macos_app_nap_suppressed(false);
         context.remote_active.store(false, Ordering::Relaxed);
         clear_clipboard_target(&context.clipboard_target);
     });
@@ -416,6 +429,7 @@ fn start_platform_capture(
     quic_transport: quic_transport::TransportHandle,
     stop: Arc<AtomicBool>,
     remote_active: Arc<AtomicBool>,
+    _main_window_visible: Arc<AtomicBool>,
     clipboard_target: Arc<Mutex<Option<ClipboardTarget>>>,
     input_events: Arc<AtomicU64>,
 ) -> NativeStageStatus {
@@ -528,6 +542,7 @@ fn start_platform_capture(
     _quic_transport: quic_transport::TransportHandle,
     _stop: Arc<AtomicBool>,
     remote_active: Arc<AtomicBool>,
+    _main_window_visible: Arc<AtomicBool>,
     clipboard_target: Arc<Mutex<Option<ClipboardTarget>>>,
     _input_events: Arc<AtomicU64>,
 ) -> NativeStageStatus {
@@ -1140,11 +1155,13 @@ struct MacCaptureContext {
     native_layout: LayoutState,
     active: Mutex<Option<ActiveTarget>>,
     remote_active: Arc<AtomicBool>,
+    main_window_visible: Arc<AtomicBool>,
     clipboard_target: Arc<Mutex<Option<ClipboardTarget>>>,
     input_events: Arc<AtomicU64>,
     anchor: Mutex<Option<(f64, f64)>>,
     cursor_hidden: Mutex<bool>,
     last_mouse_move_sent: Mutex<Option<Instant>>,
+    last_cursor_repin: Mutex<Option<Instant>>,
     remote_button_mask: AtomicU64,
     pressed_modifiers: Mutex<Vec<u16>>,
     // Regular (non-modifier) keys we have forwarded as held, so they can be
@@ -1152,10 +1169,6 @@ struct MacCaptureContext {
     pressed_keys: Mutex<Vec<u16>>,
     tap_disabled: AtomicBool,
     local_y_bounds: Option<(f64, f64)>,
-    // Set when we cross onto a remote screen; the first mouse delta after a
-    // crossing still carries the residual velocity of the flick that brought us
-    // over the edge, so we swallow it to stop the cursor darting inward.
-    just_crossed: AtomicBool,
 }
 
 #[cfg(target_os = "windows")]
@@ -1176,8 +1189,8 @@ struct WindowsCaptureContext {
     remote_button_mask: AtomicU64,
     pressed_keys: Mutex<Vec<u16>>,
     cursor_hide_calls: Mutex<u8>,
-    // See `MacCaptureContext::just_crossed`: swallow the first post-crossing
-    // delta so a fast flick across the edge does not shove the cursor inward.
+    // Swallow the first post-crossing delta so a fast flick across the edge
+    // does not shove the cursor inward on Windows, where we pin by warping.
     just_crossed: AtomicBool,
 }
 
@@ -1267,7 +1280,10 @@ fn release_remote_buttons(
             send_packet(
                 quic_transport,
                 target,
-                InputEvent::MouseButton { button, down: false },
+                InputEvent::MouseButton {
+                    button,
+                    down: false,
+                },
                 layout_state,
                 input_events,
             );
@@ -1540,6 +1556,12 @@ fn handle_windows_mouse_move(context: &WindowsCaptureContext, x: f64, y: f64) ->
         if update_active_remote_screen(active_target, dx, dy, &context.layout_state) {
             let point = local_return_point(active_target);
             let target = active_target.target.clone();
+            let _ = send_remote_mouse_move(
+                &context.quic_transport,
+                active_target,
+                &context.layout_state,
+                &context.input_events,
+            );
             *active = None;
             context.remote_active.store(false, Ordering::Relaxed);
             // Keep the clipboard peer so copies still sync after returning.
@@ -1920,18 +1942,12 @@ fn handle_macos_mouse_move(
     dx: f64,
     dy: f64,
 ) -> core_graphics::event::CallbackResult {
-    use core_graphics::{display::CGDisplay, event::CallbackResult, geometry::CGPoint};
+    use core_graphics::{event::CallbackResult, geometry::CGPoint};
 
+    let location = event.location();
     if let Ok(mut active) = context.active.lock() {
         if let Some(active_target) = active.as_mut() {
             let dy = if active_target.invert_y { -dy } else { dy };
-            if context.just_crossed.swap(false, Ordering::Relaxed) {
-                // Swallow the first delta after crossing: it carries the residual
-                // velocity of the flick across the edge and would otherwise shove
-                // the remote cursor inward in proportion to crossing speed.
-                hide_macos_cursor_if_needed(context);
-                return CallbackResult::Drop;
-            }
             active_target.x += dx;
             active_target.y += dy;
 
@@ -1939,19 +1955,34 @@ fn handle_macos_mouse_move(
                 let point = local_return_point(active_target);
                 let invert_y = active_target.invert_y;
                 let target = active_target.target.clone();
+                let _ = send_remote_mouse_move(
+                    &context.quic_transport,
+                    active_target,
+                    &context.layout_state,
+                    &context.input_events,
+                );
                 *active = None;
                 context.remote_active.store(false, Ordering::Relaxed);
                 // Keep the clipboard peer so copies still sync after returning.
                 release_held_remote_inputs_macos(context, &target);
                 reset_mouse_move_timer(&context.last_mouse_move_sent);
+                reset_cursor_repin_timer(context);
                 if let Ok(mut anchor) = context.anchor.lock() {
                     *anchor = None;
                 }
-                // Reconnect the cursor before warping it back to the local edge.
-                set_macos_cursor_decoupled(false);
-                show_macos_cursor_if_needed(context);
                 let point = mac_cursor_point(context, point, invert_y);
-                let _ = CGDisplay::warp_mouse_cursor_position(CGPoint::new(point.0, point.1));
+                // Smooth slide-back: drop the post-warp local-events suppression
+                // for just this final warp so the local pointer tracks the mouse
+                // immediately instead of freezing for ~0.25s. Re-associating then
+                // flushes any suppression still pending from the last re-pin, and
+                // the default is restored right after so re-pins keep parking the
+                // cursor on the next remote session (a persistent 0 makes the
+                // server cursor follow the mouse while not frontmost).
+                set_macos_warp_suppression_interval(0.0);
+                move_macos_cursor_without_event(CGPoint::new(point.0, point.1));
+                set_macos_cursor_decoupled(false);
+                set_macos_warp_suppression_interval(MACOS_DEFAULT_WARP_SUPPRESSION_SECS);
+                show_macos_cursor_if_needed(context);
                 return CallbackResult::Drop;
             }
 
@@ -1973,6 +2004,7 @@ fn handle_macos_mouse_move(
                     context.remote_active.store(false, Ordering::Relaxed);
                     clear_clipboard_target(&context.clipboard_target);
                     reset_mouse_move_timer(&context.last_mouse_move_sent);
+                    reset_cursor_repin_timer(context);
                     reset_remote_button_mask(&context.remote_button_mask);
                     if let Ok(mut modifiers) = context.pressed_modifiers.lock() {
                         modifiers.clear();
@@ -1985,15 +2017,11 @@ fn handle_macos_mouse_move(
                     return CallbackResult::Keep;
                 }
             }
-            hide_macos_cursor_if_needed(context);
-            // No per-event warp: the cursor is decoupled from the mouse (set on
-            // crossing), so the physical mouse drives the remote via deltas while
-            // the local cursor stays put. This is what removes the drift/stutter.
+            repin_macos_cursor_if_drifted(context, location);
             return CallbackResult::Drop;
         }
     }
 
-    let location = event.location();
     let targets = current_input_targets(&context.layout_state, &context.native_layout);
     if let Some(active_target) =
         mac_crossing_target(context, &targets, location.x, location.y, dx, dy)
@@ -2003,6 +2031,8 @@ fn handle_macos_mouse_move(
             local_anchor_point(&active_target),
             active_target.invert_y,
         );
+        set_macos_cursor_decoupled(true);
+        move_macos_cursor_without_event(CGPoint::new(anchor.0, anchor.1));
         hide_macos_cursor_if_needed(context);
         if !send_remote_mouse_move(
             &context.quic_transport,
@@ -2012,11 +2042,13 @@ fn handle_macos_mouse_move(
         ) {
             reset_mouse_move_timer(&context.last_mouse_move_sent);
             reset_remote_button_mask(&context.remote_button_mask);
+            reset_cursor_repin_timer(context);
             set_macos_cursor_decoupled(false);
             show_macos_cursor_if_needed(context);
             return CallbackResult::Keep;
         }
-        mark_mouse_move_sent(&context.last_mouse_move_sent);
+        reset_mouse_move_timer(&context.last_mouse_move_sent);
+        reset_cursor_repin_timer(context);
         reset_remote_button_mask(&context.remote_button_mask);
         context.remote_active.store(true, Ordering::Relaxed);
         set_control_clipboard_target(
@@ -2030,10 +2062,6 @@ fn handle_macos_mouse_move(
         if let Ok(mut anchor_state) = context.anchor.lock() {
             *anchor_state = Some(anchor);
         }
-        let _ = CGDisplay::warp_mouse_cursor_position(CGPoint::new(anchor.0, anchor.1));
-        // Decouple the cursor for the duration of remote control.
-        set_macos_cursor_decoupled(true);
-        context.just_crossed.store(true, Ordering::Relaxed);
         return CallbackResult::Drop;
     }
 
@@ -2148,13 +2176,15 @@ fn is_crossing_screen(screen: &Screen, edge: Edge, x: f64, y: f64, dx: f64, dy: 
     let right = (screen.x + screen.width) as f64;
     let top = screen.y as f64;
     let bottom = (screen.y + screen.height) as f64;
-    let previous_x = x - dx;
-    let previous_y = y - dy;
 
-    if !was_in_edge_activation_band(edge, left, right, top, bottom, previous_x, previous_y) {
-        return false;
-    }
-
+    // The OS clamps the cursor against the physical screen boundary, so "within
+    // CROSSING_MARGIN of the edge and still pushing outward" is already strong
+    // evidence of intent. We deliberately do NOT gate on a reconstructed previous
+    // position (x - dx): a fast flick produces a large single-frame delta, which
+    // shoved that reconstructed point outside the old activation band and made
+    // flicks fail to cross — the "had to slow down / push twice" stickiness. The
+    // band never protected against resting-at-edge false triggers anyway (the
+    // reconstructed point sits in the band there too), so dropping it is pure win.
     match edge {
         Edge::Right => {
             dx >= MIN_CROSSING_DELTA
@@ -2181,43 +2211,6 @@ fn is_crossing_screen(screen: &Screen, edge: Edge, x: f64, y: f64, dx: f64, dy: 
             dy <= -MIN_CROSSING_DELTA
                 && dy.abs() >= dx.abs() * CROSSING_AXIS_DOMINANCE
                 && y <= top + CROSSING_MARGIN
-                && x >= left - CROSSING_MARGIN
-                && x <= right + CROSSING_MARGIN
-        }
-    }
-}
-
-fn was_in_edge_activation_band(
-    edge: Edge,
-    left: f64,
-    right: f64,
-    top: f64,
-    bottom: f64,
-    x: f64,
-    y: f64,
-) -> bool {
-    match edge {
-        Edge::Right => {
-            x >= right - EDGE_ACTIVATION_BAND
-                && x <= right + CROSSING_MARGIN
-                && y >= top - CROSSING_MARGIN
-                && y <= bottom + CROSSING_MARGIN
-        }
-        Edge::Left => {
-            x <= left + EDGE_ACTIVATION_BAND
-                && x >= left - CROSSING_MARGIN
-                && y >= top - CROSSING_MARGIN
-                && y <= bottom + CROSSING_MARGIN
-        }
-        Edge::Bottom => {
-            y >= bottom - EDGE_ACTIVATION_BAND
-                && y <= bottom + CROSSING_MARGIN
-                && x >= left - CROSSING_MARGIN
-                && x <= right + CROSSING_MARGIN
-        }
-        Edge::Top => {
-            y <= top + EDGE_ACTIVATION_BAND
-                && y >= top - CROSSING_MARGIN
                 && x >= left - CROSSING_MARGIN
                 && x <= right + CROSSING_MARGIN
         }
@@ -2307,10 +2300,9 @@ fn update_active_remote_screen(
     let global_y = active.current_screen.y as f64 + active.y;
 
     // Roam onto an adjacent screen of the same device that holds this point.
-    if let Some(screen) = screens
-        .iter()
-        .find(|screen| screen.id != active.current_screen.id && point_in_screen(screen, global_x, global_y))
-    {
+    if let Some(screen) = screens.iter().find(|screen| {
+        screen.id != active.current_screen.id && point_in_screen(screen, global_x, global_y)
+    }) {
         active.x = global_x - screen.x as f64;
         active.y = global_y - screen.y as f64;
         active.current_screen_id = screen.id.clone();
@@ -2321,7 +2313,7 @@ fn update_active_remote_screen(
     // Off the edge with no neighbor there. Only the entry screen borders the
     // local machine, so only it can hand control back; every other outer edge
     // just clamps the cursor in place.
-    active.current_screen_id == active.target.screen_id
+    let returned_to_local = active.current_screen_id == active.target.screen_id
         && exited_entry_edge(
             active.target.edge,
             &active.current_screen,
@@ -2329,7 +2321,12 @@ fn update_active_remote_screen(
             active.y,
             dx,
             dy,
-        )
+        );
+    if returned_to_local {
+        pin_active_to_entry_edge(active);
+    }
+
+    returned_to_local
 }
 
 /// True when local coordinates `x`/`y` are inside `screen`'s bounds.
@@ -2354,6 +2351,22 @@ fn exited_entry_edge(edge: Edge, screen: &Screen, x: f64, y: f64, dx: f64, dy: f
         Edge::Left => x >= (screen.width - 1) as f64 && dx > 0.0,
         Edge::Bottom => y <= 0.0 && dy < 0.0,
         Edge::Top => y >= (screen.height - 1) as f64 && dy > 0.0,
+    }
+}
+
+fn pin_active_to_entry_edge(active: &mut ActiveTarget) {
+    active.x = active
+        .x
+        .clamp(0.0, (active.current_screen.width - 1) as f64);
+    active.y = active
+        .y
+        .clamp(0.0, (active.current_screen.height - 1) as f64);
+
+    match active.target.edge {
+        Edge::Right => active.x = 0.0,
+        Edge::Left => active.x = (active.current_screen.width - 1) as f64,
+        Edge::Bottom => active.y = 0.0,
+        Edge::Top => active.y = (active.current_screen.height - 1) as f64,
     }
 }
 
@@ -2390,22 +2403,28 @@ fn local_return_point(active: &ActiveTarget) -> (f64, f64) {
     let native_x = local.x as f64 + ratio_x * local.width.max(1) as f64;
     let native_y = local.y as f64 + ratio_y * local.height.max(1) as f64;
 
+    // Land the cursor RETURN_EDGE_INSET pixels inside the entry edge (not flush
+    // against it). Sitting 1-2px from the edge used to fall inside CROSSING_MARGIN,
+    // so a quick return flick re-satisfied the crossing test and bounced straight
+    // back to the remote. Insetting clears that margin.
+    let inset = RETURN_EDGE_INSET.min((local.width.max(1) - 1) as f64 / 2.0);
+    let inset_v = RETURN_EDGE_INSET.min((local.height.max(1) - 1) as f64 / 2.0);
     match active.target.edge {
         Edge::Right => (
-            (local.x + local.width - 2) as f64,
+            (local.x + local.width - 1) as f64 - inset,
             native_y.clamp(local.y as f64, (local.y + local.height - 1) as f64),
         ),
         Edge::Left => (
-            (local.x + 1) as f64,
+            local.x as f64 + inset,
             native_y.clamp(local.y as f64, (local.y + local.height - 1) as f64),
         ),
         Edge::Bottom => (
             native_x.clamp(local.x as f64, (local.x + local.width - 1) as f64),
-            (local.y + local.height - 2) as f64,
+            (local.y + local.height - 1) as f64 - inset_v,
         ),
         Edge::Top => (
             native_x.clamp(local.x as f64, (local.x + local.width - 1) as f64),
-            (local.y + 1) as f64,
+            local.y as f64 + inset_v,
         ),
     }
 }
@@ -2454,6 +2473,318 @@ fn set_macos_cursor_decoupled(decoupled: bool) {
     }
 }
 
+/// macOS default: local hardware events stay suppressed for 0.25s after a warp.
+#[cfg(target_os = "macos")]
+const MACOS_DEFAULT_WARP_SUPPRESSION_SECS: f64 = 0.25;
+
+/// Set how long macOS suppresses local hardware mouse events after a cursor
+/// warp (`CGWarpMouseCursorPosition` / `CGDisplayMoveCursorToPoint`).
+///
+/// This is a process-wide setting, so it must NOT be left at `0`: while not
+/// frontmost the OS re-associates the cursor and the capture loop re-pins it
+/// with warps, and the suppression window is what *parks* the warped cursor at
+/// the anchor between re-pins. With it at `0` the server cursor visibly follows
+/// the mouse and edge crossing gets confused. Instead, drop it to `0` only for
+/// the single slide-back warp (so the local pointer tracks immediately instead
+/// of freezing ~0.25s) and restore the default right after.
+#[cfg(target_os = "macos")]
+fn set_macos_warp_suppression_interval(seconds: f64) {
+    #[link(name = "CoreGraphics", kind = "framework")]
+    extern "C" {
+        fn CGSetLocalEventsSuppressionInterval(seconds: f64) -> i32;
+    }
+    unsafe {
+        let _ = CGSetLocalEventsSuppressionInterval(seconds);
+    }
+}
+
+/// Opt the process out of macOS App Nap while input is being captured.
+///
+/// When MyKVM is not the frontmost app (another window is focused) or the
+/// window is minimized, macOS throttles our background capture thread's run
+/// loop and coalesces its timers. That throttling is exactly what makes the
+/// cursor "stutter" when it slides back from a remote device: forwarded events
+/// and cursor re-pinning fall behind, then catch up in a burst at the edge.
+///
+/// `NSProcessInfo -beginActivityWithOptions:reason:` with a latency-critical,
+/// user-initiated activity tells the OS to keep us scheduled normally. We hold
+/// the returned (retained) activity token for the whole capture lifetime and
+/// end it on teardown. The option set still allows the machine to idle-sleep.
+#[cfg(target_os = "macos")]
+fn set_macos_app_nap_suppressed(suppress: bool) {
+    use std::ffi::c_void;
+    use std::os::raw::c_char;
+    use std::sync::atomic::AtomicUsize;
+
+    // Retained NSProcessInfo activity token (as usize) held between begin/end.
+    // 0 means "no activity currently held".
+    static ACTIVITY_TOKEN: AtomicUsize = AtomicUsize::new(0);
+
+    #[link(name = "objc")]
+    extern "C" {
+        fn objc_getClass(name: *const c_char) -> *mut c_void;
+        fn sel_registerName(name: *const c_char) -> *mut c_void;
+        fn objc_msgSend();
+    }
+
+    // NSActivityOptions, from <Foundation/NSProcessInfo.h>:
+    //   NSActivityUserInitiatedAllowingIdleSystemSleep = 0x00EFFFFF
+    //   NSActivityLatencyCritical                      = 0xFF00000000
+    const NS_ACTIVITY_USER_INITIATED_ALLOWING_IDLE_SYSTEM_SLEEP: u64 = 0x00EF_FFFF;
+    const NS_ACTIVITY_LATENCY_CRITICAL: u64 = 0xFF_0000_0000;
+
+    unsafe {
+        let process_info_class = objc_getClass(b"NSProcessInfo\0".as_ptr() as *const c_char);
+        if process_info_class.is_null() {
+            return;
+        }
+        let process_info_sel = sel_registerName(b"processInfo\0".as_ptr() as *const c_char);
+        let shared: extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void =
+            std::mem::transmute(objc_msgSend as *const ());
+        let process_info = shared(process_info_class, process_info_sel);
+        if process_info.is_null() {
+            return;
+        }
+
+        if suppress {
+            if ACTIVITY_TOKEN.load(Ordering::Relaxed) != 0 {
+                return; // already suppressing
+            }
+            let string_class = objc_getClass(b"NSString\0".as_ptr() as *const c_char);
+            let string_sel = sel_registerName(b"stringWithUTF8String:\0".as_ptr() as *const c_char);
+            let make_string: extern "C" fn(
+                *mut c_void,
+                *mut c_void,
+                *const c_char,
+            ) -> *mut c_void = std::mem::transmute(objc_msgSend as *const ());
+            let reason = make_string(
+                string_class,
+                string_sel,
+                b"MyKVM forwarding keyboard and mouse\0".as_ptr() as *const c_char,
+            );
+
+            let begin_sel =
+                sel_registerName(b"beginActivityWithOptions:reason:\0".as_ptr() as *const c_char);
+            let begin: extern "C" fn(*mut c_void, *mut c_void, u64, *mut c_void) -> *mut c_void =
+                std::mem::transmute(objc_msgSend as *const ());
+            let options = NS_ACTIVITY_USER_INITIATED_ALLOWING_IDLE_SYSTEM_SLEEP
+                | NS_ACTIVITY_LATENCY_CRITICAL;
+            let activity = begin(process_info, begin_sel, options, reason);
+            if activity.is_null() {
+                return;
+            }
+            // The returned activity is autoreleased; retain it so it survives
+            // past the current autorelease pool until we explicitly end it.
+            let retain_sel = sel_registerName(b"retain\0".as_ptr() as *const c_char);
+            let retain: extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void =
+                std::mem::transmute(objc_msgSend as *const ());
+            let retained = retain(activity, retain_sel);
+            ACTIVITY_TOKEN.store(retained as usize, Ordering::Relaxed);
+        } else {
+            let token = ACTIVITY_TOKEN.swap(0, Ordering::Relaxed);
+            if token == 0 {
+                return;
+            }
+            let activity = token as *mut c_void;
+            let end_sel = sel_registerName(b"endActivity:\0".as_ptr() as *const c_char);
+            let end: extern "C" fn(*mut c_void, *mut c_void, *mut c_void) =
+                std::mem::transmute(objc_msgSend as *const ());
+            end(process_info, end_sel, activity);
+            let release_sel = sel_registerName(b"release\0".as_ptr() as *const c_char);
+            let release: extern "C" fn(*mut c_void, *mut c_void) =
+                std::mem::transmute(objc_msgSend as *const ());
+            release(activity, release_sel);
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn set_macos_cursor_hidden_with_appkit(hidden: bool) {
+    use std::ffi::c_void;
+    use std::os::raw::c_char;
+
+    #[link(name = "objc")]
+    extern "C" {
+        fn objc_getClass(name: *const c_char) -> *mut c_void;
+        fn sel_registerName(name: *const c_char) -> *mut c_void;
+        fn objc_msgSend();
+    }
+
+    unsafe {
+        let class = objc_getClass(b"NSCursor\0".as_ptr() as *const c_char);
+        if class.is_null() {
+            return;
+        }
+        let selector = if hidden {
+            sel_registerName(b"hide\0".as_ptr() as *const c_char)
+        } else {
+            sel_registerName(b"unhide\0".as_ptr() as *const c_char)
+        };
+        let msg_void: extern "C" fn(*mut c_void, *mut c_void) =
+            std::mem::transmute(objc_msgSend as *const ());
+        msg_void(class, selector);
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn repin_macos_cursor_if_drifted(
+    context: &MacCaptureContext,
+    location: core_graphics::geometry::CGPoint,
+) {
+    const VISIBLE_DRIFT_THRESHOLD_PX: f64 = 1.5;
+    const HIDDEN_DRIFT_THRESHOLD_PX: f64 = 48.0;
+    const VISIBLE_REPIN_INTERVAL_MS: u64 = 8;
+    const HIDDEN_REPIN_INTERVAL_MS: u64 = 50;
+
+    let Ok(anchor) = context.anchor.lock() else {
+        return;
+    };
+    let Some((x, y)) = *anchor else {
+        return;
+    };
+    drop(anchor);
+
+    let window_visible = context.main_window_visible.load(Ordering::Relaxed);
+    let drift_threshold = if window_visible {
+        VISIBLE_DRIFT_THRESHOLD_PX
+    } else {
+        HIDDEN_DRIFT_THRESHOLD_PX
+    };
+    let dx = location.x - x;
+    let dy = location.y - y;
+    if dx.abs() <= drift_threshold && dy.abs() <= drift_threshold {
+        return;
+    }
+
+    let repin_interval = Duration::from_millis(if window_visible {
+        VISIBLE_REPIN_INTERVAL_MS
+    } else {
+        HIDDEN_REPIN_INTERVAL_MS
+    });
+    if !macos_cursor_repin_due(context, repin_interval) {
+        return;
+    }
+
+    // When MyKVM is not frontmost, macOS can re-associate the cursor with the
+    // physical mouse despite CGAssociateMouseAndMouseCursorPosition(false).
+    // Re-pin only after actual drift and at a capped rate. Hidden/minimized
+    // windows get a looser cap to avoid visible edge-switch stutter.
+    set_macos_cursor_decoupled(true);
+    move_macos_cursor_without_event(core_graphics::geometry::CGPoint::new(x, y));
+    hide_macos_cursor_if_needed(context);
+}
+
+#[cfg(target_os = "macos")]
+fn macos_cursor_repin_due(context: &MacCaptureContext, interval: Duration) -> bool {
+    let Ok(mut last_repin) = context.last_cursor_repin.lock() else {
+        return true;
+    };
+    let now = Instant::now();
+    if last_repin
+        .as_ref()
+        .map(|last| now.duration_since(*last) < interval)
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    *last_repin = Some(now);
+    true
+}
+
+#[cfg(target_os = "macos")]
+fn reset_cursor_repin_timer(context: &MacCaptureContext) {
+    if let Ok(mut last_repin) = context.last_cursor_repin.lock() {
+        *last_repin = None;
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn move_macos_cursor_without_event(point: core_graphics::geometry::CGPoint) {
+    use core_graphics::display::CGDisplay;
+
+    if let Ok(displays) = CGDisplay::active_displays() {
+        for display_id in displays {
+            let display = CGDisplay::new(display_id);
+            let bounds = display.bounds();
+            let max_x = bounds.origin.x + bounds.size.width;
+            let max_y = bounds.origin.y + bounds.size.height;
+            if point.x >= bounds.origin.x
+                && point.x <= max_x
+                && point.y >= bounds.origin.y
+                && point.y <= max_y
+            {
+                let local_point = core_graphics::geometry::CGPoint::new(
+                    point.x - bounds.origin.x,
+                    point.y - bounds.origin.y,
+                );
+                if display.move_cursor_to_point(local_point).is_ok() {
+                    return;
+                }
+            }
+        }
+    }
+
+    let _ = CGDisplay::warp_mouse_cursor_position(point);
+}
+
+/// Arms macOS to hide the pointer even when MyKVM is NOT the frontmost app.
+///
+/// `CGDisplayHideCursor` / `[NSCursor hide]` are normally honored only while the
+/// calling app is frontmost, so once MyKVM is minimized / backgrounded / its
+/// window is closed, the local cursor reappears at the screen edge during a
+/// crossing — the "not seamless, cursor shows up" symptom. Setting the private
+/// CGS connection property `SetsCursorInBackground` to true makes the hide stick
+/// regardless of focus. The symbols are resolved at runtime via `dlsym` so a
+/// macOS build that has moved/removed them (they live in CoreGraphics today,
+/// SkyLight on newer systems) degrades gracefully instead of failing to link.
+#[cfg(target_os = "macos")]
+fn enable_macos_background_cursor_hide() {
+    use core_foundation::{base::TCFType, boolean::CFBoolean, string::CFString};
+    use std::os::raw::{c_char, c_int, c_void};
+
+    extern "C" {
+        fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
+    }
+    // RTLD_DEFAULT on macOS searches every already-loaded image.
+    const RTLD_DEFAULT: *mut c_void = -2isize as *mut c_void;
+
+    static ENABLED: AtomicBool = AtomicBool::new(false);
+    if ENABLED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+
+    unsafe {
+        let main_conn = dlsym(
+            RTLD_DEFAULT,
+            b"CGSMainConnectionID\0".as_ptr() as *const c_char,
+        );
+        let set_prop = dlsym(
+            RTLD_DEFAULT,
+            b"CGSSetConnectionProperty\0".as_ptr() as *const c_char,
+        );
+        if main_conn.is_null() || set_prop.is_null() {
+            return;
+        }
+
+        let main_conn: extern "C" fn() -> c_int = std::mem::transmute(main_conn);
+        let set_prop: extern "C" fn(c_int, c_int, *const c_void, *const c_void) -> c_int =
+            std::mem::transmute(set_prop);
+
+        let cid = main_conn();
+        let key = CFString::from_static_string("SetsCursorInBackground");
+        let value = CFBoolean::true_value();
+        let _ = set_prop(
+            cid,
+            cid,
+            key.as_concrete_TypeRef() as *const c_void,
+            value.as_CFTypeRef() as *const c_void,
+        );
+        // Hold the CF objects until the call returns.
+        drop(key);
+        drop(value);
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn hide_macos_cursor_if_needed(context: &MacCaptureContext) {
     let Ok(mut hidden) = context.cursor_hidden.lock() else {
@@ -2462,6 +2793,11 @@ fn hide_macos_cursor_if_needed(context: &MacCaptureContext) {
     if *hidden {
         return;
     }
+
+    // Arm background hiding before the first hide so the pointer disappears at
+    // the edge even when MyKVM is minimized / not frontmost.
+    enable_macos_background_cursor_hide();
+    set_macos_cursor_hidden_with_appkit(true);
 
     if let Ok(displays) = core_graphics::display::CGDisplay::active_displays() {
         for display_id in displays {
@@ -2489,6 +2825,7 @@ fn show_macos_cursor_if_needed(context: &MacCaptureContext) {
     } else {
         let _ = core_graphics::display::CGDisplay::main().show_cursor();
     }
+    set_macos_cursor_hidden_with_appkit(false);
     *hidden = false;
 }
 
@@ -3172,6 +3509,7 @@ mod tests {
         assert!(windows_vk_to_mac_flag(0x11).is_some()); // Control
         assert!(windows_vk_to_mac_flag(0x12).is_some()); // Alt -> Option
         assert!(windows_vk_to_mac_flag(0x5B).is_some()); // LWin -> Command
+
         // Ordinary keys carry no modifier flag.
         assert!(windows_vk_to_mac_flag(0x41).is_none()); // 'A'
         assert!(windows_vk_to_mac_flag(0x20).is_none()); // Space
@@ -3334,7 +3672,10 @@ mod tests {
         // Pushing down past the primary's bottom edge roams onto the secondary.
         active.y += 5.0;
         let returned = update_active_remote_screen(&mut active, 0.0, 5.0, &layout_state);
-        assert!(!returned, "crossing onto a sibling screen must not return to local");
+        assert!(
+            !returned,
+            "crossing onto a sibling screen must not return to local"
+        );
         assert_eq!(active.current_screen_id, "scr-2");
         assert!((0.0..1080.0).contains(&active.y));
         assert_eq!(active.x, 100.0);
@@ -3349,7 +3690,14 @@ mod tests {
     #[test]
     fn cursor_returns_to_local_only_from_entry_edge() {
         let layout_state = Arc::new(Mutex::new(layout_for_target_tests()));
-        let entry = screen("peer-device", "peer-device-local-display-1", 1920, 0, 1920, 1080);
+        let entry = screen(
+            "peer-device",
+            "peer-device-local-display-1",
+            1920,
+            0,
+            1920,
+            1080,
+        );
         let target = InputTarget {
             device_id: "peer-device".into(),
             target_addr: "10.0.0.2:47834".into(),
@@ -3376,7 +3724,64 @@ mod tests {
         // Crossed in via the right edge; moving back left off the entry edge
         // hands control back to the local machine.
         active.x -= 2.0;
-        assert!(update_active_remote_screen(&mut active, -2.0, 0.0, &layout_state));
+        assert!(update_active_remote_screen(
+            &mut active,
+            -2.0,
+            0.0,
+            &layout_state
+        ));
+    }
+
+    #[test]
+    fn fast_return_pins_remote_cursor_to_entry_edge() {
+        let layout_state = Arc::new(Mutex::new(layout_for_target_tests()));
+        let entry = screen(
+            "peer-device",
+            "peer-device-local-display-1",
+            1920,
+            0,
+            1920,
+            1080,
+        );
+
+        for (edge, x, y, dx, dy, expected_x, expected_y) in [
+            (Edge::Right, 240.0, 400.0, -260.0, 18.0, 0.0, 418.0),
+            (Edge::Left, 1680.0, 400.0, 260.0, 18.0, 1919.0, 418.0),
+            (Edge::Bottom, 500.0, 260.0, 16.0, -300.0, 516.0, 0.0),
+            (Edge::Top, 500.0, 820.0, 16.0, 300.0, 516.0, 1079.0),
+        ] {
+            let target = InputTarget {
+                device_id: "peer-device".into(),
+                target_addr: "10.0.0.2:47834".into(),
+                target_platform: "windows".into(),
+                transport_public_key: "peer-public-key".into(),
+                protocol_version: quic_transport::PROTOCOL_VERSION,
+                screen_id: "local-display-1".into(),
+                local_screen: screen("local-device", "local-display-1", 0, 0, 1920, 1080),
+                layout_local_screen: screen("local-device", "local-display-1", 0, 0, 1920, 1080),
+                remote_screen: entry.clone(),
+                edge,
+            };
+            let mut current_screen = entry.clone();
+            current_screen.id = "local-display-1".into();
+            let mut active = ActiveTarget {
+                target,
+                current_screen,
+                current_screen_id: "local-display-1".into(),
+                x: x + dx,
+                y: y + dy,
+                invert_y: false,
+            };
+
+            assert!(update_active_remote_screen(
+                &mut active,
+                dx,
+                dy,
+                &layout_state
+            ));
+            assert_eq!(active.x, expected_x);
+            assert_eq!(active.y, expected_y);
+        }
     }
 
     #[test]
@@ -3572,16 +3977,37 @@ mod tests {
         let map = crate::default_modifier_map();
 
         // Control (any side) -> Meta (Windows key / macOS Command)
-        assert_eq!(remap_modifier_vk(0x11, &map.control, &map.alt, &map.meta), 0x5B);
-        assert_eq!(remap_modifier_vk(0xA2, &map.control, &map.alt, &map.meta), 0x5B);
-        assert_eq!(remap_modifier_vk(0xA3, &map.control, &map.alt, &map.meta), 0x5B);
+        assert_eq!(
+            remap_modifier_vk(0x11, &map.control, &map.alt, &map.meta),
+            0x5B
+        );
+        assert_eq!(
+            remap_modifier_vk(0xA2, &map.control, &map.alt, &map.meta),
+            0x5B
+        );
+        assert_eq!(
+            remap_modifier_vk(0xA3, &map.control, &map.alt, &map.meta),
+            0x5B
+        );
         // Meta -> Control
-        assert_eq!(remap_modifier_vk(0x5B, &map.control, &map.alt, &map.meta), 0x11);
-        assert_eq!(remap_modifier_vk(0x5C, &map.control, &map.alt, &map.meta), 0x11);
+        assert_eq!(
+            remap_modifier_vk(0x5B, &map.control, &map.alt, &map.meta),
+            0x11
+        );
+        assert_eq!(
+            remap_modifier_vk(0x5C, &map.control, &map.alt, &map.meta),
+            0x11
+        );
         // Alt stays as itself (left/right preserved via "same")
-        assert_eq!(remap_modifier_vk(0xA4, &map.control, &map.alt, &map.meta), 0xA4);
+        assert_eq!(
+            remap_modifier_vk(0xA4, &map.control, &map.alt, &map.meta),
+            0xA4
+        );
         // Non-modifier keys are untouched (e.g. the letter C)
-        assert_eq!(remap_modifier_vk(0x43, &map.control, &map.alt, &map.meta), 0x43);
+        assert_eq!(
+            remap_modifier_vk(0x43, &map.control, &map.alt, &map.meta),
+            0x43
+        );
     }
 
     #[test]

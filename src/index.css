@@ -22,15 +22,41 @@
   height: 0;
 }
 
+:root[data-remote-input-active='true'],
+:root[data-remote-input-active='true'] * {
+  cursor: none !important;
+}
+
+/* While actively controlling a remote device, swallow local trackpad gestures
+   so they get forwarded instead of scrolling our own UI. */
+:root[data-remote-input-active='true'] body {
+  touch-action: none;
+}
+
 html,
-body,
+body {
+  height: 100vh;
+  overscroll-behavior: none;
+}
+
+/* #root is the scroll container. macOS WKWebView reliably wheel/trackpad-scrolls
+   a plain block element with overflow, but not when the tall content lives in a
+   flex root mounted straight on the scrolling document (keyboard scrolls, two
+   fingers don't). Giving #root a fixed height + overflow-y makes it the scroller
+   and restores trackpad scrolling on tall pages like Settings. */
 #root {
-  min-height: 100vh;
+  height: 100vh;
+  overflow-y: auto;
+  overscroll-behavior: none;
 }
 
 body {
   margin: 0;
   background: transparent;
+  /* pan-y keeps two-finger vertical scrolling working on tall pages (e.g. the
+     settings page); a blanket `none` here disabled it everywhere. */
+  touch-action: pan-y;
+  -webkit-text-size-adjust: 100%;
 }
 
 :root[data-theme='light'],

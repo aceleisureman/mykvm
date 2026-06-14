@@ -22,6 +22,7 @@ import {
   readClipboardText,
   readPerformanceSample,
   readRuntimeStatus,
+  relaunchApp,
   restartAsAdmin,
   saveLayout,
   scanLanPeers,
@@ -136,6 +137,7 @@ function App() {
   const [isScanningLan, setIsScanningLan] = useState(false);
   const [isAddingDevice, setIsAddingDevice] = useState(false);
   const [isAdminRestartPending, setIsAdminRestartPending] = useState(false);
+  const [isAppRelaunchPending, setIsAppRelaunchPending] = useState(false);
   const [isClipboardPending, setIsClipboardPending] = useState(false);
   const [boardZoom, setBoardZoom] = useState(1);
   const [manualDeviceName, setManualDeviceName] = useState("");
@@ -416,60 +418,16 @@ function App() {
   const localPlatform =
     runtime?.discovery.localPeer.platform.toLowerCase() ??
     navigator.platform.toLowerCase();
-  const usesMacChrome = localPlatform.includes("mac");
   const usesWindowsChrome = localPlatform.includes("win");
-  const usesCustomChrome = usesMacChrome || usesWindowsChrome;
-  const chromeClassName = usesMacChrome
-    ? "custom-chrome custom-chrome-mac"
-    : usesWindowsChrome
-      ? "custom-chrome custom-chrome-windows"
-      : "";
+  const usesCustomChrome = usesWindowsChrome;
+  const chromeClassName = usesWindowsChrome
+    ? "custom-chrome custom-chrome-windows"
+    : "";
   const shellClassName = `app-shell ${chromeClassName} theme-${resolvedTheme}`;
 
   function renderWindowTitlebar() {
     if (!usesCustomChrome) {
       return null;
-    }
-
-    if (usesMacChrome) {
-      return (
-        <div className="app-titlebar app-titlebar-mac">
-          <div className="window-controls mac-window-controls">
-            <button
-              type="button"
-              className="window-control-button close"
-              title={ui.common.close}
-              aria-label={ui.common.close}
-              onClick={() => void hideMainWindow()}
-            />
-            <button
-              type="button"
-              className="window-control-button minimize"
-              title={ui.common.minimize}
-              aria-label={ui.common.minimize}
-              onClick={() => void minimizeMainWindow()}
-            />
-            <button
-              type="button"
-              className="window-control-button maximize"
-              title={ui.common.maximize}
-              aria-label={ui.common.maximize}
-              onClick={() => void toggleMaximizeMainWindow()}
-            />
-          </div>
-          <div
-            className="titlebar-drag-region"
-            data-tauri-drag-region
-            aria-hidden="true"
-            onPointerDown={(event) => {
-              if (event.button === 0) {
-                void startWindowDrag();
-              }
-            }}
-            onDoubleClick={() => void toggleMaximizeMainWindow()}
-          />
-        </div>
-      );
     }
 
     return (
@@ -953,6 +911,19 @@ function App() {
     }
   }
 
+  async function handleRelaunchApp() {
+    setIsAppRelaunchPending(true);
+
+    try {
+      await relaunchApp();
+    } catch (error: unknown) {
+      setErrorMessage(
+        error instanceof Error ? error.message : ui.errors.updateRuntime,
+      );
+      setIsAppRelaunchPending(false);
+    }
+  }
+
   async function setMachineRole(machineRole: Exclude<MachineRole, "unset">) {
     if (!layout) {
       return;
@@ -1129,6 +1100,29 @@ function App() {
     void openUpdateReleasePage();
   }
 
+  function renderErrorBanner(message: string) {
+    const canRelaunch = shouldOfferPermissionRelaunch(message);
+
+    return (
+      <div className={`error-banner ${canRelaunch ? "with-action" : ""}`} role="alert">
+        <span className="error-banner-message">{message}</span>
+        {canRelaunch ? (
+          <button
+            type="button"
+            className="error-banner-action"
+            onClick={() => void handleRelaunchApp()}
+            disabled={isAppRelaunchPending}
+          >
+            <RestartIcon />
+            <span>
+              {isAppRelaunchPending ? ui.common.relaunching : ui.common.relaunch}
+            </span>
+          </button>
+        ) : null}
+      </div>
+    );
+  }
+
   if (!snapshot || !layout || !runtime || !displayLayout) {
     return (
       <main className={shellClassName}>
@@ -1137,7 +1131,7 @@ function App() {
           <p className="eyebrow">mykvm</p>
           <h1>{ui.loading.title}</h1>
           <p>{ui.loading.copy}</p>
-          {errorMessage ? <p className="error-banner">{errorMessage}</p> : null}
+          {errorMessage ? renderErrorBanner(errorMessage) : null}
         </section>
       </main>
     );
@@ -1265,7 +1259,7 @@ function App() {
         </div>
       </header>
 
-      {errorMessage ? <p className="error-banner">{errorMessage}</p> : null}
+      {errorMessage ? renderErrorBanner(errorMessage) : null}
 
       {machineRole === "server" && currentTab === "layout" ? (
         <section className="workspace-shell">
@@ -2041,6 +2035,12 @@ function formatZoom(value: number) {
   return `${Math.round(value * 100)}%`;
 }
 
+function shouldOfferPermissionRelaunch(message: string) {
+  return ["辅助功能", "输入监控", "Accessibility", "Input Monitoring"].some(
+    (keyword) => message.includes(keyword),
+  );
+}
+
 function GitHubIcon() {
   return (
     <svg
@@ -2052,6 +2052,21 @@ function GitHubIcon() {
       <path
         fill="currentColor"
         d="M12 .5A11.5 11.5 0 0 0 8.36 22.9c.58.11.79-.25.79-.56v-2.18c-3.22.7-3.9-1.37-3.9-1.37-.53-1.34-1.29-1.7-1.29-1.7-1.05-.72.08-.7.08-.7 1.16.08 1.77 1.2 1.77 1.2 1.03 1.76 2.7 1.25 3.36.96.1-.75.4-1.25.73-1.54-2.57-.29-5.27-1.28-5.27-5.72 0-1.26.45-2.3 1.19-3.11-.12-.29-.52-1.48.11-3.07 0 0 .98-.31 3.18 1.19a10.96 10.96 0 0 1 5.78 0c2.2-1.5 3.17-1.19 3.17-1.19.64 1.59.24 2.78.12 3.07.74.81 1.18 1.85 1.18 3.11 0 4.45-2.71 5.43-5.29 5.72.42.36.79 1.07.79 2.16v3.17c0 .31.21.68.8.56A11.5 11.5 0 0 0 12 .5Z"
+      />
+    </svg>
+  );
+}
+
+function RestartIcon() {
+  return (
+    <svg className="button-icon" viewBox="0 0 24 24" aria-hidden="true">
+      <path
+        d="M20 12a8 8 0 1 1-2.34-5.66L20 8.68M20 4v4.68h-4.68"
+        fill="none"
+        stroke="currentColor"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        strokeWidth="2"
       />
     </svg>
   );

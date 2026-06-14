@@ -16,7 +16,10 @@
     "tauri:build": "tauri build --no-bundle",
     "tauri:bundle": "tauri build",
     "tauri:build:mac-arm": "tauri build --target aarch64-apple-darwin --bundles app,dmg --no-sign",
-    "tauri:build:mac-signed": "tauri build --target aarch64-apple-darwin --bundles app,dmg"
+    "tauri:build:mac-signed": "tauri build --target aarch64-apple-darwin --bundles app,dmg",
+    "mac:sign-local": "scripts/sign-mac-app.sh /Applications/mykvm.app",
+    "mac:install-local": "scripts/install-mac-app.sh",
+    "mac:build-install": "npm run tauri:build:mac-arm && npm run mac:install-local"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.11.0",

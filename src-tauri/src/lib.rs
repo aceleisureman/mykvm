@@ -289,6 +289,7 @@ struct AppRuntime {
     clipboard_seen_text: Arc<Mutex<Option<String>>>,
     clipboard_echo_until: Arc<Mutex<Option<Instant>>>,
     remote_input_active: Arc<AtomicBool>,
+    main_window_visible: Arc<AtomicBool>,
     clipboard_target: Arc<Mutex<Option<input::ClipboardTarget>>>,
     input_receive_enabled: Arc<AtomicBool>,
     clipboard_receive_enabled: Arc<AtomicBool>,
@@ -315,6 +316,7 @@ impl AppRuntime {
             clipboard_seen_text: Arc::new(Mutex::new(None)),
             clipboard_echo_until: Arc::new(Mutex::new(None)),
             remote_input_active: Arc::new(AtomicBool::new(false)),
+            main_window_visible: Arc::new(AtomicBool::new(true)),
             clipboard_target: Arc::new(Mutex::new(None)),
             input_receive_enabled: Arc::new(AtomicBool::new(false)),
             clipboard_receive_enabled: Arc::new(AtomicBool::new(false)),
@@ -626,6 +628,7 @@ impl AppRuntime {
             quic_transport,
             Arc::clone(&stop),
             Arc::clone(&self.remote_input_active),
+            Arc::clone(&self.main_window_visible),
             Arc::clone(&self.clipboard_target),
             Arc::clone(&self.input_events),
         );
@@ -947,10 +950,23 @@ fn sync_window_chrome(window: tauri::WebviewWindow, theme: String) -> Result<(),
 
 #[tauri::command]
 fn minimize_main_window(app: AppHandle) -> Result<(), String> {
-    app.get_webview_window("main")
-        .ok_or_else(|| "main window is not available".to_string())?
+    let window = app
+        .get_webview_window("main")
+        .ok_or_else(|| "main window is not available".to_string())?;
+
+    #[cfg(target_os = "macos")]
+    let result = macos_miniaturize_window(&window);
+
+    #[cfg(not(target_os = "macos"))]
+    let result = window
         .minimize()
-        .map_err(|error| format!("failed to minimize main window: {error}"))
+        .map_err(|error| format!("failed to minimize main window: {error}"));
+
+    if result.is_ok() {
+        set_main_window_visible(&app, false);
+    }
+
+    result
 }
 
 #[tauri::command]
@@ -1122,6 +1138,7 @@ fn release_single_instance() {
     }
 }
 
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 #[cfg(not(target_os = "windows"))]
 fn release_single_instance() {}
 
@@ -1221,6 +1238,188 @@ fn spawn_instance_event_listener(name: &str, app: AppHandle, event_kind: Instanc
     });
 }
 
+#[cfg(target_os = "macos")]
+static MACOS_APPKIT_CURSOR_HIDE_COUNT: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(target_os = "macos")]
+fn macos_miniaturize_window(window: &tauri::WebviewWindow) -> Result<(), String> {
+    use std::ffi::c_void;
+    use std::os::raw::c_char;
+
+    #[link(name = "objc")]
+    extern "C" {
+        fn sel_registerName(name: *const c_char) -> *mut c_void;
+        fn objc_msgSend();
+    }
+
+    let ns_window = window
+        .ns_window()
+        .map_err(|error| format!("failed to resolve NSWindow: {error}"))?;
+    if ns_window.is_null() {
+        return Err("main NSWindow is null".into());
+    }
+
+    unsafe {
+        let miniaturize_sel = sel_registerName(b"miniaturize:\0".as_ptr() as *const c_char);
+        let msg_id_arg: extern "C" fn(*mut c_void, *mut c_void, *mut c_void) =
+            std::mem::transmute(objc_msgSend as *const ());
+        msg_id_arg(ns_window, miniaturize_sel, ns_window);
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn macos_order_front_window(window: &tauri::WebviewWindow) -> Result<(), String> {
+    use std::ffi::c_void;
+    use std::os::raw::c_char;
+
+    #[link(name = "objc")]
+    extern "C" {
+        fn objc_getClass(name: *const c_char) -> *mut c_void;
+        fn sel_registerName(name: *const c_char) -> *mut c_void;
+        fn objc_msgSend();
+    }
+
+    let ns_window = window
+        .ns_window()
+        .map_err(|error| format!("failed to resolve NSWindow: {error}"))?;
+    if ns_window.is_null() {
+        return Err("main NSWindow is null".into());
+    }
+
+    unsafe {
+        let app_class = objc_getClass(b"NSApplication\0".as_ptr() as *const c_char);
+        if !app_class.is_null() {
+            let shared_sel = sel_registerName(b"sharedApplication\0".as_ptr() as *const c_char);
+            let activate_sel =
+                sel_registerName(b"activateIgnoringOtherApps:\0".as_ptr() as *const c_char);
+            let msg_id: extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void =
+                std::mem::transmute(objc_msgSend as *const ());
+            let ns_app = msg_id(app_class, shared_sel);
+            if !ns_app.is_null() {
+                let msg_bool: extern "C" fn(*mut c_void, *mut c_void, i8) =
+                    std::mem::transmute(objc_msgSend as *const ());
+                msg_bool(ns_app, activate_sel, 1);
+            }
+        }
+
+        let make_key_sel = sel_registerName(b"makeKeyAndOrderFront:\0".as_ptr() as *const c_char);
+        let msg_id_arg: extern "C" fn(*mut c_void, *mut c_void, *mut c_void) =
+            std::mem::transmute(objc_msgSend as *const ());
+        msg_id_arg(ns_window, make_key_sel, std::ptr::null_mut());
+
+        let order_front_sel = sel_registerName(b"orderFrontRegardless\0".as_ptr() as *const c_char);
+        let msg_void: extern "C" fn(*mut c_void, *mut c_void) =
+            std::mem::transmute(objc_msgSend as *const ());
+        msg_void(ns_window, order_front_sel);
+    }
+
+    Ok(())
+}
+
+/// Hide/unhide through AppKit without activating MyKVM. CoreGraphics cursor
+/// hide/decouple APIs are foreground-sensitive; AppKit's cursor hide stack lets
+/// us make the cursor invisible while the HID tap forwards movement to the
+/// remote client, without raising the visible MyKVM window.
+#[cfg(target_os = "macos")]
+fn macos_set_cursor_hidden_with_appkit(hidden: bool) {
+    use std::ffi::c_void;
+    use std::os::raw::c_char;
+
+    #[link(name = "objc")]
+    extern "C" {
+        fn objc_getClass(name: *const c_char) -> *mut c_void;
+        fn sel_registerName(name: *const c_char) -> *mut c_void;
+        fn objc_msgSend();
+    }
+
+    unsafe {
+        let class = objc_getClass(b"NSCursor\0".as_ptr() as *const c_char);
+        if class.is_null() {
+            return;
+        }
+        let selector = if hidden {
+            if MACOS_APPKIT_CURSOR_HIDE_COUNT.load(Ordering::Relaxed) >= 128 {
+                return;
+            }
+            MACOS_APPKIT_CURSOR_HIDE_COUNT.fetch_add(1, Ordering::Relaxed);
+            sel_registerName(b"hide\0".as_ptr() as *const c_char)
+        } else {
+            let count = MACOS_APPKIT_CURSOR_HIDE_COUNT.swap(0, Ordering::Relaxed);
+            let unhide_sel = sel_registerName(b"unhide\0".as_ptr() as *const c_char);
+            let msg_void: extern "C" fn(*mut c_void, *mut c_void) =
+                std::mem::transmute(objc_msgSend as *const ());
+            for _ in 0..count {
+                msg_void(class, unhide_sel);
+            }
+            return;
+        };
+        let msg_void: extern "C" fn(*mut c_void, *mut c_void) =
+            std::mem::transmute(objc_msgSend as *const ());
+        msg_void(class, selector);
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_set_main_webview_cursor_hidden(app: &AppHandle, hidden: bool) {
+    let Some(window) = app.get_webview_window("main") else {
+        return;
+    };
+    let script = if hidden {
+        "document.documentElement.dataset.remoteInputActive = 'true';"
+    } else {
+        "delete document.documentElement.dataset.remoteInputActive;"
+    };
+    let _ = window.eval(script);
+}
+
+#[cfg(target_os = "macos")]
+fn setup_macos_cursor_hider(app: &tauri::App) {
+    let remote_active = app.state::<AppRuntime>().remote_input_active.clone();
+    let app_handle = app.handle().clone();
+    thread::spawn(move || {
+        let mut was_active = false;
+        loop {
+            thread::sleep(Duration::from_millis(8));
+            let active = remote_active.load(Ordering::Relaxed);
+            if active == was_active {
+                continue;
+            }
+            was_active = active;
+            let handle = app_handle.clone();
+            let _ = app_handle.run_on_main_thread(move || {
+                macos_set_cursor_hidden_with_appkit(active);
+                macos_set_main_webview_cursor_hidden(&handle, active);
+            });
+        }
+    });
+}
+
+#[cfg(target_os = "macos")]
+fn setup_macos_window_visibility_watcher(app: &tauri::App) {
+    let app_handle = app.handle().clone();
+    thread::spawn(move || {
+        let mut last_visible = true;
+        loop {
+            thread::sleep(Duration::from_millis(100));
+            let visible = app_handle
+                .get_webview_window("main")
+                .and_then(|window| {
+                    let visible = window.is_visible().ok()?;
+                    let minimized = window.is_minimized().ok()?;
+                    Some(visible && !minimized)
+                })
+                .unwrap_or(false);
+
+            if visible == last_visible {
+                continue;
+            }
+            last_visible = visible;
+            set_main_window_visible(&app_handle, visible);
+        }
+    });
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -1228,6 +1427,7 @@ pub fn run() {
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
+                set_main_window_visible(window.app_handle(), false);
                 let _ = window.hide();
             }
         })
@@ -1260,8 +1460,12 @@ pub fn run() {
                 config_dir.join("layout.json"),
                 detected_layout,
             ));
+            #[cfg(target_os = "macos")]
+            setup_macos_cursor_hider(app);
+            #[cfg(target_os = "macos")]
+            setup_macos_window_visibility_watcher(app);
             setup_tray(app)?;
-            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            #[cfg(target_os = "windows")]
             apply_custom_chrome(app.handle())?;
             setup_single_instance_events(app.handle().clone());
             Ok(())
@@ -1287,8 +1491,26 @@ pub fn run() {
             open_releases_url,
             is_portable_mode
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| {
+            #[cfg(target_os = "macos")]
+            {
+                match event {
+                    tauri::RunEvent::Ready
+                    | tauri::RunEvent::Reopen {
+                        has_visible_windows: false,
+                        ..
+                    } => {
+                        let _ = show_main_window_handle(app);
+                    }
+                    _ => {}
+                }
+            }
+
+            #[cfg(not(target_os = "macos"))]
+            let _ = (app, event);
+        });
 }
 
 fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
@@ -1347,6 +1569,9 @@ fn show_main_window_handle(app: &AppHandle) -> Result<(), String> {
     window
         .unminimize()
         .map_err(|error| format!("failed to restore main window: {error}"))?;
+    #[cfg(target_os = "macos")]
+    macos_order_front_window(&window)?;
+    set_main_window_visible(app, true);
     window
         .set_focus()
         .map_err(|error| format!("failed to focus main window: {error}"))?;
@@ -1354,13 +1579,27 @@ fn show_main_window_handle(app: &AppHandle) -> Result<(), String> {
 }
 
 fn hide_main_window_handle(app: &AppHandle) -> Result<(), String> {
-    app.get_webview_window("main")
-        .ok_or_else(|| "main window is not available".to_string())?
+    let window = app
+        .get_webview_window("main")
+        .ok_or_else(|| "main window is not available".to_string())?;
+    let result = window
         .hide()
-        .map_err(|error| format!("failed to hide main window: {error}"))
+        .map_err(|error| format!("failed to hide main window: {error}"));
+
+    if result.is_ok() {
+        set_main_window_visible(app, false);
+    }
+
+    result
 }
 
-#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn set_main_window_visible(app: &AppHandle, visible: bool) {
+    if let Some(state) = app.try_state::<AppRuntime>() {
+        state.main_window_visible.store(visible, Ordering::Relaxed);
+    }
+}
+
+#[cfg(target_os = "windows")]
 fn apply_custom_chrome(app: &AppHandle) -> tauri::Result<()> {
     if let Some(window) = app.get_webview_window("main") {
         window.set_decorations(false)?;
@@ -2242,7 +2481,11 @@ fn run_clipboard_sync(
 fn clipboard_echo_active(clipboard_echo_until: &Arc<Mutex<Option<Instant>>>) -> bool {
     clipboard_echo_until
         .lock()
-        .map(|until| until.map(|deadline| Instant::now() < deadline).unwrap_or(false))
+        .map(|until| {
+            until
+                .map(|deadline| Instant::now() < deadline)
+                .unwrap_or(false)
+        })
         .unwrap_or(false)
 }
 
@@ -3462,7 +3705,10 @@ mod tests {
         assert_eq!(ports[0], DISCOVERY_PORT);
         // A peer that drifted from 47833 to 47834 must still be a target.
         assert!(ports.contains(&(DISCOVERY_PORT + 1)));
-        assert_eq!(*ports.last().unwrap(), DISCOVERY_PORT + DISCOVERY_PORT_SPAN - 1);
+        assert_eq!(
+            *ports.last().unwrap(),
+            DISCOVERY_PORT + DISCOVERY_PORT_SPAN - 1
+        );
     }
 
     #[test]

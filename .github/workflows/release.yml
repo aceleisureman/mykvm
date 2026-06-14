@@ -234,14 +234,19 @@ jobs:
           require APPLE_CERTIFICATE_PASSWORD
           require APPLE_SIGNING_IDENTITY
 
+          # Notarization is optional. A free self-signed release is code-signed
+          # (so Accessibility survives updates) but cannot be notarized. Only
+          # validate notarization credentials when some were actually provided.
           if [ -n "$APPLE_API_KEY_PRIVATE_KEY$APPLE_API_KEY_ID$APPLE_API_ISSUER" ]; then
             require APPLE_API_KEY_PRIVATE_KEY
             require APPLE_API_KEY_ID
             require APPLE_API_ISSUER
-          else
+          elif [ -n "$APPLE_ID$APPLE_PASSWORD$APPLE_TEAM_ID" ]; then
             require APPLE_ID
             require APPLE_PASSWORD
             require APPLE_TEAM_ID
+          else
+            echo "::warning::No Apple notarization credentials set; the macOS build will be signed but NOT notarized (Gatekeeper warns on first open unless installed via the Homebrew cask)."
           fi
 
           exit "$missing"
@@ -292,9 +297,12 @@ jobs:
           uploadUpdaterJson: true
           uploadUpdaterSignatures: true
 
-      - name: Verify macOS signing and notarization
+      - name: Verify macOS signing
         if: matrix.name == 'macos'
         shell: bash
+        env:
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
         run: |
           set -euo pipefail
 
@@ -317,10 +325,19 @@ jobs:
             exit 1
           fi
 
+          # The signature itself must always be valid.
           codesign --verify --deep --strict --verbose=2 "$app_path"
-          spctl -a -t exec -vv "$app_path"
           codesign --verify --verbose=2 "$dmg_path"
-          spctl -a -t open --context context:primary-signature -vv "$dmg_path"
+
+          # spctl asserts Gatekeeper acceptance, which only holds for notarized
+          # builds. A free self-signed release is expected to fail it, so only
+          # run it when notarization credentials were provided.
+          if [ -n "${APPLE_API_KEY_ID:-}${APPLE_ID:-}" ]; then
+            spctl -a -t exec -vv "$app_path"
+            spctl -a -t open --context context:primary-signature -vv "$dmg_path"
+          else
+            echo "Self-signed (non-notarized) build: skipping spctl Gatekeeper checks."
+          fi
 
   assemble-latest-json:
     name: Assemble updater manifest

@@ -324,6 +324,8 @@
 }
 
 .titlebar-drag-region {
+  position: relative;
+  z-index: 1;
   align-self: stretch;
   flex: 1 1 auto;
   min-width: 0;
@@ -437,38 +439,51 @@
 }
 
 .mac-window-controls {
+  position: relative;
+  z-index: 2;
   align-self: center;
-  gap: 8px;
+  gap: 2px;
   height: 36px;
-  padding: 0 12px 0 14px;
+  padding: 0 7px 0 9px;
 }
 
 .mac-window-controls button {
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  display: grid;
+  place-items: center;
+  background: transparent;
+  box-shadow: none;
+  -webkit-app-region: no-drag;
+}
+
+.mac-window-controls button::before {
+  content: "";
   width: 12px;
   height: 12px;
-  padding: 0;
   border-radius: 999px;
   border: 1px solid rgba(0, 0, 0, 0.22);
   box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.12);
 }
 
-.mac-window-controls button.close {
+.mac-window-controls button.close::before {
   background: #ff5f57;
 }
 
-.mac-window-controls button.minimize {
+.mac-window-controls button.minimize::before {
   background: #febc2e;
 }
 
-.mac-window-controls button.maximize {
+.mac-window-controls button.maximize::before {
   background: #28c840;
 }
 
-.mac-window-controls button:hover {
+.mac-window-controls button:hover::before {
   filter: brightness(0.95);
 }
 
-.theme-light .mac-window-controls button {
+.theme-light .mac-window-controls button::before {
   border-color: rgba(31, 41, 55, 0.18);
 }
 
@@ -1728,11 +1743,53 @@
 }
 
 .error-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
   padding: 10px 12px;
   border: 1px solid rgba(248, 113, 113, 0.28);
   border-radius: 10px;
   background: rgba(127, 29, 29, 0.28);
   color: #fecaca;
+}
+
+.error-banner-message {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.error-banner-action {
+  flex: 0 0 auto;
+  min-height: 30px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 0 10px;
+  border: 1px solid rgba(248, 113, 113, 0.58);
+  border-radius: 7px;
+  background: rgba(248, 113, 113, 0.12);
+  color: #fecaca;
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 800;
+  white-space: nowrap;
+}
+
+.error-banner-action:hover {
+  background: rgba(248, 113, 113, 0.2);
+}
+
+.error-banner-action:disabled {
+  cursor: progress;
+  opacity: 0.62;
+}
+
+.button-icon {
+  width: 14px;
+  height: 14px;
+  display: block;
 }
 
 .app-footer {
