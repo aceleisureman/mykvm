@@ -37,8 +37,8 @@ export const TEXT = {
       github: "GitHub",
     },
     loading: {
-      title: "正在启动桌面控制台",
-      copy: "加载 Tauri 后端状态、布局配置和运行时服务信息。",
+      title: "正在载入 MyKVM",
+      copy: "读取本机配置、显示器布局和桌面运行状态。",
     },
     onboarding: {
       eyebrow: "MyKVM setup",
@@ -212,8 +212,8 @@ export const TEXT = {
       github: "GitHub",
     },
     loading: {
-      title: "Starting Desktop Console",
-      copy: "Loading Tauri backend state, layout settings, and runtime service status.",
+      title: "Loading MyKVM",
+      copy: "Reading local settings, display layout, and desktop runtime state.",
     },
     onboarding: {
       eyebrow: "MyKVM setup",

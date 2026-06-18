@@ -1227,24 +1227,26 @@ function App() {
       <header className="app-header">
         <div className="brand-lockup">
           <span className="brand-mark">mk</span>
-          <div>
-            <strong>MyKVM</strong>
-            <span>
+          <div className="brand-copy">
+            <div className="brand-title-row">
+              <strong>MyKVM</strong>
+              {hasActionableUpdate && availableUpdate ? (
+                <button
+                  type="button"
+                  className="brand-update-badge"
+                  onClick={() => setActiveTab("settings")}
+                  title={`${ui.settings.updateAvailable}: v${availableUpdate.version}`}
+                  aria-label={`${ui.settings.updateAvailable}: v${availableUpdate.version}`}
+                >
+                  <DownloadIcon />
+                </button>
+              ) : null}
+            </div>
+            <span className="brand-subtitle">
               {roleLabel} · {runtimeStateLabel} · {onlineDeviceCount}/
               {layout.devices.length} {ui.common.online}
             </span>
           </div>
-          {hasActionableUpdate && availableUpdate ? (
-            <button
-              type="button"
-              className="brand-update-badge"
-              onClick={() => setActiveTab("settings")}
-              title={`${ui.settings.updateAvailable}: v${availableUpdate.version}`}
-              aria-label={`${ui.settings.updateAvailable}: v${availableUpdate.version}`}
-            >
-              <DownloadIcon />
-            </button>
-          ) : null}
         </div>
 
         <div className="header-actions">

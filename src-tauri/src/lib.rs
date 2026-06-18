@@ -48,6 +48,7 @@ const CLIPBOARD_MAX_IMAGE_BYTES: usize = 32 * 1024 * 1024;
 // it), so a pure content-signature check can ping-pong; this window guarantees
 // we never echo received content straight back.
 const CLIPBOARD_ECHO_GRACE_MS: u64 = 1200;
+const CLIPBOARD_RETRY_INTERVAL_MS: u64 = 2000;
 const QUIT_EXISTING_ARG: &str = "--mykvm-quit-existing";
 
 #[cfg(target_os = "windows")]
@@ -290,6 +291,7 @@ struct AppRuntime {
     clipboard_echo_until: Arc<Mutex<Option<Instant>>>,
     remote_input_active: Arc<AtomicBool>,
     main_window_visible: Arc<AtomicBool>,
+    allow_explicit_quit: Arc<AtomicBool>,
     clipboard_target: Arc<Mutex<Option<input::ClipboardTarget>>>,
     input_receive_enabled: Arc<AtomicBool>,
     clipboard_receive_enabled: Arc<AtomicBool>,
@@ -317,6 +319,7 @@ impl AppRuntime {
             clipboard_echo_until: Arc::new(Mutex::new(None)),
             remote_input_active: Arc::new(AtomicBool::new(false)),
             main_window_visible: Arc::new(AtomicBool::new(true)),
+            allow_explicit_quit: Arc::new(AtomicBool::new(false)),
             clipboard_target: Arc::new(Mutex::new(None)),
             input_receive_enabled: Arc::new(AtomicBool::new(false)),
             clipboard_receive_enabled: Arc::new(AtomicBool::new(false)),
@@ -763,7 +766,6 @@ impl AppRuntime {
 
 #[tauri::command]
 fn load_app_state(state: tauri::State<'_, AppRuntime>) -> AppStateSnapshot {
-    let _ = state.start_discovery();
     state.snapshot()
 }
 
@@ -1238,6 +1240,24 @@ fn spawn_instance_event_listener(name: &str, app: AppHandle, event_kind: Instanc
     });
 }
 
+fn request_app_quit(app: &AppHandle) {
+    if let Some(state) = app.try_state::<AppRuntime>() {
+        state.allow_explicit_quit.store(true, Ordering::Relaxed);
+    }
+    app.exit(0);
+}
+
+#[cfg(target_os = "macos")]
+fn should_allow_macos_exit(app: &AppHandle, code: Option<i32>) -> bool {
+    if code == Some(tauri::RESTART_EXIT_CODE) {
+        return true;
+    }
+
+    app.try_state::<AppRuntime>()
+        .map(|state| state.allow_explicit_quit.swap(false, Ordering::Relaxed))
+        .unwrap_or(false)
+}
+
 #[cfg(target_os = "macos")]
 static MACOS_APPKIT_CURSOR_HIDE_COUNT: AtomicU64 = AtomicU64::new(0);
 
@@ -1497,6 +1517,12 @@ pub fn run() {
             #[cfg(target_os = "macos")]
             {
                 match event {
+                    tauri::RunEvent::ExitRequested { code, api, .. } => {
+                        if !should_allow_macos_exit(app, code) {
+                            api.prevent_exit();
+                            let _ = hide_main_window_handle(app);
+                        }
+                    }
                     tauri::RunEvent::Ready
                     | tauri::RunEvent::Reopen {
                         has_visible_windows: false,
@@ -1530,7 +1556,7 @@ fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
             "hide" => {
                 let _ = hide_main_window_handle(app);
             }
-            "quit" => app.exit(0),
+            "quit" => request_app_quit(app),
             _ => {}
         })
         .on_tray_icon_event(|tray, event| {
@@ -2389,6 +2415,7 @@ fn run_clipboard_sync(
     stop: Arc<AtomicBool>,
 ) {
     let mut last_sent: Option<(String, String, String)> = None;
+    let mut last_failed: Option<(String, String, String, Instant)> = None;
     let mut last_poll = Instant::now() - Duration::from_secs(1);
     let mut sequence = now_ms();
 
@@ -2436,6 +2463,18 @@ fn run_clipboard_sync(
         {
             continue;
         }
+        if last_failed
+            .as_ref()
+            .map(|(device_id, addr, previous, failed_at)| {
+                device_id == &target.device_id
+                    && addr == &target.addr
+                    && previous == &signature
+                    && failed_at.elapsed() < Duration::from_millis(CLIPBOARD_RETRY_INTERVAL_MS)
+            })
+            .unwrap_or(false)
+        {
+            continue;
+        }
 
         let should_send = clipboard_seen_text
             .lock()
@@ -2466,12 +2505,16 @@ fn run_clipboard_sync(
             if quic_transport.send_stream(peer, payload).is_ok() {
                 transport_packets.fetch_add(1, Ordering::Relaxed);
                 clipboard_packets.fetch_add(1, Ordering::Relaxed);
+                last_failed = None;
+                last_sent = Some((target.device_id, target.addr, signature));
+            } else {
+                last_failed = Some((
+                    target.device_id.clone(),
+                    target.addr.clone(),
+                    signature,
+                    Instant::now(),
+                ));
             }
-            // Record the attempt regardless of the result. If the peer is
-            // unreachable this stops us re-encoding and re-blocking on the same
-            // unchanged content every poll; a genuinely new copy still differs
-            // and will be retried.
-            last_sent = Some((target.device_id, target.addr, signature));
         }
     }
 }
@@ -3484,11 +3527,20 @@ pub(crate) fn unicast_sweep_targets(port: u16) -> Vec<String> {
 
 /// Adds (once per process) an inbound UDP allow rule for this binary to Windows
 /// Defender Firewall so LAN peers can reach our discovery and QUIC sockets.
-/// Requires elevation; when we are not elevated the `netsh` calls fail
-/// harmlessly and we just log a hint.
+/// Requires elevation; when we are not elevated, skip the `netsh` calls so
+/// startup does not block on commands that cannot succeed.
 #[cfg(target_os = "windows")]
 fn ensure_windows_firewall_rule() {
     if WINDOWS_FIREWALL_ENSURED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+
+    if !is_windows_process_elevated().unwrap_or(false) {
+        log::warn!(
+            "skipping Windows Defender Firewall rule setup without administrator rights; \
+             if LAN peers cannot find this device, allow MyKVM through the firewall for all \
+             networks or relaunch MyKVM as administrator"
+        );
         return;
     }
 

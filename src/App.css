@@ -73,7 +73,7 @@
   color: #172033;
 }
 
-.theme-light .brand-lockup span:last-child,
+.theme-light .brand-subtitle,
 .theme-light .page-heading p,
 .theme-light .surface-card > p,
 .theme-light .muted-copy,
@@ -259,6 +259,45 @@
   color: #9a5a00;
 }
 
+.theme-light .brand-update-badge {
+  border-color: #2563eb;
+  background: #2563eb;
+  color: #ffffff;
+  box-shadow: 0 4px 10px rgba(37, 99, 235, 0.22);
+}
+
+.theme-light .brand-update-badge:hover {
+  border-color: #1d4ed8;
+  background: #1d4ed8;
+}
+
+.theme-light .onboarding-copy h1,
+.theme-light .role-choice-card strong {
+  color: #172033;
+}
+
+.theme-light .onboarding-copy p:last-child,
+.theme-light .role-choice-card p {
+  color: #5f6b7d;
+}
+
+.theme-light .role-choice-card {
+  border-color: #d7deea;
+  background: #ffffff;
+  color: #172033;
+  box-shadow: 0 12px 30px rgba(31, 41, 55, 0.05);
+}
+
+.theme-light .role-choice-card:hover {
+  border-color: rgba(31, 122, 242, 0.56);
+  background: #f8fbff;
+  box-shadow: 0 16px 34px rgba(31, 73, 125, 0.12);
+}
+
+.theme-light .role-choice-card span {
+  color: #1f7af2;
+}
+
 .theme-light .switch-button.active {
   background: #dcfce7;
   border-color: #86efac;
@@ -362,6 +401,17 @@
   font-weight: 800;
 }
 
+.brand-copy {
+  min-width: 0;
+}
+
+.brand-title-row {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+}
+
 .brand-lockup strong {
   display: block;
   color: #3b9fff;
@@ -371,38 +421,43 @@
 
 .brand-update-badge {
   flex: 0 0 auto;
-  display: grid;
-  place-items: center;
-  width: 30px;
-  height: 30px;
-  border: 0;
-  border-radius: 8px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 19px;
+  height: 19px;
+  border: 1px solid #2563eb;
+  border-radius: 999px;
   background: #2563eb;
-  color: #fff;
+  color: #ffffff;
   cursor: pointer;
+  padding: 0;
+  line-height: 0;
+  box-shadow: 0 4px 10px rgba(37, 99, 235, 0.28);
   animation: brand-update-pulse 2.2s ease-in-out infinite;
 }
 
 .brand-update-badge:hover {
+  border-color: #1d4ed8;
   background: #1d4ed8;
 }
 
 .brand-update-badge .runtime-icon {
-  width: 18px;
-  height: 18px;
+  width: 11px;
+  height: 11px;
 }
 
 @keyframes brand-update-pulse {
   0%,
   100% {
-    box-shadow: 0 0 0 0 rgba(37, 99, 235, 0.55);
+    box-shadow: 0 4px 10px rgba(37, 99, 235, 0.28), 0 0 0 0 rgba(37, 99, 235, 0.42);
   }
   50% {
-    box-shadow: 0 0 0 6px rgba(37, 99, 235, 0);
+    box-shadow: 0 4px 10px rgba(37, 99, 235, 0.28), 0 0 0 4px rgba(37, 99, 235, 0);
   }
 }
 
-.brand-lockup span:last-child {
+.brand-subtitle {
   display: block;
   margin-top: 4px;
   color: #a1a1aa;
