@@ -2162,7 +2162,9 @@ fn handle_windows_mouse_move(context: &WindowsCaptureContext, x: f64, y: f64) ->
         if update_active_remote_screen(active_target, dx, dy, &context.layout_state) {
             let point = local_return_point(active_target);
             let target = active_target.target.clone();
-            let _ = send_remote_mouse_move(
+            // Control is returning to the local machine: park the controlled
+            // cursor in a corner so it doesn't visibly linger at the shared edge.
+            let _ = send_remote_cursor_park(
                 &context.quic_transport,
                 active_target,
                 &context.layout_state,
@@ -2561,7 +2563,10 @@ fn handle_macos_mouse_move(
                 let point = local_return_point(active_target);
                 let invert_y = active_target.invert_y;
                 let target = active_target.target.clone();
-                let _ = send_remote_mouse_move(
+                // Control is returning to the local machine: park the controlled
+                // cursor in a corner so it doesn't visibly linger at the shared
+                // edge of the controlled (client) screen.
+                let _ = send_remote_cursor_park(
                     &context.quic_transport,
                     active_target,
                     &context.layout_state,
@@ -3057,6 +3062,34 @@ fn send_remote_mouse_move(
 
 fn local_anchor_point(active: &ActiveTarget) -> (f64, f64) {
     local_return_point(active)
+}
+
+/// When control returns to the local machine, move the controlled cursor into
+/// the far (bottom-right) corner of the remote screen instead of leaving it
+/// parked at the shared edge. True cursor hiding isn't reliably possible on the
+/// controlled side, so tucking it into a corner is the seamless-feeling
+/// approximation.
+#[cfg_attr(
+    not(any(target_os = "windows", target_os = "macos")),
+    allow(dead_code)
+)]
+fn send_remote_cursor_park(
+    quic_transport: &quic_transport::TransportHandle,
+    active: &ActiveTarget,
+    layout_state: &Arc<Mutex<LayoutState>>,
+    input_events: &Arc<AtomicU64>,
+) -> bool {
+    send_packet(
+        quic_transport,
+        &active.target,
+        InputEvent::MouseMove {
+            screen_id: active.current_screen_id.clone(),
+            x: (active.current_screen.width - 1).max(0),
+            y: (active.current_screen.height - 1).max(0),
+        },
+        layout_state,
+        input_events,
+    )
 }
 
 /// Disconnects (or reconnects) the on-screen cursor from the physical mouse.

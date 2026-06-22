@@ -196,6 +196,18 @@ function App() {
         if (active) {
           setSnapshot(nextSnapshot);
         }
+        // A controlled (client) machine usually has no local operator, so make
+        // sure it relaunches itself after a reboot/upgrade and reconnects on its
+        // own (pairing is persisted). Enable launch-at-startup once per install,
+        // so a later manual toggle is still respected.
+        if (
+          active &&
+          nextSnapshot.layout.machineRole === "client" &&
+          !localStorage.getItem("mykvm.clientAutostartInit")
+        ) {
+          localStorage.setItem("mykvm.clientAutostartInit", "1");
+          void setAutostart(true).catch(() => {});
+        }
         if (
           active &&
           nextSnapshot.layout.machineRole === "client" &&
