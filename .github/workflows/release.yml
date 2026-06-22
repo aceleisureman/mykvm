@@ -426,7 +426,12 @@ jobs:
           tagName: ${{ needs.prepare.outputs.tag }}
           releaseName: "MyKVM ${{ needs.prepare.outputs.tag }}"
           releaseBody: ${{ needs.prepare.outputs.release_notes }}
-          releaseDraft: false
+          # Keep the release a DRAFT until latest.json is attached (published by
+          # the assemble-latest-json job below). Otherwise the release becomes
+          # "latest" the moment the first platform bundle uploads, and the in-app
+          # updater (releases/latest/download/latest.json) 404s for the rest of
+          # the build. A failed build also never becomes "latest" this way.
+          releaseDraft: true
           prerelease: false
           # latest.json is assembled by the dedicated assemble-latest-json job
           # (single source of truth across platforms); the .sig artifacts are
@@ -589,3 +594,14 @@ jobs:
         run: |
           set -euo pipefail
           gh release upload "$TAG" latest.json --clobber --repo "$GITHUB_REPOSITORY"
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -euo pipefail
+          # Now that every platform bundle AND latest.json are attached, flip the
+          # draft to published. Only at this point does releases/latest advance to
+          # this tag, so the in-app updater never sees a manifest-less release.
+          gh release edit "$TAG" --draft=false --latest --repo "$GITHUB_REPOSITORY"
