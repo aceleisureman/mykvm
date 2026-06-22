@@ -378,8 +378,16 @@ fn server_config(identity: &TransportIdentity) -> Result<ServerConfig, String> {
 fn tuned_transport_config() -> quinn::TransportConfig {
     let mut transport = quinn::TransportConfig::default();
     transport.max_concurrent_bidi_streams(64_u32.into());
-    transport.keep_alive_interval(Some(Duration::from_secs(5)));
-    if let Ok(timeout) = quinn::IdleTimeout::try_from(Duration::from_secs(30)) {
+    // Keep-alive well under the idle timeout so a healthy link never drops, but
+    // keep the idle timeout short: when a client vanishes (e.g. it is killed and
+    // reinstalled during an app upgrade) the controller's cached connection must
+    // close on its own within a few seconds. Otherwise the controller keeps
+    // reusing the now-dead connection after the client comes back, so input
+    // silently goes nowhere until the user toggles the runtime to force a
+    // reconnect. 10 s tolerates brief LAN/Wi-Fi hiccups while auto-recovering
+    // across the typical upgrade downtime without any manual toggle.
+    transport.keep_alive_interval(Some(Duration::from_secs(3)));
+    if let Ok(timeout) = quinn::IdleTimeout::try_from(Duration::from_secs(10)) {
         transport.max_idle_timeout(Some(timeout));
     }
     transport
