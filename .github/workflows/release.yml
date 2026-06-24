@@ -23,6 +23,11 @@ concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
 
+env:
+  CARGO_HTTP_MULTIPLEXING: "false"
+  CARGO_HTTP_TIMEOUT: "600"
+  CARGO_NET_RETRY: "10"
+
 jobs:
   prepare:
     name: Prepare release
