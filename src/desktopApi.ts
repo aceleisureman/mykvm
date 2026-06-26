@@ -24,6 +24,12 @@ export interface AppUpdateCheckResult {
   update?: AppUpdateInfo
 }
 
+export interface FileTransferSummary {
+  targetName: string
+  fileCount: number
+  byteCount: number
+}
+
 const FALLBACK_RUNTIME: RuntimeStatus = {
   started: false,
   transport: {
@@ -365,6 +371,18 @@ export async function sendSecureAttention(deviceId: string): Promise<void> {
   }
 
   await invoke('send_secure_attention', { deviceId })
+}
+
+export async function sendFilesToDevice(deviceId: string, paths: string[]): Promise<FileTransferSummary> {
+  if (!isTauri()) {
+    return {
+      targetName: 'Desktop fallback',
+      fileCount: paths.length,
+      byteCount: 0,
+    }
+  }
+
+  return invoke<FileTransferSummary>('send_files_to_device', { deviceId, paths })
 }
 
 export async function relaunchApp(): Promise<void> {

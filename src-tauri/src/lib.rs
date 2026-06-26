@@ -1,8 +1,9 @@
 use std::{
     collections::HashMap,
     env, fs,
+    io::{Read, Write},
     net::{SocketAddr, UdpSocket},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::Command,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -58,6 +59,9 @@ const CLIPBOARD_IDLE_SLEEP_MS: u64 = 25;
 const CLIPBOARD_RETRY_INTERVAL_MS: u64 = 2000;
 const CLIPBOARD_WRITE_ATTEMPTS: usize = 5;
 const CLIPBOARD_WRITE_RETRY_DELAY_MS: u64 = 30;
+const FILE_TRANSFER_PROTOCOL: &str = "mykvm.file-transfer.v1";
+const FILE_TRANSFER_CHUNK_BYTES: usize = 256 * 1024;
+const FILE_TRANSFER_MAX_FILE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const LOG_MAX_FILE_SIZE_BYTES: u128 = 1024 * 1024;
 const QUIT_EXISTING_ARG: &str = "--mykvm-quit-existing";
 const INSTALL_INPUT_SERVICE_ARG: &str = "--install-input-service";
@@ -373,6 +377,62 @@ struct PairingChallenge {
     attempts: u8,
 }
 
+#[derive(Debug, Clone)]
+struct FileTransferTarget {
+    device_id: String,
+    name: String,
+    addr: String,
+    transport_public_key: String,
+    protocol_version: u16,
+    cluster_id: String,
+    pair_secret: String,
+}
+
+#[derive(Debug, Clone)]
+struct TransferFile {
+    path: PathBuf,
+    name: String,
+    total_bytes: u64,
+}
+
+#[derive(Debug)]
+struct IncomingFileTransfer {
+    origin_id: String,
+    target_id: String,
+    file_name: String,
+    total_bytes: u64,
+    received_bytes: u64,
+    next_chunk_index: u64,
+    temp_path: PathBuf,
+    final_path: PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FileTransferSummary {
+    target_name: String,
+    file_count: usize,
+    byte_count: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FileTransferPacket {
+    protocol: String,
+    kind: String,
+    transfer_id: String,
+    origin_id: String,
+    target_id: String,
+    cluster_id: String,
+    pair_secret: String,
+    file_name: String,
+    total_bytes: u64,
+    chunk_index: u64,
+    offset: u64,
+    #[serde(default)]
+    data: Vec<u8>,
+}
+
 struct AppRuntime {
     app_handle: AppHandle,
     layout: Arc<Mutex<LayoutState>>,
@@ -380,6 +440,7 @@ struct AppRuntime {
     runtime: Mutex<RuntimeStatus>,
     peers: Arc<Mutex<Vec<LanPeer>>>,
     pairing_challenge: Arc<Mutex<Option<PairingChallenge>>>,
+    file_transfers: Arc<Mutex<HashMap<String, IncomingFileTransfer>>>,
     quic_transport: Mutex<Option<quic_transport::TransportHandle>>,
     discovery_stop: Mutex<Option<Arc<AtomicBool>>>,
     input_stop: Mutex<Option<Arc<AtomicBool>>>,
@@ -412,6 +473,7 @@ impl AppRuntime {
             runtime: Mutex::new(default_runtime(&detected_layout)),
             peers: Arc::new(Mutex::new(Vec::new())),
             pairing_challenge: Arc::new(Mutex::new(None)),
+            file_transfers: Arc::new(Mutex::new(HashMap::new())),
             quic_transport: Mutex::new(None),
             discovery_stop: Mutex::new(None),
             input_stop: Mutex::new(None),
@@ -565,6 +627,7 @@ impl AppRuntime {
 
         let layout_for_input = Arc::clone(&self.layout);
         let layout_for_clipboard = Arc::clone(&self.layout);
+        let layout_for_file_transfer = Arc::clone(&self.layout);
         let layout_for_pairing = Arc::clone(&self.layout);
         let native_layout_for_input = self.native_layout();
         let input_receive_enabled = Arc::clone(&self.input_receive_enabled);
@@ -573,6 +636,8 @@ impl AppRuntime {
         let clipboard_echo_until = Arc::clone(&self.clipboard_echo_until);
         let clipboard_last_sequences = Arc::clone(&self.clipboard_last_sequences);
         let clipboard_target = Arc::clone(&self.clipboard_target);
+        let app_handle_for_file_transfer = self.app_handle.clone();
+        let file_transfers = Arc::clone(&self.file_transfers);
         let transport_packets_for_input = Arc::clone(&self.transport_packets);
         let transport_packets_for_stream = Arc::clone(&self.transport_packets);
         let input_events = Arc::clone(&self.input_events);
@@ -622,6 +687,20 @@ impl AppRuntime {
             ) {
                 transport_packets_for_stream.fetch_add(1, Ordering::Relaxed);
                 return true;
+            }
+
+            if let Ok(layout) = layout_for_file_transfer.lock() {
+                let current_peer = local_peer_from_layout(&layout);
+                if handle_file_transfer_packet(
+                    &payload,
+                    &layout,
+                    &current_peer.id,
+                    &file_transfers,
+                    &app_handle_for_file_transfer,
+                ) {
+                    transport_packets_for_stream.fetch_add(1, Ordering::Relaxed);
+                    return true;
+                }
             }
 
             if !clipboard_receive_enabled.load(Ordering::Relaxed) {
@@ -1563,6 +1642,46 @@ fn send_secure_attention(
 }
 
 #[tauri::command]
+fn send_files_to_device(
+    device_id: String,
+    paths: Vec<String>,
+    state: tauri::State<'_, AppRuntime>,
+) -> Result<FileTransferSummary, String> {
+    if paths.is_empty() {
+        return Err("请选择要传输的文件。".into());
+    }
+
+    state.start_discovery()?;
+    let layout = state.layout_snapshot();
+    let mut local_peer = local_peer_from_layout(&layout);
+    let quic_transport = state
+        .quic_transport_handle()
+        .ok_or_else(|| "QUIC transport is not ready; start the runtime first.".to_string())?;
+    apply_transport_to_peer(&mut local_peer, &quic_transport);
+
+    let peers = active_peer_snapshot(&state.peers);
+    let target = file_transfer_target_for_device(&layout, &peers, &device_id)?;
+    let files = collect_transfer_files(&paths)?;
+    let mut file_count = 0_usize;
+    let mut byte_count = 0_u64;
+
+    for file in files {
+        let packet_count = send_transfer_file(&quic_transport, &local_peer.id, &target, &file)?;
+        state
+            .transport_packets
+            .fetch_add(packet_count, Ordering::Relaxed);
+        file_count += 1;
+        byte_count = byte_count.saturating_add(file.total_bytes);
+    }
+
+    Ok(FileTransferSummary {
+        target_name: target.name,
+        file_count,
+        byte_count,
+    })
+}
+
+#[tauri::command]
 fn sync_window_chrome(window: tauri::WebviewWindow, theme: String) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
@@ -2357,6 +2476,7 @@ pub fn run() {
             install_input_service,
             uninstall_input_service,
             send_secure_attention,
+            send_files_to_device,
             sync_window_chrome,
             minimize_main_window,
             hide_main_window,
@@ -4167,6 +4287,595 @@ fn clipboard_packet_authorized(layout: &LayoutState, packet: &ClipboardPacket) -
     }
 
     true
+}
+
+fn file_transfer_target_for_device(
+    layout: &LayoutState,
+    peers: &[LanPeer],
+    device_id: &str,
+) -> Result<FileTransferTarget, String> {
+    if layout.cluster_id.trim().is_empty() || layout.pair_secret.trim().is_empty() {
+        return Err("当前设备尚未完成配对，无法传输文件。".into());
+    }
+
+    if let Some(device) = layout
+        .devices
+        .iter()
+        .find(|device| device.id == device_id && device.role != "local")
+    {
+        if !device.online || !device.input_ready {
+            return Err(format!("{} 当前不在线，无法传输文件。", device.name));
+        }
+        if device.protocol_version != quic_transport::PROTOCOL_VERSION
+            || device.transport_public_key.trim().is_empty()
+        {
+            return Err(format!("{} 版本过旧，请先升级 MyKVM。", device.name));
+        }
+        let quic_port = normalize_quic_port(device.transport_port, device.quic_port);
+        let host = file_transfer_host(&device.host)
+            .ok_or_else(|| format!("{} 缺少可用地址。", device.name))?;
+
+        return Ok(FileTransferTarget {
+            device_id: device.id.clone(),
+            name: device.name.clone(),
+            addr: format!("{host}:{quic_port}"),
+            transport_public_key: device.transport_public_key.clone(),
+            protocol_version: device.protocol_version,
+            cluster_id: layout.cluster_id.clone(),
+            pair_secret: layout.pair_secret.clone(),
+        });
+    }
+
+    if layout.machine_role == "client" {
+        if let Some(controller) = layout
+            .paired_controllers
+            .iter()
+            .find(|controller| controller.id == device_id)
+        {
+            let peer = peers
+                .iter()
+                .find(|peer| {
+                    peer.id == controller.id
+                        || (!controller.transport_public_key.trim().is_empty()
+                            && peer.transport_public_key == controller.transport_public_key)
+                })
+                .ok_or_else(|| format!("{} 当前不在线，无法传输文件。", controller.name))?;
+            if peer.protocol_version != quic_transport::PROTOCOL_VERSION
+                || peer.transport_public_key.trim().is_empty()
+                || peer.quic_port == 0
+            {
+                return Err(format!("{} 版本过旧，请先升级 MyKVM。", controller.name));
+            }
+            let host = if !peer.ip.trim().is_empty() {
+                peer.ip.clone()
+            } else {
+                file_transfer_host(&peer.host)
+                    .or_else(|| file_transfer_host(&controller.ip))
+                    .or_else(|| file_transfer_host(&controller.host))
+                    .ok_or_else(|| format!("{} 缺少可用地址。", controller.name))?
+            };
+
+            return Ok(FileTransferTarget {
+                device_id: controller.id.clone(),
+                name: controller.name.clone(),
+                addr: format!("{}:{}", host, peer.quic_port),
+                transport_public_key: peer.transport_public_key.clone(),
+                protocol_version: peer.protocol_version,
+                cluster_id: layout.cluster_id.clone(),
+                pair_secret: layout.pair_secret.clone(),
+            });
+        }
+    }
+
+    Err("没有找到可传输的目标设备。".into())
+}
+
+fn file_transfer_host(host_value: &str) -> Option<String> {
+    host_candidates(host_value)
+        .into_iter()
+        .find_map(|candidate| {
+            let (host, _) = split_host_port(&candidate);
+            (!host.trim().is_empty()).then_some(host)
+        })
+}
+
+fn collect_transfer_files(paths: &[String]) -> Result<Vec<TransferFile>, String> {
+    let mut files = Vec::new();
+    for path_value in paths {
+        let path_value = path_value.trim();
+        if path_value.is_empty() {
+            continue;
+        }
+        let path = PathBuf::from(path_value);
+        let metadata = fs::metadata(&path)
+            .map_err(|error| format!("无法读取文件 {}: {error}", path.display()))?;
+        if !metadata.is_file() {
+            return Err(format!("暂不支持传输文件夹或特殊文件：{}", path.display()));
+        }
+        if metadata.len() > FILE_TRANSFER_MAX_FILE_BYTES {
+            return Err(format!(
+                "{} 超过单文件上限 {}。",
+                path.display(),
+                format_bytes(FILE_TRANSFER_MAX_FILE_BYTES)
+            ));
+        }
+        let name = transfer_file_name(&path)?;
+        files.push(TransferFile {
+            path,
+            name,
+            total_bytes: metadata.len(),
+        });
+    }
+
+    if files.is_empty() {
+        Err("请选择要传输的文件。".into())
+    } else {
+        Ok(files)
+    }
+}
+
+fn transfer_file_name(path: &Path) -> Result<String, String> {
+    let raw_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    sanitize_transfer_file_name(&raw_name).ok_or_else(|| {
+        format!(
+            "文件名不可用于传输：{}",
+            if raw_name.is_empty() {
+                path.display().to_string()
+            } else {
+                raw_name
+            }
+        )
+    })
+}
+
+fn send_transfer_file(
+    quic_transport: &quic_transport::TransportHandle,
+    origin_id: &str,
+    target: &FileTransferTarget,
+    file: &TransferFile,
+) -> Result<u64, String> {
+    let transfer_id = format!("file-{}-{}", now_ms(), random_hex(8));
+    let mut packet_count = 0_u64;
+
+    send_file_transfer_packet(
+        quic_transport,
+        target,
+        file_transfer_packet(
+            "start",
+            &transfer_id,
+            origin_id,
+            target,
+            &file.name,
+            file.total_bytes,
+            0,
+            0,
+            Vec::new(),
+        ),
+    )?;
+    packet_count += 1;
+
+    let mut file_handle = fs::File::open(&file.path)
+        .map_err(|error| format!("无法打开文件 {}: {error}", file.path.display()))?;
+    let mut buffer = vec![0_u8; FILE_TRANSFER_CHUNK_BYTES];
+    let mut offset = 0_u64;
+    let mut chunk_index = 0_u64;
+    loop {
+        let read = file_handle
+            .read(&mut buffer)
+            .map_err(|error| format!("读取文件 {} 失败: {error}", file.path.display()))?;
+        if read == 0 {
+            break;
+        }
+        let data = buffer[..read].to_vec();
+        send_file_transfer_packet(
+            quic_transport,
+            target,
+            file_transfer_packet(
+                "chunk",
+                &transfer_id,
+                origin_id,
+                target,
+                &file.name,
+                file.total_bytes,
+                chunk_index,
+                offset,
+                data,
+            ),
+        )?;
+        packet_count += 1;
+        offset = offset.saturating_add(read as u64);
+        chunk_index = chunk_index.saturating_add(1);
+    }
+
+    send_file_transfer_packet(
+        quic_transport,
+        target,
+        file_transfer_packet(
+            "finish",
+            &transfer_id,
+            origin_id,
+            target,
+            &file.name,
+            file.total_bytes,
+            chunk_index,
+            offset,
+            Vec::new(),
+        ),
+    )?;
+    packet_count += 1;
+
+    Ok(packet_count)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn file_transfer_packet(
+    kind: &str,
+    transfer_id: &str,
+    origin_id: &str,
+    target: &FileTransferTarget,
+    file_name: &str,
+    total_bytes: u64,
+    chunk_index: u64,
+    offset: u64,
+    data: Vec<u8>,
+) -> FileTransferPacket {
+    FileTransferPacket {
+        protocol: FILE_TRANSFER_PROTOCOL.into(),
+        kind: kind.into(),
+        transfer_id: transfer_id.into(),
+        origin_id: origin_id.into(),
+        target_id: target.device_id.clone(),
+        cluster_id: target.cluster_id.clone(),
+        pair_secret: target.pair_secret.clone(),
+        file_name: file_name.into(),
+        total_bytes,
+        chunk_index,
+        offset,
+        data,
+    }
+}
+
+fn send_file_transfer_packet(
+    quic_transport: &quic_transport::TransportHandle,
+    target: &FileTransferTarget,
+    packet: FileTransferPacket,
+) -> Result<(), String> {
+    let payload = encode_wire_packet(&packet)?;
+    let peer = quic_transport.peer(
+        target.addr.clone(),
+        target.transport_public_key.clone(),
+        target.protocol_version,
+    );
+    quic_transport
+        .send_stream_expect_ack(peer, payload)
+        .map_err(|error| format!("文件传输失败: {error}"))
+}
+
+fn handle_file_transfer_packet(
+    payload: &[u8],
+    layout: &LayoutState,
+    local_peer_id: &str,
+    transfers: &Arc<Mutex<HashMap<String, IncomingFileTransfer>>>,
+    app: &AppHandle,
+) -> bool {
+    let Ok(receive_root) = file_transfer_receive_root(app) else {
+        log::warn!("file transfer receive failed: could not resolve receive directory");
+        return false;
+    };
+
+    handle_file_transfer_packet_with_root(payload, layout, local_peer_id, transfers, &receive_root)
+}
+
+fn file_transfer_receive_root(app: &AppHandle) -> Result<PathBuf, String> {
+    if let Ok(downloads) = app.path().download_dir() {
+        return Ok(downloads.join("MyKVM Transfers"));
+    }
+
+    app.path()
+        .app_data_dir()
+        .map(|directory| directory.join("MyKVM Transfers"))
+        .map_err(|error| format!("failed to resolve file transfer receive directory: {error}"))
+}
+
+fn handle_file_transfer_packet_with_root(
+    payload: &[u8],
+    layout: &LayoutState,
+    local_peer_id: &str,
+    transfers: &Arc<Mutex<HashMap<String, IncomingFileTransfer>>>,
+    receive_root: &Path,
+) -> bool {
+    let Some(packet) = decode_wire_packet::<FileTransferPacket>(payload) else {
+        return false;
+    };
+
+    if packet.protocol != FILE_TRANSFER_PROTOCOL {
+        return false;
+    }
+    if !file_transfer_packet_authorized(layout, &packet) {
+        return false;
+    }
+    if !file_transfer_packet_targets_local(layout, &packet, local_peer_id) {
+        return false;
+    }
+    if packet.origin_id == local_peer_id {
+        return true;
+    }
+
+    match packet.kind.as_str() {
+        "start" => start_incoming_file_transfer(packet, transfers, receive_root),
+        "chunk" => append_incoming_file_transfer_chunk(packet, transfers),
+        "finish" => finish_incoming_file_transfer(packet, transfers),
+        _ => false,
+    }
+}
+
+fn start_incoming_file_transfer(
+    packet: FileTransferPacket,
+    transfers: &Arc<Mutex<HashMap<String, IncomingFileTransfer>>>,
+    receive_root: &Path,
+) -> bool {
+    if packet.transfer_id.trim().is_empty()
+        || packet.origin_id.trim().is_empty()
+        || packet.total_bytes > FILE_TRANSFER_MAX_FILE_BYTES
+        || !packet.data.is_empty()
+    {
+        return false;
+    }
+
+    let Some(file_name) = sanitize_transfer_file_name(&packet.file_name) else {
+        return false;
+    };
+
+    if let Err(error) = fs::create_dir_all(receive_root) {
+        log::warn!(
+            "file transfer receive failed: could not create {}: {error}",
+            receive_root.display()
+        );
+        return false;
+    }
+
+    let final_path = unique_transfer_destination(receive_root, &file_name);
+    let temp_path = receive_root.join(format!(
+        ".mykvm-{}-{}.part",
+        sanitize_transfer_id(&packet.transfer_id),
+        file_name
+    ));
+
+    if let Ok(mut transfers) = transfers.lock() {
+        if let Some(previous) = transfers.remove(&packet.transfer_id) {
+            let _ = fs::remove_file(previous.temp_path);
+        }
+    } else {
+        return false;
+    }
+
+    if fs::File::create(&temp_path).is_err() {
+        return false;
+    }
+
+    let transfer = IncomingFileTransfer {
+        origin_id: packet.origin_id.clone(),
+        target_id: packet.target_id.clone(),
+        file_name,
+        total_bytes: packet.total_bytes,
+        received_bytes: 0,
+        next_chunk_index: 0,
+        temp_path,
+        final_path,
+    };
+
+    transfers
+        .lock()
+        .map(|mut transfers| {
+            transfers.insert(packet.transfer_id, transfer);
+            true
+        })
+        .unwrap_or(false)
+}
+
+fn append_incoming_file_transfer_chunk(
+    packet: FileTransferPacket,
+    transfers: &Arc<Mutex<HashMap<String, IncomingFileTransfer>>>,
+) -> bool {
+    if packet.data.is_empty() || packet.data.len() > FILE_TRANSFER_CHUNK_BYTES {
+        return false;
+    }
+    let Ok(mut transfers) = transfers.lock() else {
+        return false;
+    };
+    let Some(transfer) = transfers.get_mut(&packet.transfer_id) else {
+        return false;
+    };
+    if packet.origin_id != transfer.origin_id
+        || packet.target_id != transfer.target_id
+        || packet.file_name != transfer.file_name
+        || packet.total_bytes != transfer.total_bytes
+        || packet.chunk_index != transfer.next_chunk_index
+        || packet.offset != transfer.received_bytes
+        || transfer
+            .received_bytes
+            .saturating_add(packet.data.len() as u64)
+            > transfer.total_bytes
+    {
+        return false;
+    }
+
+    let write_result = fs::OpenOptions::new()
+        .append(true)
+        .open(&transfer.temp_path)
+        .and_then(|mut file| file.write_all(&packet.data));
+    if let Err(error) = write_result {
+        log::warn!("file transfer chunk write failed: {error}");
+        return false;
+    }
+
+    transfer.received_bytes = transfer
+        .received_bytes
+        .saturating_add(packet.data.len() as u64);
+    transfer.next_chunk_index = transfer.next_chunk_index.saturating_add(1);
+    true
+}
+
+fn finish_incoming_file_transfer(
+    packet: FileTransferPacket,
+    transfers: &Arc<Mutex<HashMap<String, IncomingFileTransfer>>>,
+) -> bool {
+    if !packet.data.is_empty() {
+        return false;
+    }
+    let (temp_path, final_path, file_name, total_bytes) = {
+        let Ok(transfers) = transfers.lock() else {
+            return false;
+        };
+        let Some(transfer) = transfers.get(&packet.transfer_id) else {
+            return false;
+        };
+        if packet.origin_id != transfer.origin_id
+            || packet.target_id != transfer.target_id
+            || packet.file_name != transfer.file_name
+            || packet.total_bytes != transfer.total_bytes
+            || packet.offset != transfer.received_bytes
+            || packet.chunk_index != transfer.next_chunk_index
+            || transfer.received_bytes != transfer.total_bytes
+        {
+            return false;
+        }
+        (
+            transfer.temp_path.clone(),
+            transfer.final_path.clone(),
+            transfer.file_name.clone(),
+            transfer.total_bytes,
+        )
+    };
+
+    match fs::rename(&temp_path, &final_path) {
+        Ok(()) => {
+            if let Ok(mut transfers) = transfers.lock() {
+                transfers.remove(&packet.transfer_id);
+            }
+            log::info!(
+                "received file transfer {} bytes={} path={}",
+                file_name,
+                total_bytes,
+                final_path.display()
+            );
+            true
+        }
+        Err(error) => {
+            log::warn!("file transfer finalize failed: {error}");
+            false
+        }
+    }
+}
+
+fn file_transfer_packet_authorized(layout: &LayoutState, packet: &FileTransferPacket) -> bool {
+    if layout.cluster_id.trim().is_empty()
+        || layout.pair_secret.trim().is_empty()
+        || packet.cluster_id != layout.cluster_id
+        || packet.pair_secret != layout.pair_secret
+    {
+        return false;
+    }
+
+    if layout.machine_role == "client" && !layout.paired_controllers.is_empty() {
+        return layout
+            .paired_controllers
+            .iter()
+            .any(|controller| controller.id == packet.origin_id);
+    }
+
+    true
+}
+
+fn file_transfer_packet_targets_local(
+    layout: &LayoutState,
+    packet: &FileTransferPacket,
+    local_peer_id: &str,
+) -> bool {
+    if packet.target_id.trim().is_empty() || packet.target_id == local_peer_id {
+        return true;
+    }
+
+    layout
+        .devices
+        .iter()
+        .any(|device| device.role == "local" && device.id == packet.target_id)
+}
+
+fn sanitize_transfer_file_name(name: &str) -> Option<String> {
+    let mut output = String::with_capacity(name.len().min(180));
+    for character in name.trim().chars() {
+        let safe = match character {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+            character if character.is_control() => '_',
+            character => character,
+        };
+        output.push(safe);
+        if output.len() >= 180 {
+            break;
+        }
+    }
+    let output = output.trim().trim_matches('.').trim().to_string();
+    if output.is_empty() || output == "." || output == ".." {
+        None
+    } else {
+        Some(output)
+    }
+}
+
+fn sanitize_transfer_id(transfer_id: &str) -> String {
+    let id = transfer_id
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric() || *character == '-')
+        .take(80)
+        .collect::<String>();
+    if id.is_empty() {
+        random_hex(8)
+    } else {
+        id
+    }
+}
+
+fn unique_transfer_destination(directory: &Path, file_name: &str) -> PathBuf {
+    let first = directory.join(file_name);
+    if !first.exists() {
+        return first;
+    }
+
+    let path = Path::new(file_name);
+    let stem = path
+        .file_stem()
+        .map(|value| value.to_string_lossy().into_owned())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "file".into());
+    let extension = path
+        .extension()
+        .map(|value| format!(".{}", value.to_string_lossy()))
+        .unwrap_or_default();
+
+    for index in 1..10_000 {
+        let candidate = directory.join(format!("{stem} ({index}){extension}"));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+
+    directory.join(format!("{stem}-{}{extension}", random_hex(4)))
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const GIB: u64 = 1024 * 1024 * 1024;
+    const MIB: u64 = 1024 * 1024;
+    if bytes >= GIB {
+        format!("{:.1} GiB", bytes as f64 / GIB as f64)
+    } else if bytes >= MIB {
+        format!("{:.1} MiB", bytes as f64 / MIB as f64)
+    } else {
+        format!("{bytes} bytes")
+    }
 }
 
 fn encode_wire_packet<T: Serialize>(packet: &T) -> Result<Vec<u8>, String> {
@@ -6201,6 +6910,155 @@ mod tests {
 
         assert!(!accepted);
         assert!(clipboard_seen_text.lock().expect("seen lock").is_none());
+    }
+
+    #[test]
+    fn file_transfer_target_uses_peer_quic_port() {
+        let layout = test_layout();
+        let target = file_transfer_target_for_device(&layout, &[], "peer-client-10-0-0-2").unwrap();
+
+        assert_eq!(target.addr, "10.0.0.2:47834");
+        assert_eq!(target.transport_public_key, "peer-public-key");
+    }
+
+    #[test]
+    fn file_transfer_client_targets_online_paired_controller() {
+        let mut layout = test_layout();
+        layout.machine_role = "client".into();
+        layout.paired_controllers = vec![PairedController {
+            id: "peer-server-10-0-0-1".into(),
+            name: "Server".into(),
+            host: "server.local".into(),
+            ip: "10.0.0.1".into(),
+            transport_public_key: "server-public-key".into(),
+            protocol_version: quic_transport::PROTOCOL_VERSION,
+            cluster_id: layout.cluster_id.clone(),
+            paired_at_ms: now_ms(),
+        }];
+        let peers = vec![LanPeer {
+            id: "peer-server-10-0-0-1".into(),
+            name: "Server".into(),
+            platform: "macos".into(),
+            machine_role: "server".into(),
+            cluster_id: layout.cluster_id.clone(),
+            pairing_required: false,
+            host: "server.local".into(),
+            ip: "10.0.0.1".into(),
+            transport_port: 52000,
+            quic_port: 52001,
+            transport_public_key: "server-public-key".into(),
+            protocol_version: quic_transport::PROTOCOL_VERSION,
+            screen_count: 1,
+            input_ready: false,
+            upgrading: false,
+            screens: vec![],
+            app_version: "0.1.0".into(),
+            last_seen_ms: now_ms(),
+        }];
+
+        let target =
+            file_transfer_target_for_device(&layout, &peers, "peer-server-10-0-0-1").unwrap();
+
+        assert_eq!(target.addr, "10.0.0.1:52001");
+        assert_eq!(target.transport_public_key, "server-public-key");
+    }
+
+    #[test]
+    fn file_transfer_writes_chunked_file_to_receive_root() {
+        let layout = test_layout();
+        let root = temp_test_dir("file-transfer-ok");
+        let transfers = Arc::new(Mutex::new(HashMap::new()));
+
+        for packet in [
+            test_file_transfer_packet("start", "transfer-1", "note.txt", 11, 0, 0, b""),
+            test_file_transfer_packet("chunk", "transfer-1", "note.txt", 11, 0, 0, b"hello "),
+            test_file_transfer_packet("chunk", "transfer-1", "note.txt", 11, 1, 6, b"world"),
+            test_file_transfer_packet("finish", "transfer-1", "note.txt", 11, 2, 11, b""),
+        ] {
+            let payload = encode_wire_packet(&packet).expect("file packet should encode");
+            assert!(handle_file_transfer_packet_with_root(
+                &payload,
+                &layout,
+                "local-device",
+                &transfers,
+                &root
+            ));
+        }
+
+        assert_eq!(
+            fs::read_to_string(root.join("note.txt")).expect("received file"),
+            "hello world"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn file_transfer_rejects_out_of_order_chunks() {
+        let layout = test_layout();
+        let root = temp_test_dir("file-transfer-order");
+        let transfers = Arc::new(Mutex::new(HashMap::new()));
+        let start = test_file_transfer_packet("start", "transfer-2", "note.txt", 5, 0, 0, b"");
+        let start_payload = encode_wire_packet(&start).expect("start should encode");
+        assert!(handle_file_transfer_packet_with_root(
+            &start_payload,
+            &layout,
+            "local-device",
+            &transfers,
+            &root
+        ));
+
+        let stale = test_file_transfer_packet("chunk", "transfer-2", "note.txt", 5, 1, 0, b"hello");
+        let stale_payload = encode_wire_packet(&stale).expect("chunk should encode");
+        assert!(!handle_file_transfer_packet_with_root(
+            &stale_payload,
+            &layout,
+            "local-device",
+            &transfers,
+            &root
+        ));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn file_transfer_sanitizes_received_file_names() {
+        assert_eq!(
+            sanitize_transfer_file_name("../bad:name?.txt").as_deref(),
+            Some("_bad_name_.txt")
+        );
+        assert!(sanitize_transfer_file_name("..").is_none());
+        assert!(sanitize_transfer_file_name("  ").is_none());
+    }
+
+    fn temp_test_dir(name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!("{name}-{}", random_hex(4)));
+        fs::create_dir_all(&path).expect("temp test dir");
+        path
+    }
+
+    fn test_file_transfer_packet(
+        kind: &str,
+        transfer_id: &str,
+        file_name: &str,
+        total_bytes: u64,
+        chunk_index: u64,
+        offset: u64,
+        data: &[u8],
+    ) -> FileTransferPacket {
+        FileTransferPacket {
+            protocol: FILE_TRANSFER_PROTOCOL.into(),
+            kind: kind.into(),
+            transfer_id: transfer_id.into(),
+            origin_id: "peer-client-10-0-0-2".into(),
+            target_id: "local-device".into(),
+            cluster_id: "cluster-test".into(),
+            pair_secret: "secret-test".into(),
+            file_name: file_name.into(),
+            total_bytes,
+            chunk_index,
+            offset,
+            data: data.to_vec(),
+        }
     }
 
     #[test]

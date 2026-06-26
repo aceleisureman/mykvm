@@ -8,6 +8,7 @@ import {
   useState,
 } from "react";
 import { isTauri } from "@tauri-apps/api/core";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
 import type { Theme } from "@tauri-apps/api/window";
 import "./App.css";
 import {
@@ -32,6 +33,7 @@ import {
   resetPairing,
   restartAsAdmin,
   saveLayout,
+  sendFilesToDevice,
   setAutostart,
   scanLanPeers,
   startRuntime,
@@ -140,6 +142,17 @@ interface BoardViewport {
   metrics: BoardMetrics;
 }
 
+interface FileDropPosition {
+  x: number;
+  y: number;
+}
+
+type NativeFileDragPayload =
+  | { type: "over"; position: FileDropPosition }
+  | { type: "drop"; paths: string[]; position?: FileDropPosition }
+  | { type: "cancel" }
+  | { type: string; paths?: string[]; position?: FileDropPosition };
+
 function App() {
   const [snapshot, setSnapshot] = useState<AppStateSnapshot | null>(null);
   const [dragState, setDragState] = useState<DragState | null>(null);
@@ -153,6 +166,12 @@ function App() {
   const [isAddingDevice, setIsAddingDevice] = useState(false);
   const [isPairingDevice, setIsPairingDevice] = useState(false);
   const [isDismissingPairing, setIsDismissingPairing] = useState(false);
+  const [fileTransferPendingTargetId, setFileTransferPendingTargetId] =
+    useState<string | null>(null);
+  const [fileDragTargetId, setFileDragTargetId] = useState<string | null>(null);
+  const [fileTransferMessage, setFileTransferMessage] = useState<string | null>(
+    null,
+  );
   const [isAdminRestartPending, setIsAdminRestartPending] = useState(false);
   const [isAppRelaunchPending, setIsAppRelaunchPending] = useState(false);
   const [boardZoom, setBoardZoom] = useState(1);
@@ -188,12 +207,17 @@ function App() {
     () => getSystemTheme(),
   );
   const boardRef = useRef<HTMLDivElement | null>(null);
+  const fileDragTargetIdRef = useRef<string | null>(null);
   const startupUpdateCheckStarted = useRef(false);
   const snapshotRef = useRef<AppStateSnapshot | null>(null);
 
   useEffect(() => {
     snapshotRef.current = snapshot;
   }, [snapshot]);
+
+  useEffect(() => {
+    fileDragTargetIdRef.current = fileDragTargetId;
+  }, [fileDragTargetId]);
 
   useEffect(() => {
     let active = true;
@@ -750,6 +774,78 @@ function App() {
       setIsSaving(false);
     }
   }
+
+  const sendDroppedFiles = useEffectEvent(
+    async (targetDeviceId: string, paths: string[]) => {
+      const transferPaths = paths.filter((path) => path.trim().length > 0);
+      if (transferPaths.length === 0) {
+        return;
+      }
+
+      setFileTransferPendingTargetId(targetDeviceId);
+      setFileTransferMessage(null);
+      setErrorMessage(null);
+
+      try {
+        const summary = await sendFilesToDevice(targetDeviceId, transferPaths);
+        setFileTransferMessage(formatFileTransferSummary(summary, language));
+      } catch (error: unknown) {
+        setErrorMessage(
+          error instanceof Error ? error.message : ui.errors.fileTransfer,
+        );
+      } finally {
+        setFileTransferPendingTargetId(null);
+      }
+    },
+  );
+
+  useEffect(() => {
+    if (!isTauri()) {
+      return;
+    }
+
+    let disposed = false;
+    let unlisten: (() => void) | null = null;
+
+    getCurrentWebview()
+      .onDragDropEvent((event) => {
+        const payload = event.payload as NativeFileDragPayload;
+
+        if (payload.type === "over") {
+          setFileDragTargetId(fileTransferTargetIdAtPosition(payload.position));
+          return;
+        }
+
+        if (payload.type === "drop") {
+          const targetDeviceId =
+            fileTransferTargetIdAtPosition(payload.position) ??
+            fileDragTargetIdRef.current;
+          setFileDragTargetId(null);
+          if (targetDeviceId && payload.paths?.length) {
+            void sendDroppedFiles(targetDeviceId, payload.paths);
+          }
+          return;
+        }
+
+        setFileDragTargetId(null);
+      })
+      .then((nextUnlisten) => {
+        if (disposed) {
+          nextUnlisten();
+        } else {
+          unlisten = nextUnlisten;
+        }
+      })
+      .catch(() => {
+        // File drag-and-drop is a native desktop affordance; the rest of the app
+        // should keep working if the webview cannot register this listener.
+      });
+
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, []);
 
   const endDrag = useEffectEvent(() => {
     if (layout) {
@@ -1469,6 +1565,65 @@ function App() {
   const addedOnlyDevices = displayLayout.devices.filter(
     (device) => !lanPeers.some((peer) => deviceMatchesPeer(device, peer)),
   );
+  const serverFileTransferTargets = displayLayout.devices.filter(
+    (device) =>
+      device.role !== "local" &&
+      device.online &&
+      device.inputReady &&
+      device.transportPublicKey.trim().length > 0,
+  );
+  const clientFileTransferTargets =
+    machineRole === "client"
+      ? layout.pairedControllers.map((controller) => {
+          const peer = lanPeers.find(
+            (candidate) =>
+              candidate.id === controller.id ||
+              (controller.transportPublicKey.trim().length > 0 &&
+                candidate.transportPublicKey === controller.transportPublicKey),
+          );
+
+          return {
+            id: controller.id,
+            name: controller.name || controller.ip || controller.id,
+            meta: peer
+              ? `${peer.ip || peer.host} · ${peer.platform || "peer"}`
+              : controller.ip || controller.host || controller.id,
+            available: Boolean(peer),
+          };
+        })
+      : [];
+
+  function renderFileTransferDropZone(target: {
+    id: string;
+    name: string;
+    meta: string;
+    available: boolean;
+  }) {
+    const isPending = fileTransferPendingTargetId === target.id;
+    const isHovering = fileDragTargetId === target.id;
+
+    return (
+      <div
+        key={target.id}
+        className={`file-drop-zone ${isHovering ? "drag-over" : ""} ${
+          !target.available ? "disabled" : ""
+        }`}
+        data-file-transfer-target={target.available && !isPending ? target.id : undefined}
+      >
+        <div>
+          <strong>{target.name}</strong>
+          <span>{target.meta}</span>
+        </div>
+        <small>
+          {isPending
+            ? ui.devices.fileTransferSending
+            : target.available
+              ? ui.devices.fileTransferDrop
+              : ui.common.offline}
+        </small>
+      </div>
+    );
+  }
 
   function renderAddedDeviceActions(device: Device) {
     if (device.role === "local") {
@@ -1716,6 +1871,36 @@ function App() {
                     : ui.common.add}
                 </button>
               </form>
+            </section>
+
+            <section className="surface-card file-transfer-card">
+              <div className="card-title-row">
+                <div>
+                  <h2>{ui.devices.fileTransferTitle}</h2>
+                  <p className="muted-copy">{ui.devices.fileTransferCopy}</p>
+                </div>
+              </div>
+              <div className="file-drop-grid">
+                {serverFileTransferTargets.length > 0 ? (
+                  serverFileTransferTargets.map((device) =>
+                    renderFileTransferDropZone({
+                      id: device.id,
+                      name: device.name,
+                      meta: `${PLATFORM_LABELS[device.platform]} · ${device.host}`,
+                      available: true,
+                    }),
+                  )
+                ) : (
+                  <p className="muted-copy file-transfer-empty">
+                    {ui.devices.fileTransferUnavailable}
+                  </p>
+                )}
+              </div>
+              {fileTransferMessage ? (
+                <p className="muted-copy file-transfer-message">
+                  {fileTransferMessage}
+                </p>
+              ) : null}
             </section>
 
             <section className="surface-card connection-list-card">
@@ -1999,6 +2184,29 @@ function App() {
                   </div>
                 ) : null}
               </section>
+
+              {machineRole === "client" ? (
+                <section className="surface-card file-transfer-card">
+                  <div>
+                    <h2>{ui.devices.fileTransferTitle}</h2>
+                    <p className="muted-copy">{ui.devices.fileTransferCopy}</p>
+                  </div>
+                  <div className="file-drop-grid">
+                    {clientFileTransferTargets.length > 0 ? (
+                      clientFileTransferTargets.map(renderFileTransferDropZone)
+                    ) : (
+                      <p className="muted-copy file-transfer-empty">
+                        {ui.settings.notPaired}
+                      </p>
+                    )}
+                  </div>
+                  {fileTransferMessage ? (
+                    <p className="muted-copy file-transfer-message">
+                      {fileTransferMessage}
+                    </p>
+                  ) : null}
+                </section>
+              ) : null}
 
               <section className="surface-card modifier-card">
                 <div className="card-title-row">
@@ -2852,6 +3060,45 @@ function formatScreenCount(count: number, language: AppLanguage) {
   return language === "en"
     ? `${count} ${count === 1 ? "screen" : "screens"}`
     : `${count} 屏`;
+}
+
+function fileTransferTargetIdAtPosition(position?: FileDropPosition | null) {
+  if (!position) {
+    return null;
+  }
+
+  const element = document.elementFromPoint(position.x, position.y);
+  const target = element?.closest<HTMLElement>("[data-file-transfer-target]");
+  return target?.dataset.fileTransferTarget ?? null;
+}
+
+function formatFileTransferSummary(
+  summary: { targetName: string; fileCount: number; byteCount: number },
+  language: AppLanguage,
+) {
+  const size = formatFileTransferBytes(summary.byteCount);
+  if (language === "en") {
+    return `${TEXT.en.devices.fileTransferSent} ${summary.fileCount} ${
+      summary.fileCount === 1 ? "file" : "files"
+    } to ${summary.targetName} · ${size}`;
+  }
+
+  return `${summary.fileCount} 个文件${TEXT.cn.devices.fileTransferSent}到 ${summary.targetName} · ${size}`;
+}
+
+function formatFileTransferBytes(bytes: number) {
+  const gib = 1024 * 1024 * 1024;
+  const mib = 1024 * 1024;
+  if (bytes >= gib) {
+    return `${(bytes / gib).toFixed(1)} GiB`;
+  }
+  if (bytes >= mib) {
+    return `${(bytes / mib).toFixed(1)} MiB`;
+  }
+  if (bytes >= 1024) {
+    return `${(bytes / 1024).toFixed(1)} KiB`;
+  }
+  return `${bytes} B`;
 }
 
 function updateStatusLabel(status: UpdateStatus, ui: AppText) {
