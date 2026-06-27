@@ -217,6 +217,17 @@ function App() {
   }, [snapshot]);
 
   useEffect(() => {
+    fileTransferFallbackTargetIdRef.current =
+      snapshot?.layout.fileTransferEnabled &&
+      snapshot.layout.machineRole === "client"
+        ? (preferredPairedControllerId(
+            snapshot.layout,
+            snapshot.runtime.discovery.peers,
+          ) ?? null)
+        : null;
+  }, [snapshot]);
+
+  useEffect(() => {
     fileDragTargetIdRef.current = fileDragTargetId;
   }, [fileDragTargetId]);
 
@@ -1181,6 +1192,17 @@ function App() {
     }
   }
 
+  function setEdgeSwitchHotkey(edgeSwitchHotkey: string) {
+    updateLayout((layoutState) => ({
+      ...layoutState,
+      edgeSwitchHotkey,
+    }));
+  }
+
+  function commitEdgeSwitchHotkey(value: string) {
+    setEdgeSwitchHotkey(normalizeEdgeSwitchHotkeyInput(value));
+  }
+
   function setTransportPortMode(transportPortMode: TransportPortMode) {
     updateLayout((layoutState) => ({
       ...layoutState,
@@ -1640,11 +1662,6 @@ function App() {
   const serverFileTransferTargetIds = new Set(
     serverFileTransferTargets.map((device) => device.id),
   );
-  const clientFileTransferTargetId =
-    fileTransferEnabled && machineRole === "client"
-      ? (preferredPairedControllerId(layout, lanPeers) ?? null)
-      : null;
-  fileTransferFallbackTargetIdRef.current = clientFileTransferTargetId;
 
   function screenFileTransferTargetId(screen: FlattenedScreen) {
     if (
@@ -2159,6 +2176,34 @@ function App() {
                       {ui.settings.autostartOff}
                     </button>
                   </div>
+                </div>
+                <div className="settings-control-row">
+                  <span>{ui.settings.edgeSwitchHotkey}</span>
+                  <input
+                    className="settings-text-input"
+                    list="edge-switch-hotkey-options"
+                    value={layout.edgeSwitchHotkey}
+                    placeholder={ui.settings.edgeSwitchHotkeyPlaceholder}
+                    onChange={(event) =>
+                      setEdgeSwitchHotkey(event.currentTarget.value)
+                    }
+                    onBlur={(event) =>
+                      commitEdgeSwitchHotkey(event.currentTarget.value)
+                    }
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter") {
+                        event.currentTarget.blur();
+                      }
+                    }}
+                  />
+                  <datalist id="edge-switch-hotkey-options">
+                    <option value="alt+shift+k" />
+                    <option value="ctrl+alt+k" />
+                    <option value="ctrl+shift+k" />
+                    <option value="f12" />
+                    <option value="scrolllock" />
+                    <option value="disabled" />
+                  </datalist>
                 </div>
                 <div className="settings-control-row">
                   <span>{ui.settings.clipboard}</span>
@@ -2754,6 +2799,11 @@ function normalizePort(value: number) {
   }
 
   return Math.round(Math.min(65535, Math.max(1024, value)));
+}
+
+function normalizeEdgeSwitchHotkeyInput(value: string) {
+  const normalized = value.trim().toLowerCase().replace(/\s+/g, "");
+  return normalized.length === 0 ? "alt+shift+k" : normalized;
 }
 
 function clampZoom(value: number) {

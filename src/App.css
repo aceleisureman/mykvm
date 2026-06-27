@@ -45,6 +45,7 @@
 .theme-light .role-status-pill,
 .theme-light .add-device-form input,
 .theme-light .settings-number-input,
+.theme-light .settings-text-input,
 .theme-light .role-switcher button,
 .theme-light .segmented-control,
 .theme-light .switch-button {
@@ -1353,7 +1354,8 @@
 }
 
 .add-device-form input,
-.settings-number-input {
+.settings-number-input,
+.settings-text-input {
   width: 100%;
   min-width: 0;
   border: 1px solid rgba(63, 63, 70, 0.92);
@@ -1364,13 +1366,15 @@
 }
 
 .add-device-form input,
-.settings-number-input {
+.settings-number-input,
+.settings-text-input {
   min-height: 34px;
   padding: 0 10px;
 }
 
 .add-device-form input:focus,
-.settings-number-input:focus {
+.settings-number-input:focus,
+.settings-text-input:focus {
   border-color: #2786ff;
 }
 

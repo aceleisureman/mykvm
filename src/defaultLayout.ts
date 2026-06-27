@@ -31,6 +31,7 @@ export const defaultLayout: LayoutState = {
   quicPort: 47834,
   modifierRemap: true,
   modifierMap: { control: 'meta', alt: 'same', meta: 'control' },
+  edgeSwitchHotkey: 'alt+shift+k',
   devices: [
     {
       id: 'local-device',

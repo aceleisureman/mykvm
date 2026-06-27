@@ -32,6 +32,11 @@ const CROSSING_ACTIVATION_BAND: f64 = EDGE_TOLERANCE as f64 * 2.0;
 const RETURN_EDGE_INSET: f64 = 12.0;
 const MOUSE_MOVE_SEND_INTERVAL_MS: u64 = 8;
 const DRAG_MOVE_SEND_INTERVAL_MS: u64 = 8;
+const EDGE_SWITCH_HOTKEY_DISABLED: &str = "disabled";
+#[cfg(target_os = "windows")]
+const WINDOWS_FULLSCREEN_EDGE_TOLERANCE: i32 = 3;
+#[cfg(target_os = "windows")]
+const WINDOWS_FULLSCREEN_CHECK_INTERVAL_MS: u64 = 250;
 
 static INPUT_TX_FAILURES: AtomicU64 = AtomicU64::new(0);
 static INPUT_TX_SKIPS: AtomicU64 = AtomicU64::new(0);
@@ -138,6 +143,112 @@ struct RemoteMouseState {
     x: i32,
     y: i32,
     buttons: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EdgeSwitchHotkey {
+    key_code: u16,
+    ctrl: bool,
+    alt: bool,
+    shift: bool,
+    meta: bool,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct HotkeyModifiers {
+    ctrl: bool,
+    alt: bool,
+    shift: bool,
+    meta: bool,
+}
+
+fn edge_switch_hotkey_for_layout(
+    layout_state: &Arc<Mutex<LayoutState>>,
+) -> Option<EdgeSwitchHotkey> {
+    let layout = layout_state.lock().ok()?;
+    parse_edge_switch_hotkey(&layout.edge_switch_hotkey)
+}
+
+fn parse_edge_switch_hotkey(value: &str) -> Option<EdgeSwitchHotkey> {
+    let value = value.trim().to_ascii_lowercase().replace(' ', "");
+    if value.is_empty()
+        || matches!(
+            value.as_str(),
+            EDGE_SWITCH_HOTKEY_DISABLED | "disable" | "off" | "none"
+        )
+    {
+        return None;
+    }
+
+    let mut hotkey = EdgeSwitchHotkey {
+        key_code: 0,
+        ctrl: false,
+        alt: false,
+        shift: false,
+        meta: false,
+    };
+    let mut key_seen = false;
+
+    for part in value.split('+').filter(|part| !part.is_empty()) {
+        match part {
+            "ctrl" | "control" => hotkey.ctrl = true,
+            "alt" | "option" => hotkey.alt = true,
+            "shift" => hotkey.shift = true,
+            "meta" | "cmd" | "command" | "win" | "windows" | "super" => hotkey.meta = true,
+            key => {
+                if key_seen {
+                    return None;
+                }
+                hotkey.key_code = hotkey_key_code(key)?;
+                key_seen = true;
+            }
+        }
+    }
+
+    key_seen.then_some(hotkey)
+}
+
+fn hotkey_key_code(key: &str) -> Option<u16> {
+    if key.len() == 1 {
+        let byte = key.as_bytes()[0];
+        if byte.is_ascii_alphabetic() {
+            return Some(byte.to_ascii_uppercase() as u16);
+        }
+        if byte.is_ascii_digit() {
+            return Some(byte as u16);
+        }
+    }
+
+    if let Some(function_number) = key
+        .strip_prefix('f')
+        .and_then(|value| value.parse::<u16>().ok())
+    {
+        if (1..=24).contains(&function_number) {
+            return Some(0x70 + function_number - 1);
+        }
+    }
+
+    Some(match key {
+        "space" => 0x20,
+        "tab" => 0x09,
+        "enter" | "return" => 0x0D,
+        "esc" | "escape" => 0x1B,
+        "scrolllock" | "scroll" | "scrlk" => 0x91,
+        _ => return None,
+    })
+}
+
+fn hotkey_matches_key_event(
+    hotkey: &EdgeSwitchHotkey,
+    key_code: u16,
+    down: bool,
+    modifiers: HotkeyModifiers,
+) -> bool {
+    down && hotkey.key_code == key_code
+        && (!hotkey.ctrl || modifiers.ctrl)
+        && (!hotkey.alt || modifiers.alt)
+        && (!hotkey.shift || modifiers.shift)
+        && (!hotkey.meta || modifiers.meta)
 }
 
 pub fn stopped_capture_status() -> NativeStageStatus {
@@ -346,6 +457,8 @@ fn start_platform_capture(
             pressed_modifiers: Mutex::new(Vec::new()),
             pressed_keys: Mutex::new(Vec::new()),
             tap_disabled: AtomicBool::new(false),
+            crossing_enabled: AtomicBool::new(true),
+            hotkey_down: AtomicBool::new(false),
             local_y_bounds,
         });
         let callback_context = Arc::clone(&context);
@@ -478,6 +591,9 @@ fn start_platform_capture(
             remote_button_mask: AtomicU64::new(0),
             pressed_keys: Mutex::new(Vec::new()),
             cursor_hide_calls: Mutex::new(0),
+            crossing_enabled: AtomicBool::new(true),
+            hotkey_down: AtomicBool::new(false),
+            fullscreen_foreground_cache: Mutex::new(None),
             just_crossed: AtomicBool::new(false),
         });
 
@@ -1680,6 +1796,8 @@ struct MacCaptureContext {
     // released if the cursor crosses back to local while a key is still down.
     pressed_keys: Mutex<Vec<u16>>,
     tap_disabled: AtomicBool,
+    crossing_enabled: AtomicBool,
+    hotkey_down: AtomicBool,
     local_y_bounds: Option<(f64, f64)>,
 }
 
@@ -1701,6 +1819,9 @@ struct WindowsCaptureContext {
     remote_button_mask: AtomicU64,
     pressed_keys: Mutex<Vec<u16>>,
     cursor_hide_calls: Mutex<u8>,
+    crossing_enabled: AtomicBool,
+    hotkey_down: AtomicBool,
+    fullscreen_foreground_cache: Mutex<Option<(Instant, bool)>>,
     // Swallow the first post-crossing delta so a fast flick across the edge
     // does not shove the cursor inward on Windows, where we pin by warping.
     just_crossed: AtomicBool,
@@ -1857,6 +1978,110 @@ fn release_held_remote_inputs_macos(context: &MacCaptureContext, target: &InputT
     );
 }
 
+#[cfg(target_os = "macos")]
+fn handle_macos_toggle_hotkey(
+    context: &MacCaptureContext,
+    event_type: core_graphics::event::CGEventType,
+    event: &core_graphics::event::CGEvent,
+) -> Option<core_graphics::event::CallbackResult> {
+    use core_graphics::event::{CallbackResult, EventField};
+
+    if !matches!(
+        event_type,
+        core_graphics::event::CGEventType::KeyDown | core_graphics::event::CGEventType::KeyUp
+    ) {
+        return None;
+    }
+
+    let Some(hotkey) = edge_switch_hotkey_for_layout(&context.layout_state) else {
+        context.hotkey_down.store(false, Ordering::Relaxed);
+        return None;
+    };
+    let mac_code = event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE) as u16;
+    let Some(key_code) = mac_key_to_windows_vk(mac_code) else {
+        return None;
+    };
+    if key_code != hotkey.key_code {
+        return None;
+    }
+
+    let down = matches!(event_type, core_graphics::event::CGEventType::KeyDown);
+    if down && hotkey_matches_key_event(&hotkey, key_code, down, mac_event_modifiers(event)) {
+        if !context.hotkey_down.swap(true, Ordering::Relaxed) {
+            let next_enabled = !context.crossing_enabled.fetch_xor(true, Ordering::Relaxed);
+            if next_enabled {
+                log::info!("macOS edge-switch hotkey enabled edge switching");
+            } else {
+                log::info!("macOS edge-switch hotkey disabled edge switching");
+                release_macos_remote_control(context, true);
+            }
+        }
+        return Some(CallbackResult::Drop);
+    }
+
+    if !down && context.hotkey_down.swap(false, Ordering::Relaxed) {
+        return Some(CallbackResult::Drop);
+    }
+
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn should_suspend_macos_capture(context: &MacCaptureContext) -> bool {
+    if !context.crossing_enabled.load(Ordering::Relaxed) {
+        release_macos_remote_control(context, true);
+        return true;
+    }
+
+    false
+}
+
+#[cfg(target_os = "macos")]
+fn mac_event_modifiers(event: &core_graphics::event::CGEvent) -> HotkeyModifiers {
+    use core_graphics::event::CGEventFlags;
+
+    let flags = event.get_flags();
+    HotkeyModifiers {
+        ctrl: flags.contains(CGEventFlags::CGEventFlagControl),
+        alt: flags.contains(CGEventFlags::CGEventFlagAlternate),
+        shift: flags.contains(CGEventFlags::CGEventFlagShift),
+        meta: flags.contains(CGEventFlags::CGEventFlagCommand),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn release_macos_remote_control(context: &MacCaptureContext, clear_clipboard: bool) {
+    let target = context
+        .active
+        .lock()
+        .ok()
+        .and_then(|mut active| active.take().map(|active| active.target));
+
+    if let Some(target) = target {
+        release_held_remote_inputs_macos(context, &target);
+    } else {
+        reset_remote_button_mask(&context.remote_button_mask);
+        if let Ok(mut modifiers) = context.pressed_modifiers.lock() {
+            modifiers.clear();
+        }
+        if let Ok(mut pressed) = context.pressed_keys.lock() {
+            pressed.clear();
+        }
+    }
+
+    context.remote_active.store(false, Ordering::Relaxed);
+    reset_mouse_move_timer(&context.last_mouse_move_sent);
+    reset_cursor_repin_timer(context);
+    set_macos_cursor_decoupled(false);
+    show_macos_cursor_if_needed(context);
+    if let Ok(mut anchor) = context.anchor.lock() {
+        *anchor = None;
+    }
+    if clear_clipboard {
+        clear_clipboard_target(&context.clipboard_target);
+    }
+}
+
 pub fn clear_clipboard_target(target: &Arc<Mutex<Option<ClipboardTarget>>>) {
     if let Ok(mut target) = target.lock() {
         *target = None;
@@ -1955,6 +2180,9 @@ unsafe extern "system" fn windows_mouse_proc(code: i32, wparam: usize, lparam: i
         release_windows_remote_control(&context, true);
         return unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) };
     }
+    if should_suspend_windows_capture(&context) {
+        return unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) };
+    }
 
     let event = unsafe { *(lparam as *const MSLLHOOKSTRUCT) };
     let message = wparam as u32;
@@ -1991,6 +2219,20 @@ unsafe extern "system" fn windows_keyboard_proc(code: i32, wparam: usize, lparam
         return unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) };
     }
 
+    let event = unsafe { *(lparam as *const KBDLLHOOKSTRUCT) };
+    let message = wparam as u32;
+    if matches!(message, WM_KEYDOWN | WM_SYSKEYDOWN | WM_KEYUP | WM_SYSKEYUP) {
+        let key_code = event.vkCode as u16;
+        let down = matches!(message, WM_KEYDOWN | WM_SYSKEYDOWN);
+        if handle_windows_toggle_hotkey(&context, key_code, down) {
+            return 1;
+        }
+    }
+
+    if should_suspend_windows_capture(&context) {
+        return unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) };
+    }
+
     let active = context
         .active
         .lock()
@@ -2000,8 +2242,6 @@ unsafe extern "system" fn windows_keyboard_proc(code: i32, wparam: usize, lparam
         return unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) };
     };
 
-    let event = unsafe { *(lparam as *const KBDLLHOOKSTRUCT) };
-    let message = wparam as u32;
     if matches!(message, WM_KEYDOWN | WM_SYSKEYDOWN | WM_KEYUP | WM_SYSKEYUP) {
         let key_code = event.vkCode as u16;
         let down = matches!(message, WM_KEYDOWN | WM_SYSKEYDOWN);
@@ -2102,6 +2342,95 @@ fn release_windows_remote_control(context: &WindowsCaptureContext, clear_clipboa
 }
 
 #[cfg(target_os = "windows")]
+fn handle_windows_toggle_hotkey(
+    context: &WindowsCaptureContext,
+    key_code: u16,
+    down: bool,
+) -> bool {
+    let Some(hotkey) = edge_switch_hotkey_for_layout(&context.layout_state) else {
+        context.hotkey_down.store(false, Ordering::Relaxed);
+        return false;
+    };
+
+    if key_code != hotkey.key_code {
+        return false;
+    }
+
+    if down && hotkey_matches_key_event(&hotkey, key_code, down, windows_current_modifiers()) {
+        if !context.hotkey_down.swap(true, Ordering::Relaxed) {
+            let next_enabled = !context.crossing_enabled.fetch_xor(true, Ordering::Relaxed);
+            if next_enabled {
+                log::info!("Windows edge-switch hotkey enabled edge switching");
+            } else {
+                log::info!("Windows edge-switch hotkey disabled edge switching");
+                release_windows_remote_control(context, true);
+            }
+        }
+        return true;
+    }
+
+    if !down && context.hotkey_down.swap(false, Ordering::Relaxed) {
+        return true;
+    }
+
+    false
+}
+
+#[cfg(target_os = "windows")]
+fn windows_current_modifiers() -> HotkeyModifiers {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+        GetAsyncKeyState, VK_CONTROL, VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MENU,
+        VK_RCONTROL, VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SHIFT,
+    };
+
+    fn down(vk: u16) -> bool {
+        unsafe { GetAsyncKeyState(vk as i32) < 0 }
+    }
+
+    HotkeyModifiers {
+        ctrl: down(VK_CONTROL) || down(VK_LCONTROL) || down(VK_RCONTROL),
+        alt: down(VK_MENU) || down(VK_LMENU) || down(VK_RMENU),
+        shift: down(VK_SHIFT) || down(VK_LSHIFT) || down(VK_RSHIFT),
+        meta: down(VK_LWIN) || down(VK_RWIN),
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn should_suspend_windows_capture(context: &WindowsCaptureContext) -> bool {
+    if !context.crossing_enabled.load(Ordering::Relaxed) {
+        release_windows_remote_control(context, true);
+        return true;
+    }
+
+    if windows_foreground_window_is_fullscreen_cached(context) {
+        release_windows_remote_control(context, true);
+        return true;
+    }
+
+    false
+}
+
+#[cfg(target_os = "windows")]
+fn windows_foreground_window_is_fullscreen_cached(context: &WindowsCaptureContext) -> bool {
+    let now = Instant::now();
+    if let Ok(mut cache) = context.fullscreen_foreground_cache.lock() {
+        if let Some((checked_at, value)) = *cache {
+            if now.duration_since(checked_at)
+                < Duration::from_millis(WINDOWS_FULLSCREEN_CHECK_INTERVAL_MS)
+            {
+                return value;
+            }
+        }
+
+        let value = windows_foreground_window_is_fullscreen();
+        *cache = Some((now, value));
+        return value;
+    }
+
+    windows_foreground_window_is_fullscreen()
+}
+
+#[cfg(target_os = "windows")]
 fn windows_input_desktop_is_default() -> bool {
     use windows_sys::Win32::System::StationsAndDesktops::{
         CloseDesktop, GetUserObjectInformationW, OpenInputDesktop, DESKTOP_READOBJECTS, UOI_NAME,
@@ -2136,6 +2465,84 @@ fn windows_input_desktop_is_default() -> bool {
 
         name.eq_ignore_ascii_case("default")
     }
+}
+
+#[cfg(target_os = "windows")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WindowsRect {
+    left: i32,
+    top: i32,
+    right: i32,
+    bottom: i32,
+}
+
+#[cfg(target_os = "windows")]
+fn windows_foreground_window_is_fullscreen() -> bool {
+    use windows_sys::Win32::{
+        Foundation::RECT,
+        Graphics::Gdi::{
+            GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+        },
+        System::Threading::GetCurrentProcessId,
+        UI::WindowsAndMessaging::{
+            GetForegroundWindow, GetWindowRect, GetWindowThreadProcessId, IsWindowVisible,
+        },
+    };
+
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        if hwnd.is_null() || IsWindowVisible(hwnd) == 0 {
+            return false;
+        }
+
+        let mut foreground_pid = 0_u32;
+        GetWindowThreadProcessId(hwnd, &mut foreground_pid);
+        if foreground_pid == GetCurrentProcessId() {
+            return false;
+        }
+
+        let mut window_rect = RECT::default();
+        if GetWindowRect(hwnd, &mut window_rect) == 0 {
+            return false;
+        }
+
+        let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        if monitor.is_null() {
+            return false;
+        }
+        let mut monitor_info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            rcMonitor: RECT::default(),
+            rcWork: RECT::default(),
+            dwFlags: 0,
+        };
+        if GetMonitorInfoW(monitor, &mut monitor_info) == 0 {
+            return false;
+        }
+
+        rect_covers_monitor(
+            WindowsRect {
+                left: window_rect.left,
+                top: window_rect.top,
+                right: window_rect.right,
+                bottom: window_rect.bottom,
+            },
+            WindowsRect {
+                left: monitor_info.rcMonitor.left,
+                top: monitor_info.rcMonitor.top,
+                right: monitor_info.rcMonitor.right,
+                bottom: monitor_info.rcMonitor.bottom,
+            },
+        )
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn rect_covers_monitor(window: WindowsRect, monitor: WindowsRect) -> bool {
+    window.left <= monitor.left + WINDOWS_FULLSCREEN_EDGE_TOLERANCE
+        && window.top <= monitor.top + WINDOWS_FULLSCREEN_EDGE_TOLERANCE
+        && window.right >= monitor.right - WINDOWS_FULLSCREEN_EDGE_TOLERANCE
+        && window.bottom >= monitor.bottom - WINDOWS_FULLSCREEN_EDGE_TOLERANCE
 }
 
 #[cfg(target_os = "windows")]
@@ -2454,6 +2861,14 @@ fn handle_macos_event(
         // Flag for the run-loop thread to re-enable; the cursor and remote state
         // are reset there too so we don't get stuck mid-control.
         context.tap_disabled.store(true, Ordering::Relaxed);
+        return CallbackResult::Keep;
+    }
+
+    if let Some(result) = handle_macos_toggle_hotkey(context, event_type, event) {
+        return result;
+    }
+
+    if should_suspend_macos_capture(context) {
         return CallbackResult::Keep;
     }
 
@@ -3080,10 +3495,7 @@ fn local_anchor_point(active: &ActiveTarget) -> (f64, f64) {
 /// parked at the shared edge. True cursor hiding isn't reliably possible on the
 /// controlled side, so tucking it into a corner is the seamless-feeling
 /// approximation.
-#[cfg_attr(
-    not(any(target_os = "windows", target_os = "macos")),
-    allow(dead_code)
-)]
+#[cfg_attr(not(any(target_os = "windows", target_os = "macos")), allow(dead_code))]
 fn send_remote_cursor_park(
     quic_transport: &quic_transport::TransportHandle,
     active: &ActiveTarget,
@@ -4121,6 +4533,7 @@ mod tests {
             quic_port: 47834,
             modifier_remap: true,
             modifier_map: crate::default_modifier_map(),
+            edge_switch_hotkey: crate::default_edge_switch_hotkey(),
         }
     }
 
@@ -4802,5 +5215,68 @@ mod tests {
         let targets = build_input_targets(&layout, &layout);
 
         assert!(targets.is_empty());
+    }
+
+    #[test]
+    fn edge_switch_hotkey_parses_cross_platform_combos() {
+        let hotkey = parse_edge_switch_hotkey("Option + Shift + K").expect("hotkey");
+
+        assert_eq!(hotkey.key_code, 0x4B);
+        assert!(hotkey.alt);
+        assert!(hotkey.shift);
+        assert!(!hotkey.ctrl);
+        assert!(!hotkey.meta);
+    }
+
+    #[test]
+    fn edge_switch_hotkey_supports_custom_single_keys() {
+        assert_eq!(
+            parse_edge_switch_hotkey("f12")
+                .expect("f12 hotkey")
+                .key_code,
+            0x7B
+        );
+        assert_eq!(
+            parse_edge_switch_hotkey("scrolllock")
+                .expect("scroll lock hotkey")
+                .key_code,
+            0x91
+        );
+        assert!(parse_edge_switch_hotkey("disabled").is_none());
+    }
+
+    #[test]
+    fn edge_switch_hotkey_requires_configured_modifiers() {
+        let hotkey = parse_edge_switch_hotkey("ctrl+alt+k").expect("hotkey");
+
+        assert!(hotkey_matches_key_event(
+            &hotkey,
+            0x4B,
+            true,
+            HotkeyModifiers {
+                ctrl: true,
+                alt: true,
+                ..HotkeyModifiers::default()
+            },
+        ));
+        assert!(!hotkey_matches_key_event(
+            &hotkey,
+            0x4B,
+            true,
+            HotkeyModifiers {
+                ctrl: true,
+                ..HotkeyModifiers::default()
+            },
+        ));
+        assert!(!hotkey_matches_key_event(
+            &hotkey,
+            0x4B,
+            false,
+            HotkeyModifiers {
+                ctrl: true,
+                alt: true,
+                ..HotkeyModifiers::default()
+            },
+        ));
     }
 }
