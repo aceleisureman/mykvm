@@ -19,8 +19,10 @@ use serde::{Deserialize, Serialize};
 use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    AppHandle, DragDropEvent, Manager, Monitor, WebviewUrl, WebviewWindowBuilder, WindowEvent,
+    AppHandle, DragDropEvent, Emitter, Manager, Monitor, WebviewUrl, WebviewWindowBuilder,
+    WindowEvent, Wry,
 };
+use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
 
 mod clipboard;
 mod input;
@@ -75,6 +77,7 @@ const QUIT_EXISTING_ARG: &str = "--mykvm-quit-existing";
 const INSTALL_INPUT_SERVICE_ARG: &str = "--install-input-service";
 const UNINSTALL_INPUT_SERVICE_ARG: &str = "--uninstall-input-service";
 const HELPER_PATH_ARG: &str = "--helper-path";
+const RUNTIME_STATE_EVENT: &str = "runtime-state-changed";
 
 #[cfg(target_os = "windows")]
 const SINGLE_INSTANCE_MUTEX_NAME: &str = "Local\\MyKVM_SingleInstance";
@@ -494,6 +497,7 @@ struct AppRuntime {
     clipboard_last_sequences: Arc<Mutex<HashMap<String, u64>>>,
     remote_input_active: Arc<AtomicBool>,
     main_window_visible: Arc<AtomicBool>,
+    main_window_focused: Arc<AtomicBool>,
     allow_explicit_quit: Arc<AtomicBool>,
     clipboard_target: Arc<Mutex<Option<input::ClipboardTarget>>>,
     input_receive_enabled: Arc<AtomicBool>,
@@ -502,6 +506,8 @@ struct AppRuntime {
     transport_packets: Arc<AtomicU64>,
     input_events: Arc<AtomicU64>,
     clipboard_packets: Arc<AtomicU64>,
+    runtime_toggle_shortcut: Mutex<Option<String>>,
+    runtime_toggle_menu_item: Mutex<Option<MenuItem<Wry>>>,
     config_path: PathBuf,
 }
 
@@ -528,6 +534,7 @@ impl AppRuntime {
             clipboard_last_sequences: Arc::new(Mutex::new(HashMap::new())),
             remote_input_active: Arc::new(AtomicBool::new(false)),
             main_window_visible: Arc::new(AtomicBool::new(false)),
+            main_window_focused: Arc::new(AtomicBool::new(false)),
             allow_explicit_quit: Arc::new(AtomicBool::new(false)),
             clipboard_target: Arc::new(Mutex::new(None)),
             input_receive_enabled: Arc::new(AtomicBool::new(false)),
@@ -536,6 +543,8 @@ impl AppRuntime {
             transport_packets: Arc::new(AtomicU64::new(0)),
             input_events: Arc::new(AtomicU64::new(0)),
             clipboard_packets: Arc::new(AtomicU64::new(0)),
+            runtime_toggle_shortcut: Mutex::new(None),
+            runtime_toggle_menu_item: Mutex::new(None),
             config_path,
         }
     }
@@ -1044,6 +1053,7 @@ impl AppRuntime {
             Arc::clone(&stop),
             Arc::clone(&self.remote_input_active),
             Arc::clone(&self.main_window_visible),
+            Arc::clone(&self.main_window_focused),
             Arc::clone(&self.clipboard_target),
             Arc::clone(&self.input_events),
         );
@@ -1244,6 +1254,7 @@ fn save_layout(
             state.start_discovery()?;
         }
     }
+    sync_runtime_toggle_shortcut(&state.app_handle)?;
     Ok(state.snapshot())
 }
 
@@ -1372,8 +1383,7 @@ fn restart_runtime_if_running(state: &AppRuntime) -> Result<(), String> {
     Ok(())
 }
 
-#[tauri::command]
-fn start_runtime(state: tauri::State<'_, AppRuntime>) -> Result<RuntimeStatus, String> {
+fn start_runtime_inner(state: &AppRuntime) -> Result<RuntimeStatus, String> {
     state.refresh_layout_from_disk();
     let discovery_error = state.start_discovery().err();
     let layout = state.layout_snapshot();
@@ -1403,6 +1413,16 @@ fn start_runtime(state: tauri::State<'_, AppRuntime>) -> Result<RuntimeStatus, S
     };
 
     Ok(runtime.clone())
+}
+
+#[tauri::command]
+fn start_runtime(
+    app: AppHandle,
+    state: tauri::State<'_, AppRuntime>,
+) -> Result<RuntimeStatus, String> {
+    let runtime = start_runtime_inner(state.inner())?;
+    notify_runtime_state_changed(&app, &runtime);
+    Ok(runtime)
 }
 
 fn ready_transport_status(discovery: &DiscoveryStatus) -> NativeStageStatus {
@@ -1566,8 +1586,7 @@ fn ipv4_from_host_value(host_value: &str) -> Option<std::net::Ipv4Addr> {
         })
 }
 
-#[tauri::command]
-fn stop_runtime(state: tauri::State<'_, AppRuntime>) -> Result<RuntimeStatus, String> {
+fn stop_runtime_inner(state: &AppRuntime) -> Result<RuntimeStatus, String> {
     state.stop_input();
     state.stop_clipboard();
     state.start_discovery()?;
@@ -1582,6 +1601,198 @@ fn stop_runtime(state: tauri::State<'_, AppRuntime>) -> Result<RuntimeStatus, St
     stopped_runtime.pairing = state.pairing_status_for_layout(&layout);
     *runtime = stopped_runtime;
     Ok(runtime.clone())
+}
+
+#[tauri::command]
+fn stop_runtime(
+    app: AppHandle,
+    state: tauri::State<'_, AppRuntime>,
+) -> Result<RuntimeStatus, String> {
+    let runtime = stop_runtime_inner(state.inner())?;
+    notify_runtime_state_changed(&app, &runtime);
+    Ok(runtime)
+}
+
+fn toggle_runtime_from_app(app: &AppHandle) -> Result<RuntimeStatus, String> {
+    let state = app.state::<AppRuntime>();
+    let started = state
+        .runtime
+        .lock()
+        .map_err(|_| "runtime state lock poisoned".to_string())?
+        .started;
+    let runtime = if started {
+        stop_runtime_inner(state.inner())?
+    } else {
+        start_runtime_inner(state.inner())?
+    };
+    notify_runtime_state_changed(app, &runtime);
+    Ok(runtime)
+}
+
+fn notify_runtime_state_changed(app: &AppHandle, runtime: &RuntimeStatus) {
+    update_runtime_tray_state(app, runtime.started);
+    let _ = app.emit(RUNTIME_STATE_EVENT, runtime);
+}
+
+fn update_runtime_tray_state(app: &AppHandle, started: bool) {
+    if let Some(state) = app.try_state::<AppRuntime>() {
+        if let Ok(item) = state.runtime_toggle_menu_item.lock() {
+            if let Some(item) = item.as_ref() {
+                let _ = item.set_text(runtime_toggle_menu_label(started));
+            }
+        }
+    }
+
+    if let Some(tray) = app.tray_by_id("main") {
+        let _ = tray.set_tooltip(Some(runtime_tray_tooltip(started)));
+    }
+}
+
+fn runtime_toggle_menu_label(started: bool) -> &'static str {
+    if started {
+        "快捷启停：已启动"
+    } else {
+        "快捷启停：已停止"
+    }
+}
+
+fn runtime_tray_tooltip(started: bool) -> &'static str {
+    if started {
+        "mykvm · 已启动"
+    } else {
+        "mykvm · 已停止"
+    }
+}
+
+fn sync_runtime_toggle_shortcut(app: &AppHandle) -> Result<(), String> {
+    let Some(state) = app.try_state::<AppRuntime>() else {
+        return Ok(());
+    };
+    let shortcut = runtime_toggle_shortcut_for_layout(&state.layout_snapshot())?;
+    let mut current = state
+        .runtime_toggle_shortcut
+        .lock()
+        .map_err(|_| "runtime toggle shortcut lock poisoned".to_string())?;
+
+    if current.as_deref() == shortcut.as_deref() {
+        return Ok(());
+    }
+
+    if let Some(previous) = current.take() {
+        if let Err(error) = app.global_shortcut().unregister(previous.as_str()) {
+            log::warn!("failed to unregister quick start/stop shortcut {previous}: {error}");
+        }
+    }
+
+    if let Some(next) = shortcut {
+        app.global_shortcut()
+            .register(next.as_str())
+            .map_err(|error| {
+                format!("failed to register quick start/stop shortcut {next}: {error}")
+            })?;
+        *current = Some(next);
+    }
+
+    Ok(())
+}
+
+fn runtime_toggle_shortcut_for_layout(layout: &LayoutState) -> Result<Option<String>, String> {
+    canonical_runtime_toggle_shortcut(&layout.edge_switch_hotkey)
+}
+
+fn canonical_runtime_toggle_shortcut(value: &str) -> Result<Option<String>, String> {
+    let normalized = normalize_edge_switch_hotkey(value);
+    if matches!(normalized.as_str(), "disabled" | "disable" | "off" | "none") {
+        return Ok(None);
+    }
+
+    let mut ctrl = false;
+    let mut alt = false;
+    let mut shift = false;
+    let mut meta = false;
+    let mut key = None;
+
+    for part in normalized.split('+').filter(|part| !part.is_empty()) {
+        match part {
+            "ctrl" | "control" => ctrl = true,
+            "alt" | "option" => alt = true,
+            "shift" => shift = true,
+            "meta" | "cmd" | "command" | "win" | "windows" | "super" | "os" => meta = true,
+            raw_key => {
+                if key.is_some() {
+                    return Err("快捷启停快捷键只能包含一个主按键。".into());
+                }
+                key = Some(
+                    canonical_runtime_toggle_key(raw_key)
+                        .ok_or_else(|| format!("无法识别快捷启停快捷键按键：{raw_key}"))?,
+                );
+            }
+        }
+    }
+
+    let key = key.ok_or_else(|| "快捷启停快捷键缺少主按键。".to_string())?;
+    if !(ctrl || alt || shift || meta) && !allows_single_runtime_toggle_key(&key) {
+        return Err("快捷启停快捷键需要使用组合键，或使用 F1-F24 / ScrollLock。".into());
+    }
+
+    let mut parts = Vec::new();
+    if ctrl {
+        parts.push("control".to_string());
+    }
+    if alt {
+        parts.push("alt".to_string());
+    }
+    if shift {
+        parts.push("shift".to_string());
+    }
+    if meta {
+        parts.push("super".to_string());
+    }
+    parts.push(key);
+    let shortcut = parts.join("+");
+    shortcut
+        .parse::<tauri_plugin_global_shortcut::Shortcut>()
+        .map_err(|error| format!("无法注册快捷启停快捷键 {normalized}: {error}"))?;
+
+    Ok(Some(shortcut))
+}
+
+fn canonical_runtime_toggle_key(key: &str) -> Option<String> {
+    if key.len() == 1 {
+        let byte = key.as_bytes()[0];
+        if byte.is_ascii_alphanumeric() {
+            return Some(key.to_ascii_uppercase());
+        }
+    }
+
+    if let Some(function_number) = key
+        .strip_prefix('f')
+        .and_then(|value| value.parse::<u8>().ok())
+    {
+        if (1..=24).contains(&function_number) {
+            return Some(format!("F{function_number}"));
+        }
+    }
+
+    Some(
+        match key {
+            "space" | "spacebar" => "space",
+            "tab" => "tab",
+            "enter" | "return" => "enter",
+            "esc" | "escape" => "escape",
+            "scrolllock" | "scroll" | "scrlk" => "scrolllock",
+            "up" | "arrowup" => "arrowup",
+            "down" | "arrowdown" => "arrowdown",
+            "left" | "arrowleft" => "arrowleft",
+            "right" | "arrowright" => "arrowright",
+            _ => return None,
+        }
+        .into(),
+    )
+}
+
+fn allows_single_runtime_toggle_key(key: &str) -> bool {
+    key.starts_with('F') || key == "scrolllock"
 }
 
 #[tauri::command]
@@ -1811,7 +2022,10 @@ fn sync_edge_drop_windows_on_main(
                 spec.height,
             )));
             let _ = window.set_always_on_top(true);
-            let _ = window.show();
+            let _ = window.set_focusable(false);
+            if !window.is_visible().unwrap_or(false) {
+                let _ = window.show();
+            }
             continue;
         }
 
@@ -1834,6 +2048,7 @@ fn sync_edge_drop_windows_on_main(
         .visible_on_all_workspaces(true)
         .skip_taskbar(true)
         .focused(false)
+        .focusable(false)
         .build();
 
         if let Err(error) = build_result {
@@ -2222,6 +2437,7 @@ fn minimize_main_window(app: AppHandle) -> Result<(), String> {
 
     if result.is_ok() {
         set_main_window_visible(&app, false);
+        set_main_window_focused(&app, false);
     }
 
     result
@@ -2887,6 +3103,17 @@ pub fn run() {
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             Some(vec![AUTOSTART_ARG]),
         ))
+        .plugin(
+            tauri_plugin_global_shortcut::Builder::new()
+                .with_handler(|app, _shortcut, event| {
+                    if event.state == ShortcutState::Pressed {
+                        if let Err(error) = toggle_runtime_from_app(app) {
+                            log::warn!("quick start/stop shortcut failed: {error}");
+                        }
+                    }
+                })
+                .build(),
+        )
         .on_window_event(|window, event| {
             if handle_edge_drop_window_event(window, event) {
                 return;
@@ -2895,6 +3122,9 @@ pub fn run() {
                 return;
             }
             if window.label() == "main" {
+                if let WindowEvent::Focused(focused) = event {
+                    set_main_window_focused(window.app_handle(), *focused);
+                }
                 if let WindowEvent::CloseRequested { api, .. } = event {
                     api.prevent_close();
                     let _ = destroy_main_window_handle(window.app_handle());
@@ -2979,6 +3209,9 @@ pub fn run() {
             setup_macos_window_visibility_watcher(app);
             start_edge_drop_window_sync(app.handle().clone());
             setup_tray(app)?;
+            if let Err(error) = sync_runtime_toggle_shortcut(app.handle()) {
+                log::warn!("failed to register quick start/stop shortcut: {error}");
+            }
             #[cfg(target_os = "windows")]
             apply_custom_chrome(app.handle())?;
             setup_single_instance_events(app.handle().clone());
@@ -3052,18 +3285,43 @@ pub fn run() {
 }
 
 fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
+    let runtime_started = app
+        .try_state::<AppRuntime>()
+        .map(|state| state.runtime_status().started)
+        .unwrap_or(false);
     let show_item = MenuItem::with_id(app, "show", "Show mykvm", true, None::<&str>)?;
+    let runtime_toggle_item = MenuItem::with_id(
+        app,
+        "runtime-toggle",
+        runtime_toggle_menu_label(runtime_started),
+        true,
+        None::<&str>,
+    )?;
     let hide_item = MenuItem::with_id(app, "hide", "Hide to tray", true, None::<&str>)?;
     let quit_item = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&show_item, &hide_item, &quit_item])?;
+    let menu = Menu::with_items(
+        app,
+        &[&show_item, &runtime_toggle_item, &hide_item, &quit_item],
+    )?;
+
+    if let Some(state) = app.try_state::<AppRuntime>() {
+        if let Ok(mut item) = state.runtime_toggle_menu_item.lock() {
+            *item = Some(runtime_toggle_item);
+        }
+    }
 
     let mut tray = TrayIconBuilder::with_id("main")
         .menu(&menu)
-        .tooltip("mykvm")
+        .tooltip(runtime_tray_tooltip(runtime_started))
         .show_menu_on_left_click(true)
         .on_menu_event(|app, event| match event.id().as_ref() {
             "show" => {
                 let _ = show_main_window_handle(app);
+            }
+            "runtime-toggle" => {
+                if let Err(error) = toggle_runtime_from_app(app) {
+                    log::warn!("quick start/stop tray action failed: {error}");
+                }
             }
             "hide" => {
                 let _ = hide_main_window_handle(app);
@@ -3121,6 +3379,7 @@ fn hide_main_window_handle(app: &AppHandle) -> Result<(), String> {
 fn destroy_main_window_handle(app: &AppHandle) -> Result<(), String> {
     let Some(window) = app.get_webview_window("main") else {
         set_main_window_visible(app, false);
+        set_main_window_focused(app, false);
         return Ok(());
     };
     let result = window
@@ -3129,6 +3388,7 @@ fn destroy_main_window_handle(app: &AppHandle) -> Result<(), String> {
 
     if result.is_ok() {
         set_main_window_visible(app, false);
+        set_main_window_focused(app, false);
     }
 
     result
@@ -3163,6 +3423,12 @@ fn ensure_main_window(app: &AppHandle) -> Result<tauri::WebviewWindow, String> {
 fn set_main_window_visible(app: &AppHandle, visible: bool) {
     if let Some(state) = app.try_state::<AppRuntime>() {
         state.main_window_visible.store(visible, Ordering::Relaxed);
+    }
+}
+
+fn set_main_window_focused(app: &AppHandle, focused: bool) {
+    if let Some(state) = app.try_state::<AppRuntime>() {
+        state.main_window_focused.store(focused, Ordering::Relaxed);
     }
 }
 
@@ -5362,6 +5628,7 @@ fn show_file_drop_landing_window(app: &AppHandle, _file_name: &str) {
     if let Some(window) = app.get_webview_window(FILE_DROP_LANDING_LABEL) {
         let _ = window.set_position(tauri::Position::Logical(tauri::LogicalPosition::new(x, y)));
         let _ = window.set_always_on_top(true);
+        let _ = window.set_focusable(false);
         let _ = window.show();
         schedule_file_drop_landing_hide(app.clone());
         return;
@@ -5386,6 +5653,7 @@ fn show_file_drop_landing_window(app: &AppHandle, _file_name: &str) {
     .visible_on_all_workspaces(true)
     .skip_taskbar(true)
     .focused(false)
+    .focusable(false)
     .build();
 
     if let Err(error) = build_result {
@@ -5872,7 +6140,7 @@ fn sanitize_id(value: &str) -> String {
 }
 
 fn update_device_from_peer(device: &mut Device, peer: &LanPeer) {
-    device.online = peer.input_ready;
+    device.online = true;
     device.input_ready = peer.input_ready;
     device.host = if peer.ip.trim().is_empty() {
         peer.host.clone()
@@ -7115,6 +7383,35 @@ mod tests {
     }
 
     #[test]
+    fn runtime_toggle_shortcut_normalizes_command_aliases() {
+        assert_eq!(
+            canonical_runtime_toggle_shortcut("command+1").expect("shortcut"),
+            Some("super+1".into())
+        );
+        assert_eq!(
+            canonical_runtime_toggle_shortcut("meta+1").expect("legacy shortcut"),
+            Some("super+1".into())
+        );
+    }
+
+    #[test]
+    fn runtime_toggle_shortcut_supports_function_key_and_disabled() {
+        assert_eq!(
+            canonical_runtime_toggle_shortcut("f12").expect("shortcut"),
+            Some("F12".into())
+        );
+        assert_eq!(
+            canonical_runtime_toggle_shortcut("disabled").expect("disabled shortcut"),
+            None
+        );
+    }
+
+    #[test]
+    fn runtime_toggle_shortcut_rejects_single_letter_globals() {
+        assert!(canonical_runtime_toggle_shortcut("k").is_err());
+    }
+
+    #[test]
     fn peer_presence_marks_missing_remote_offline() {
         let mut layout = test_layout();
 
@@ -7140,14 +7437,14 @@ mod tests {
     }
 
     #[test]
-    fn peer_presence_requires_input_ready_for_online() {
+    fn peer_presence_keeps_discovered_peer_online_without_input_ready() {
         let mut layout = test_layout();
         let mut peer = test_peer();
         peer.input_ready = false;
 
         apply_peer_presence(&mut layout, &[peer]);
 
-        assert!(!layout.devices[1].online);
+        assert!(layout.devices[1].online);
         assert!(!layout.devices[1].input_ready);
         assert_eq!(layout.devices[1].host, "10.0.0.2");
     }

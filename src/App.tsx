@@ -48,6 +48,11 @@ import { APP_VERSION, REPOSITORY_URL } from "./constants";
 import { TEXT } from "./i18n";
 import type { AppText } from "./i18n";
 import {
+  edgeSwitchHotkeyFromKeyboardEvent,
+  formatEdgeSwitchHotkeyForDisplay,
+  metaKeyLabelForPlatform,
+} from "./hotkeyInput";
+import {
   flattenScreens,
   getLayoutBounds,
   getScreenById,
@@ -62,6 +67,7 @@ import type {
   LanPeer,
   LanPeerScreen,
   PerformanceSample,
+  RuntimeStatus,
 } from "./runtime";
 import type {
   AppLanguage,
@@ -202,11 +208,14 @@ function App() {
   const [isPortable, setIsPortable] = useState(false);
   const [autostartEnabled, setAutostartEnabled] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [isCapturingEdgeSwitchHotkey, setIsCapturingEdgeSwitchHotkey] =
+    useState(false);
   const [activeTab, setActiveTab] = useState<WorkspaceTab>("layout");
   const [systemTheme, setSystemTheme] = useState<Exclude<ThemeMode, "system">>(
     () => getSystemTheme(),
   );
   const boardRef = useRef<HTMLDivElement | null>(null);
+  const edgeSwitchHotkeyButtonRef = useRef<HTMLButtonElement | null>(null);
   const fileDragTargetIdRef = useRef<string | null>(null);
   const fileTransferFallbackTargetIdRef = useRef<string | null>(null);
   const startupUpdateCheckStarted = useRef(false);
@@ -260,6 +269,49 @@ function App() {
     return () => {
       window.removeEventListener("dragover", allowNativeFileDrop);
       window.removeEventListener("drop", allowNativeFileDrop);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!isTauri()) {
+      return;
+    }
+
+    let active = true;
+    let unlistenRuntime: (() => void) | null = null;
+
+    void import("@tauri-apps/api/event")
+      .then(({ listen }) =>
+        listen<RuntimeStatus>("runtime-state-changed", ({ payload }) => {
+          if (!active) {
+            return;
+          }
+
+          setSnapshot((current) =>
+            current
+              ? {
+                  ...current,
+                  runtime: payload,
+                }
+              : current,
+          );
+        }),
+      )
+      .then((unlisten) => {
+        if (active) {
+          unlistenRuntime = unlisten;
+          return;
+        }
+
+        unlisten();
+      })
+      .catch(() => {
+        // Runtime events are an instant UI sync path; polling remains the fallback.
+      });
+
+    return () => {
+      active = false;
+      unlistenRuntime?.();
     };
   }, []);
 
@@ -575,6 +627,7 @@ function App() {
   const localPlatform =
     runtime?.discovery.localPeer.platform.toLowerCase() ??
     navigator.platform.toLowerCase();
+  const metaKeyLabel = metaKeyLabelForPlatform(localPlatform);
   const usesWindowsChrome = localPlatform.includes("win");
   const usesCustomChrome = usesWindowsChrome;
   const chromeClassName = usesWindowsChrome
@@ -1202,6 +1255,49 @@ function App() {
   function commitEdgeSwitchHotkey(value: string) {
     setEdgeSwitchHotkey(normalizeEdgeSwitchHotkeyInput(value));
   }
+
+  const captureEdgeSwitchHotkey = useEffectEvent((event: KeyboardEvent) => {
+    const hotkey = edgeSwitchHotkeyFromKeyboardEvent(event, metaKeyLabel);
+    if (!hotkey) {
+      return;
+    }
+
+    event.preventDefault();
+    event.stopPropagation();
+    commitEdgeSwitchHotkey(hotkey);
+    setIsCapturingEdgeSwitchHotkey(false);
+  });
+
+  useEffect(() => {
+    if (!isCapturingEdgeSwitchHotkey) {
+      return;
+    }
+
+    const cancelIfOutsideRecorder = (event: Event) => {
+      const target = event.target;
+      const button = edgeSwitchHotkeyButtonRef.current;
+      if (target instanceof Node && button?.contains(target)) {
+        return;
+      }
+      setIsCapturingEdgeSwitchHotkey(false);
+    };
+    const cancelRecording = () => setIsCapturingEdgeSwitchHotkey(false);
+
+    window.addEventListener("keydown", captureEdgeSwitchHotkey, true);
+    document.addEventListener("pointerdown", cancelIfOutsideRecorder, true);
+    document.addEventListener("focusin", cancelIfOutsideRecorder, true);
+    window.addEventListener("blur", cancelRecording);
+    return () => {
+      window.removeEventListener("keydown", captureEdgeSwitchHotkey, true);
+      document.removeEventListener(
+        "pointerdown",
+        cancelIfOutsideRecorder,
+        true,
+      );
+      document.removeEventListener("focusin", cancelIfOutsideRecorder, true);
+      window.removeEventListener("blur", cancelRecording);
+    };
+  }, [isCapturingEdgeSwitchHotkey]);
 
   function setTransportPortMode(transportPortMode: TransportPortMode) {
     updateLayout((layoutState) => ({
@@ -2179,31 +2275,26 @@ function App() {
                 </div>
                 <div className="settings-control-row">
                   <span>{ui.settings.edgeSwitchHotkey}</span>
-                  <input
-                    className="settings-text-input"
-                    list="edge-switch-hotkey-options"
-                    value={layout.edgeSwitchHotkey}
-                    placeholder={ui.settings.edgeSwitchHotkeyPlaceholder}
-                    onChange={(event) =>
-                      setEdgeSwitchHotkey(event.currentTarget.value)
+                  <button
+                    type="button"
+                    ref={edgeSwitchHotkeyButtonRef}
+                    className={`hotkey-recorder-button ${
+                      isCapturingEdgeSwitchHotkey ? "recording" : ""
+                    }`}
+                    aria-pressed={isCapturingEdgeSwitchHotkey}
+                    onClick={() =>
+                      setIsCapturingEdgeSwitchHotkey((recording) => !recording)
                     }
-                    onBlur={(event) =>
-                      commitEdgeSwitchHotkey(event.currentTarget.value)
-                    }
-                    onKeyDown={(event) => {
-                      if (event.key === "Enter") {
-                        event.currentTarget.blur();
-                      }
-                    }}
-                  />
-                  <datalist id="edge-switch-hotkey-options">
-                    <option value="alt+shift+k" />
-                    <option value="ctrl+alt+k" />
-                    <option value="ctrl+shift+k" />
-                    <option value="f12" />
-                    <option value="scrolllock" />
-                    <option value="disabled" />
-                  </datalist>
+                  >
+                    {isCapturingEdgeSwitchHotkey
+                      ? ui.settings.edgeSwitchHotkeyRecording
+                      : renderHotkeyTags(
+                          formatEdgeSwitchHotkeyForDisplay(
+                            layout.edgeSwitchHotkey,
+                            metaKeyLabel,
+                          ),
+                        )}
+                  </button>
                 </div>
                 <div className="settings-control-row">
                   <span>{ui.settings.clipboard}</span>
@@ -2806,6 +2897,53 @@ function normalizeEdgeSwitchHotkeyInput(value: string) {
   return normalized.length === 0 ? "alt+shift+k" : normalized;
 }
 
+function renderHotkeyTags(displayHotkey: string) {
+  const parts = displayHotkey
+    .split("+")
+    .map((part) => part.trim())
+    .filter((part) => part.length > 0);
+
+  return (
+    <span className="hotkey-tag-list">
+      {parts.map((part) => (
+        <span className="hotkey-tag" key={part}>
+          {hotkeyTagLabel(part)}
+        </span>
+      ))}
+    </span>
+  );
+}
+
+function hotkeyTagLabel(part: string) {
+  switch (part.toLowerCase()) {
+    case "command":
+    case "cmd":
+    case "meta":
+      return "⌘";
+    case "shift":
+      return "⇧";
+    case "alt":
+    case "option":
+      return "⌥";
+    case "control":
+    case "ctrl":
+      return "⌃";
+    case "win":
+    case "windows":
+      return "Win";
+    case "space":
+      return "Space";
+    case "enter":
+      return "Enter";
+    case "escape":
+      return "Esc";
+    case "disabled":
+      return "Off";
+    default:
+      return part.length === 1 ? part.toUpperCase() : part.toUpperCase();
+  }
+}
+
 function clampZoom(value: number) {
   return Math.min(BOARD_ZOOM_MAX, Math.max(BOARD_ZOOM_MIN, value));
 }
@@ -3008,7 +3146,7 @@ function applyPeerPresence(layout: LayoutState, peers: LanPeer[]): LayoutState {
 
       return {
         ...device,
-        online: peer.inputReady,
+        online: true,
         inputReady: peer.inputReady,
         host: peer.ip || peer.host || device.host,
         transportPort: peer.transportPort,
@@ -3071,7 +3209,7 @@ function createDeviceFromPeer(
     transportPublicKey: peer.transportPublicKey,
     protocolVersion: peer.protocolVersion,
     color: existingDevice?.color ?? nextDeviceColor(layout),
-    online: peer.inputReady,
+    online: true,
     inputReady: peer.inputReady,
     role: "client",
     source: "detected",

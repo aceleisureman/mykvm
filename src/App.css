@@ -46,6 +46,7 @@
 .theme-light .add-device-form input,
 .theme-light .settings-number-input,
 .theme-light .settings-text-input,
+.theme-light .hotkey-recorder-button,
 .theme-light .role-switcher button,
 .theme-light .segmented-control,
 .theme-light .switch-button {
@@ -186,6 +187,31 @@
 .theme-light .switch-button,
 .theme-light .settings-control-row > span {
   color: #657186;
+}
+
+.theme-light .hotkey-recorder-button {
+  border-color: #c4ccda;
+  background: #f6f8fc;
+  color: #172033;
+}
+
+.theme-light .hotkey-tag {
+  background: #dbeafe;
+  color: #0f2857;
+}
+
+.theme-light .hotkey-recorder-button:hover,
+.theme-light .hotkey-recorder-button:focus-visible,
+.theme-light .hotkey-recorder-button.recording {
+  border-color: #93c5fd;
+  background: #f6f8fc;
+  color: #0f2857;
+}
+
+.theme-light .hotkey-recorder-button:hover .hotkey-tag,
+.theme-light .hotkey-recorder-button:focus-visible .hotkey-tag {
+  background: #cfe2ff;
+  color: #0f2857;
 }
 
 .theme-light .header-tabs button.active {
@@ -1376,6 +1402,75 @@
 .settings-number-input:focus,
 .settings-text-input:focus {
   border-color: #2786ff;
+}
+
+.hotkey-recorder-button {
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+  min-height: 34px;
+  padding: 4px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-start;
+  justify-self: stretch;
+  border: 1px solid rgba(63, 63, 70, 0.92);
+  border-radius: 8px;
+  background: #18181b;
+  color: #a1a1aa;
+  font: inherit;
+  text-align: left;
+  outline: none;
+  cursor: pointer;
+  transition:
+    border-color 160ms ease,
+    background 160ms ease,
+    color 160ms ease;
+}
+
+.hotkey-recorder-button:hover,
+.hotkey-recorder-button:focus-visible,
+.hotkey-recorder-button.recording {
+  border-color: #2786ff;
+}
+
+.hotkey-recorder-button.recording {
+  padding: 0 12px;
+  background: rgba(39, 134, 255, 0.14);
+  color: #93c5fd;
+  font-size: 12px;
+  font-weight: 800;
+  justify-content: center;
+}
+
+.hotkey-tag-list {
+  min-width: 0;
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  align-items: center;
+}
+
+.hotkey-tag {
+  min-width: 24px;
+  min-height: 24px;
+  padding: 0 8px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 6px;
+  background: rgba(39, 134, 255, 0.18);
+  color: #f4f4f5;
+  font-size: 13px;
+  font-weight: 850;
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.hotkey-recorder-button:hover .hotkey-tag,
+.hotkey-recorder-button:focus-visible .hotkey-tag {
+  background: rgba(39, 134, 255, 0.26);
+  color: #f4f4f5;
 }
 
 .runtime-summary-card {
