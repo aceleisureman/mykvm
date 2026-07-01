@@ -49,6 +49,7 @@ pub struct PeerEndpoint {
 /// Maximum consecutive datagram failures before `send_datagram` short-circuits
 /// with an error so the input layer can release the cursor immediately.
 const DATAGRAM_FAIL_THRESHOLD: u64 = 3;
+const DATAGRAM_QUEUE_CAP: u64 = 32;
 
 #[derive(Clone)]
 pub struct TransportHandle {
@@ -59,6 +60,7 @@ pub struct TransportHandle {
     /// Shared with the input layer so it can detect a dead peer without
     /// waiting for the async transport to propagate the error.
     datagram_failures: Arc<AtomicU64>,
+    datagram_pending: Arc<AtomicU64>,
 }
 
 impl TransportHandle {
@@ -92,6 +94,11 @@ impl TransportHandle {
         if self.datagram_failures.load(Ordering::Relaxed) >= DATAGRAM_FAIL_THRESHOLD {
             return Err("QUIC datagram send failed: peer unreachable (consecutive failures)".to_string());
         }
+
+        if self.datagram_pending.load(Ordering::Relaxed) >= DATAGRAM_QUEUE_CAP {
+            return Ok(());
+        }
+        self.datagram_pending.fetch_add(1, Ordering::Relaxed);
 
         self.commands
             .send(TransportCommand::SendDatagram { peer, payload })
@@ -180,6 +187,8 @@ pub fn start(
     let (command_tx, command_rx) = tokio_mpsc::unbounded_channel();
     let datagram_failures = Arc::new(AtomicU64::new(0));
     let datagram_failures_inner = Arc::clone(&datagram_failures);
+    let datagram_pending = Arc::new(AtomicU64::new(0));
+    let datagram_pending_inner = Arc::clone(&datagram_pending);
 
     thread::Builder::new()
         .name("mykvm-quic-transport".into())
@@ -204,6 +213,7 @@ pub fn start(
                 on_stream,
                 ready_tx,
                 datagram_failures_inner,
+                datagram_pending_inner,
             ));
         })
         .map_err(|error| format!("failed to spawn QUIC transport thread: {error}"))?;
@@ -217,6 +227,7 @@ pub fn start(
         port: ready.port,
         public_key: ready.public_key,
         datagram_failures,
+        datagram_pending,
     })
 }
 
@@ -233,6 +244,7 @@ async fn run_transport(
     on_stream: StreamHandler,
     ready_tx: mpsc::Sender<Result<ReadyTransport, String>>,
     datagram_failures: Arc<AtomicU64>,
+    datagram_pending: Arc<AtomicU64>,
 ) {
     let (endpoint, public_key) = match bind_endpoint(preferred_port, &identity) {
         Ok(bound) => bound,
@@ -261,6 +273,7 @@ async fn run_transport(
     while let Some(command) = commands.recv().await {
         match command {
             TransportCommand::SendDatagram { peer, payload } => {
+                datagram_pending.fetch_sub(1, Ordering::Relaxed);
                 // Skip send attempt if this peer failed recently (within 5s).
                 let skip = resolve_peer_addr(&peer.addr)
                     .ok()

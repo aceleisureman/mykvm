@@ -42,7 +42,7 @@ const RETURN_EDGE_INSET: f64 = 0.0;
 // After returning to local, refuse to cross back into the remote for this long.
 // Lets a fast back-flick settle at the edge without bouncing into the remote.
 const RETURN_COOLDOWN_MS: u64 = 150;
-const MOUSE_MOVE_SEND_INTERVAL_MS: u64 = 8;
+const MOUSE_MOVE_SEND_INTERVAL_MS: u64 = 16;
 const DRAG_MOVE_SEND_INTERVAL_MS: u64 = 8;
 #[cfg(target_os = "windows")]
 const WINDOWS_FULLSCREEN_EDGE_TOLERANCE: i32 = 3;

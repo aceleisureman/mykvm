@@ -46,7 +46,7 @@ const DISCOVERY_PORT_SPAN: u16 = 8;
 const REPOSITORY_URL: &str = "https://github.com/XxMinor/mykvm";
 const RELEASES_URL: &str = "https://github.com/XxMinor/mykvm/releases/latest";
 const DISCOVERY_PROTOCOL: &str = "mykvm.discovery.v1";
-const PEER_TTL_MS: u64 = 30_000;
+const PEER_TTL_MS: u64 = 15_000;
 const MAX_DISCOVERY_PEERS: usize = 128;
 const PAIRING_CODE_TTL_MS: u64 = 60_000;
 const PAIRING_MAX_ATTEMPTS: u8 = 5;
@@ -56,7 +56,7 @@ const CLIPBOARD_PROTOCOL: &str = "mykvm.clipboard.v1";
 // pasteboard is not always byte-identical to what we wrote (macOS re-encodes
 // it), so a pure content-signature check can ping-pong; this window guarantees
 // we never echo received content straight back.
-const CLIPBOARD_ECHO_GRACE_MS: u64 = 1200;
+const CLIPBOARD_ECHO_GRACE_MS: u64 = 3000;
 const CLIPBOARD_POLL_INTERVAL_MS: u64 = 150;
 const CLIPBOARD_IDLE_SLEEP_MS: u64 = 25;
 const CLIPBOARD_RETRY_INTERVAL_MS: u64 = 2000;
@@ -91,6 +91,10 @@ static HOSTNAME_CACHE: OnceLock<Option<String>> = OnceLock::new();
 
 #[cfg(target_os = "windows")]
 static WINDOWS_FIREWALL_ENSURED: AtomicBool = AtomicBool::new(false);
+/// Signals that a clipboard write (from remote peer) is in progress.
+/// The local clipboard polling thread checks this to avoid racing on
+/// OpenClipboard (Windows OS error 1418).
+static CLIPBOARD_WRITE_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 #[cfg(target_os = "windows")]
 static SINGLE_INSTANCE_MUTEX: OnceLock<Mutex<Option<SingleInstanceGuard>>> = OnceLock::new();
@@ -4991,6 +4995,14 @@ fn run_clipboard_sync(
             thread::sleep(Duration::from_millis(CLIPBOARD_IDLE_SLEEP_MS));
             continue;
         }
+
+        // Skip reading the clipboard while a remote write is in progress to
+        // avoid racing on OpenClipboard (Windows OS error 1418).
+        if CLIPBOARD_WRITE_ACTIVE.load(Ordering::Relaxed) {
+            thread::sleep(Duration::from_millis(CLIPBOARD_IDLE_SLEEP_MS));
+            continue;
+        }
+
         last_poll = Instant::now();
 
         let Some(content) = clipboard::read_content() else {
@@ -5126,12 +5138,15 @@ fn arm_clipboard_echo_guard(clipboard_echo_until: &Arc<Mutex<Option<Instant>>>) 
 }
 
 fn write_clipboard_content_with_retry(content: &ClipboardContent) -> Result<(), String> {
-    retry_clipboard_content_write(
+    CLIPBOARD_WRITE_ACTIVE.store(true, Ordering::Relaxed);
+    let result = retry_clipboard_content_write(
         content,
         CLIPBOARD_WRITE_ATTEMPTS,
         CLIPBOARD_WRITE_RETRY_DELAY_BASE_MS,
         clipboard::write_content,
-    )
+    );
+    CLIPBOARD_WRITE_ACTIVE.store(false, Ordering::Relaxed);
+    result
 }
 
 fn retry_clipboard_content_write<F>(
