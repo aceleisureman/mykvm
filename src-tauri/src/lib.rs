@@ -61,8 +61,8 @@ const CLIPBOARD_POLL_INTERVAL_MS: u64 = 150;
 const CLIPBOARD_IDLE_SLEEP_MS: u64 = 25;
 const CLIPBOARD_RETRY_INTERVAL_MS: u64 = 2000;
 const CLIPBOARD_BACKOFF_MAX_MS: u64 = 30_000;
-const CLIPBOARD_WRITE_ATTEMPTS: usize = 5;
-const CLIPBOARD_WRITE_RETRY_DELAY_MS: u64 = 30;
+const CLIPBOARD_WRITE_ATTEMPTS: usize = 10;
+const CLIPBOARD_WRITE_RETRY_DELAY_BASE_MS: u64 = 50;
 const FILE_TRANSFER_PROTOCOL: &str = "mykvm.file-transfer.v1";
 const FILE_TRANSFER_CHUNK_BYTES: usize = 256 * 1024;
 const FILE_TRANSFER_MAX_FILE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
@@ -5129,7 +5129,7 @@ fn write_clipboard_content_with_retry(content: &ClipboardContent) -> Result<(), 
     retry_clipboard_content_write(
         content,
         CLIPBOARD_WRITE_ATTEMPTS,
-        Duration::from_millis(CLIPBOARD_WRITE_RETRY_DELAY_MS),
+        CLIPBOARD_WRITE_RETRY_DELAY_BASE_MS,
         clipboard::write_content,
     )
 }
@@ -5137,7 +5137,7 @@ fn write_clipboard_content_with_retry(content: &ClipboardContent) -> Result<(), 
 fn retry_clipboard_content_write<F>(
     content: &ClipboardContent,
     attempts: usize,
-    retry_delay: Duration,
+    retry_delay_base_ms: u64,
     mut write_content: F,
 ) -> Result<(), String>
 where
@@ -5150,8 +5150,12 @@ where
             Ok(()) => return Ok(()),
             Err(error) => last_error = Some(error),
         }
-        if attempt + 1 < attempts && !retry_delay.is_zero() {
-            thread::sleep(retry_delay);
+        if attempt + 1 < attempts && retry_delay_base_ms > 0 {
+            // Progressive delay: 50, 100, 150, 200, ... ms
+            // Total window for 10 attempts: ~2.25s — enough to outlast most
+            // transient clipboard locks from other processes.
+            let delay_ms = retry_delay_base_ms * (attempt as u64 + 1);
+            thread::sleep(Duration::from_millis(delay_ms));
         }
     }
 
