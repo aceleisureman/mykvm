@@ -1791,8 +1791,8 @@ fn inject_input_event(
 
     #[cfg(not(target_os = "windows"))]
     {
-        inject_input_command(command);
         let (absolute_x, absolute_y) = command_coordinates(&command);
+        inject_input_command(command);
         record_input_debug_event(InputDebugEvent {
             timestamp_ms: now_input_debug_ms(),
             controller_id: controller_id.to_string(),

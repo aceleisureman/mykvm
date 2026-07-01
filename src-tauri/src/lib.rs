@@ -1225,26 +1225,30 @@ struct SyncRecord {
 }
 
 #[tauri::command]
-fn read_sync_history(app: AppHandle, count: Option<usize>) -> Result<Vec<SyncRecord>, String> {
+async fn read_sync_history(app: AppHandle, count: Option<usize>) -> Result<Vec<SyncRecord>, String> {
     let log_dir = app
         .path()
         .app_log_dir()
         .map_err(|e| format!("failed to resolve log dir: {e}"))?;
     let log_file = log_dir.join("mykvm.log");
-    if !log_file.exists() {
-        return Ok(vec![]);
-    }
-    let content = fs::read_to_string(&log_file)
-        .map_err(|e| format!("failed to read log file: {e}"))?;
-    let mut records: Vec<SyncRecord> = Vec::new();
-    for line in content.lines() {
-        if let Some(rec) = parse_sync_line(line) {
-            records.push(rec);
+    tokio::task::spawn_blocking(move || -> Result<Vec<SyncRecord>, String> {
+        if !log_file.exists() {
+            return Ok(vec![]);
         }
-    }
-    let max = count.unwrap_or(100);
-    let start = if records.len() > max { records.len() - max } else { 0 };
-    Ok(records[start..].to_vec())
+        let content = fs::read_to_string(&log_file)
+            .map_err(|e| format!("failed to read log file: {e}"))?;
+        let mut records: Vec<SyncRecord> = Vec::new();
+        for line in content.lines() {
+            if let Some(rec) = parse_sync_line(line) {
+                records.push(rec);
+            }
+        }
+        let max = count.unwrap_or(100);
+        let start = if records.len() > max { records.len() - max } else { 0 };
+        Ok(records[start..].to_vec())
+    })
+    .await
+    .map_err(|e| format!("sync history task failed: {e}"))?
 }
 
 fn parse_sync_line(line: &str) -> Option<SyncRecord> {
@@ -1298,21 +1302,25 @@ fn split_content_field(raw: &str) -> (String, String) {
 
 
 #[tauri::command]
-fn read_log_lines(app: AppHandle, count: Option<usize>) -> Result<Vec<String>, String> {
+async fn read_log_lines(app: AppHandle, count: Option<usize>) -> Result<Vec<String>, String> {
     let log_dir = app
         .path()
         .app_log_dir()
         .map_err(|error| format!("failed to resolve log dir: {error}"))?;
     let log_file = log_dir.join("mykvm.log");
-    if !log_file.exists() {
-        return Ok(vec![]);
-    }
-    let content = fs::read_to_string(&log_file)
-        .map_err(|error| format!("failed to read log file: {error}"))?;
-    let lines: Vec<String> = content.lines().map(String::from).collect();
-    let max_lines = count.unwrap_or(200);
-    let start = if lines.len() > max_lines { lines.len() - max_lines } else { 0 };
-    Ok(lines[start..].to_vec())
+    tokio::task::spawn_blocking(move || -> Result<Vec<String>, String> {
+        if !log_file.exists() {
+            return Ok(vec![]);
+        }
+        let content = fs::read_to_string(&log_file)
+            .map_err(|error| format!("failed to read log file: {error}"))?;
+        let lines: Vec<String> = content.lines().map(String::from).collect();
+        let max_lines = count.unwrap_or(200);
+        let start = if lines.len() > max_lines { lines.len() - max_lines } else { 0 };
+        Ok(lines[start..].to_vec())
+    })
+    .await
+    .map_err(|error| format!("log lines task failed: {error}"))?
 }
 
 #[tauri::command]
