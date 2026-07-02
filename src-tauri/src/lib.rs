@@ -46,7 +46,9 @@ const DISCOVERY_PORT_SPAN: u16 = 8;
 const REPOSITORY_URL: &str = "https://github.com/XxMinor/mykvm";
 const RELEASES_URL: &str = "https://github.com/XxMinor/mykvm/releases/latest";
 const DISCOVERY_PROTOCOL: &str = "mykvm.discovery.v1";
-const PEER_TTL_MS: u64 = 30_000;
+// UDP discovery is a heartbeat, not the transport itself. Keep peers through
+// short announce gaps so online clients do not flicker offline in the UI.
+const PEER_TTL_MS: u64 = 90_000;
 const MAX_DISCOVERY_PEERS: usize = 128;
 const PAIRING_CODE_TTL_MS: u64 = 60_000;
 const PAIRING_MAX_ATTEMPTS: u8 = 5;
@@ -552,6 +554,7 @@ struct AppRuntime {
     runtime_toggle_menu_item: Mutex<Option<MenuItem<Wry>>>,
     screen_switch_request: Arc<Mutex<Option<input::SwitchDirection>>>,
     screen_switch_shortcuts: Mutex<ScreenSwitchHotkeys>,
+    last_known_peer_probe: Mutex<Option<Instant>>,
     config_path: PathBuf,
 }
 
@@ -592,11 +595,13 @@ impl AppRuntime {
             runtime_toggle_menu_item: Mutex::new(None),
             screen_switch_request: Arc::new(Mutex::new(None)),
             screen_switch_shortcuts: Mutex::new(screen_switch_hotkeys),
+            last_known_peer_probe: Mutex::new(None),
             config_path,
         }
     }
 
     fn snapshot(&self) -> AppStateSnapshot {
+        self.refresh_known_peers_if_due();
         let layout = self.layout_snapshot();
         let runtime = self.runtime_status_for_layout(&layout);
 
@@ -613,12 +618,19 @@ impl AppRuntime {
             return;
         };
         let disk_layout = normalize_saved_layout(saved_layout, native_layout);
-        if let Ok(mut current) = self.layout.lock() {
+        let merged = if let Ok(mut current) = self.layout.lock() {
             *current = merge_disk_layout_into_runtime(disk_layout, &current);
+            true
+        } else {
+            false
+        };
+        if merged {
+            sync_layout_peer_presence(&self.layout, &self.peers);
         }
     }
 
     fn runtime_status(&self) -> RuntimeStatus {
+        self.refresh_known_peers_if_due();
         let layout = self.layout_snapshot();
 
         self.runtime_status_for_layout(&layout)
@@ -636,8 +648,64 @@ impl AppRuntime {
     }
 
     fn discovery_status(&self) -> DiscoveryStatus {
+        self.refresh_known_peers_if_due();
         let layout = self.layout_snapshot();
         self.discovery_status_for_layout(&layout)
+    }
+
+    fn refresh_known_peers_if_due(&self) {
+        const KNOWN_PEER_PROBE_INTERVAL: Duration = Duration::from_secs(3);
+
+        if self
+            .discovery_stop
+            .lock()
+            .map(|stop| stop.is_none())
+            .unwrap_or(true)
+        {
+            return;
+        }
+
+        let Ok(mut last_probe) = self.last_known_peer_probe.lock() else {
+            return;
+        };
+        let now = Instant::now();
+        if last_probe
+            .as_ref()
+            .map(|last| now.duration_since(*last) < KNOWN_PEER_PROBE_INTERVAL)
+            .unwrap_or(false)
+        {
+            return;
+        }
+        *last_probe = Some(now);
+        drop(last_probe);
+
+        let layout = self.layout_snapshot();
+        let targets = known_peer_discovery_targets(&layout, discovery_base_port(&layout));
+        if targets.is_empty() {
+            return;
+        }
+
+        let mut local_peer = local_peer_from_layout(&layout);
+        if let Some(transport) = self.quic_transport_handle() {
+            apply_transport_to_peer(&mut local_peer, &transport);
+        }
+        local_peer.input_ready =
+            advertised_input_ready(&layout, self.input_receive_enabled.load(Ordering::Relaxed));
+
+        let probed_peers = probe_known_peer_targets(&local_peer, &targets);
+        if probed_peers.is_empty() {
+            return;
+        }
+
+        log::debug!(
+            "known peer probe refreshed {} peer(s) from {} target(s)",
+            probed_peers.len(),
+            targets.len()
+        );
+        for peer in probed_peers {
+            merge_peer(&self.peers, peer);
+        }
+        sync_layout_peer_presence(&self.layout, &self.peers);
     }
 
     fn discovery_status_for_layout(&self, layout: &LayoutState) -> DiscoveryStatus {
@@ -955,13 +1023,12 @@ impl AppRuntime {
                                 target.as_str(),
                             );
                         }
-                        for target in &direct_targets {
-                            let _ = send_discovery_packet(
-                                &socket,
-                                "announce",
-                                &local_peer,
-                                target.as_str(),
-                            );
+                        let probed_peers = probe_known_peer_targets(&local_peer, &direct_targets);
+                        if !probed_peers.is_empty() {
+                            for peer in probed_peers {
+                                merge_peer(&peers, peer);
+                            }
+                            sync_layout_peer_presence(&layout_state, &peers);
                         }
                     }
                     last_announce = Instant::now();
@@ -1022,7 +1089,6 @@ impl AppRuntime {
                             if peer_visible_to_layout(&current_layout, &incoming.peer) {
                                 merge_peer(&peers, incoming.peer.clone());
                                 sync_layout_peer_presence(&layout_state, &peers);
-                                warm_quic_peer(&quic_transport, &incoming.peer);
                             }
 
                             if matches!(incoming.kind.as_str(), "announce" | "probe") {
@@ -2127,7 +2193,11 @@ fn start_edge_drop_window_sync(app_handle: AppHandle) {
         let runtime = state.inner();
         let layout = runtime.layout_snapshot();
         let peers = active_peer_snapshot(&runtime.peers);
-        let specs = edge_drop_specs_for_layout(&layout, &peers);
+        let specs = edge_drop_specs_for_window_visibility(
+            &layout,
+            &peers,
+            runtime.main_window_visible.load(Ordering::Relaxed),
+        );
         let next_labels = specs
             .iter()
             .map(|spec| spec.label.clone())
@@ -2299,6 +2369,18 @@ fn edge_drop_specs_for_layout(layout: &LayoutState, peers: &[LanPeer]) -> Vec<Ed
     };
     specs.sort_by(|left, right| left.label.cmp(&right.label));
     specs
+}
+
+fn edge_drop_specs_for_window_visibility(
+    layout: &LayoutState,
+    peers: &[LanPeer],
+    main_window_visible: bool,
+) -> Vec<EdgeDropWindowSpec> {
+    if main_window_visible {
+        edge_drop_specs_for_layout(layout, peers)
+    } else {
+        Vec::new()
+    }
 }
 
 fn server_edge_drop_specs(layout: &LayoutState, local_device: &Device) -> Vec<EdgeDropWindowSpec> {
@@ -2659,7 +2741,7 @@ fn set_app_upgrading(state: tauri::State<'_, AppRuntime>, enabled: bool) {
 }
 
 #[tauri::command]
-fn scan_lan_peers(state: tauri::State<'_, AppRuntime>) -> Result<DiscoveryStatus, String> {
+async fn scan_lan_peers(state: tauri::State<'_, AppRuntime>) -> Result<DiscoveryStatus, String> {
     state.start_discovery()?;
     let layout = state
         .layout
@@ -2670,7 +2752,14 @@ fn scan_lan_peers(state: tauri::State<'_, AppRuntime>) -> Result<DiscoveryStatus
     if let Some(transport) = state.quic_transport_handle() {
         apply_transport_to_peer(&mut local_peer, &transport);
     }
-    let discovered = scan_for_peers(&local_peer, discovery_base_port(&layout))?;
+    let base_port = discovery_base_port(&layout);
+
+    // scan_for_peers blocks for ~1.4s on UDP recv; run it on a blocking thread
+    // so the async command doesn't freeze the webview UI.
+    let discovered =
+        tauri::async_runtime::spawn_blocking(move || scan_for_peers(&local_peer, base_port))
+            .await
+            .map_err(|e| format!("scan task failed: {e}"))??;
 
     for peer in discovered {
         merge_peer(&state.peers, peer);
@@ -3506,30 +3595,9 @@ fn show_main_window_handle(app: &AppHandle) -> Result<(), String> {
 }
 
 fn hide_main_window_handle(app: &AppHandle) -> Result<(), String> {
-    #[cfg(target_os = "macos")]
-    {
-        let Some(window) = app.get_webview_window("main") else {
-            set_main_window_visible(app, false);
-            set_main_window_focused(app, false);
-            return Ok(());
-        };
-        let result = window
-            .hide()
-            .map_err(|error| format!("failed to hide main window: {error}"));
-        if result.is_ok() {
-            set_main_window_visible(app, false);
-            set_main_window_focused(app, false);
-        }
-        result
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    {
-        destroy_main_window_handle(app)
-    }
+    destroy_main_window_handle(app)
 }
 
-#[cfg(not(target_os = "macos"))]
 fn destroy_main_window_handle(app: &AppHandle) -> Result<(), String> {
     let Some(window) = app.get_webview_window("main") else {
         set_main_window_visible(app, false);
@@ -6211,6 +6279,7 @@ fn active_peer_snapshot(peers: &Arc<Mutex<Vec<LanPeer>>>) -> Vec<LanPeer> {
 fn apply_peer_presence(layout: &mut LayoutState, peers: &[LanPeer]) {
     let local_transport_port = layout.transport_port;
     let local_quic_port = layout.quic_port;
+    let cluster_id = layout.cluster_id.clone();
     for device in &mut layout.devices {
         if device.role == "local" {
             device.online = true;
@@ -6221,7 +6290,9 @@ fn apply_peer_presence(layout: &mut LayoutState, peers: &[LanPeer]) {
             continue;
         }
 
-        let peer = peers.iter().find(|peer| device_matches_peer(device, peer));
+        let peer = peers
+            .iter()
+            .find(|peer| device_matches_peer(device, peer, &cluster_id));
         if let Some(peer) = peer {
             update_device_from_peer(device, peer);
         } else {
@@ -6285,10 +6356,19 @@ fn refresh_paired_controller_keys(layout: &mut LayoutState, peers: &[LanPeer]) {
     }
 }
 
-fn device_matches_peer(device: &Device, peer: &LanPeer) -> bool {
+fn device_matches_peer(device: &Device, peer: &LanPeer, layout_cluster_id: &str) -> bool {
     device.id == peer_device_id(peer)
         || (!device.transport_public_key.trim().is_empty()
             && device.transport_public_key == peer.transport_public_key)
+        || same_cluster_host(device, peer, layout_cluster_id)
+}
+
+fn same_cluster_host(device: &Device, peer: &LanPeer, layout_cluster_id: &str) -> bool {
+    let cluster_id = layout_cluster_id.trim();
+    !cluster_id.is_empty()
+        && !peer.pairing_required
+        && peer.cluster_id == cluster_id
+        && (same_host(&device.host, &peer.host) || same_host(&device.host, &peer.ip))
 }
 
 #[allow(dead_code)]
@@ -6518,18 +6598,6 @@ fn apply_transport_to_peer(peer: &mut LanPeer, transport: &quic_transport::Trans
     peer.protocol_version = quic_transport::PROTOCOL_VERSION;
 }
 
-fn warm_quic_peer(transport: &quic_transport::TransportHandle, peer: &LanPeer) {
-    if !peer.input_ready || peer.transport_public_key.trim().is_empty() || peer.quic_port == 0 {
-        return;
-    }
-    let endpoint = transport.peer(
-        format!("{}:{}", peer.ip, peer.quic_port),
-        peer.transport_public_key.clone(),
-        peer.protocol_version,
-    );
-    let _ = transport.send_datagram(endpoint, Vec::new());
-}
-
 fn pairing_required(layout: &LayoutState) -> bool {
     layout.machine_role == "client" && layout.paired_controllers.is_empty()
 }
@@ -6635,6 +6703,41 @@ fn scan_for_peers(local_peer: &LanPeer, base_port: u16) -> Result<Vec<LanPeer>, 
     }
 
     Ok(peers)
+}
+
+fn probe_known_peer_targets(local_peer: &LanPeer, targets: &[String]) -> Vec<LanPeer> {
+    if targets.is_empty() {
+        return Vec::new();
+    }
+
+    let Ok(socket) = UdpSocket::bind("0.0.0.0:0") else {
+        return Vec::new();
+    };
+    let _ = socket.set_read_timeout(Some(Duration::from_millis(120)));
+    for target in targets {
+        let _ = send_discovery_packet(&socket, "probe", local_peer, target.as_str());
+    }
+
+    let started = Instant::now();
+    let mut buffer = [0_u8; 4096];
+    let mut peers = Vec::new();
+    while started.elapsed() < Duration::from_millis(700) {
+        let Ok((length, source)) = socket.recv_from(&mut buffer) else {
+            continue;
+        };
+        let Some(packet) = decode_discovery_packet(&buffer[..length]) else {
+            continue;
+        };
+        let Some(incoming) =
+            peer_from_discovery_packet(packet, source.ip().to_string(), &local_peer.id)
+        else {
+            continue;
+        };
+        if peer_visible_to_local_peer(local_peer, &incoming.peer) {
+            merge_peer_entry(&mut peers, incoming.peer);
+        }
+    }
+    peers
 }
 
 fn probe_for_peer(local_peer: &LanPeer, host: &str, base_port: u16) -> Result<LanPeer, String> {
@@ -6918,7 +7021,7 @@ fn merge_peer_entry(peers: &mut Vec<LanPeer>, next_peer: LanPeer) {
         }
     }
 
-    log::info!(
+    log::debug!(
         "discovery peer found id={} name={} ip={} discovery_port={} quic_port={} input_ready={} pairing_required={}",
         next_peer.id,
         next_peer.name,
@@ -7665,6 +7768,33 @@ mod tests {
     }
 
     #[test]
+    fn peer_presence_matches_same_cluster_host_after_identity_rotation() {
+        let mut layout = test_layout();
+        let mut peer = test_peer();
+        peer.id = "rotated-client-id".into();
+        peer.transport_public_key = "rotated-client-key".into();
+
+        apply_peer_presence(&mut layout, &[peer]);
+
+        assert!(layout.devices[1].online);
+        assert!(layout.devices[1].input_ready);
+        assert_eq!(layout.devices[1].transport_public_key, "rotated-client-key");
+    }
+
+    #[test]
+    fn discovery_keeps_peer_through_short_heartbeat_gap() {
+        let mut peer = test_peer();
+        peer.last_seen_ms = now_ms().saturating_sub(45_000);
+        let peers = Arc::new(Mutex::new(vec![peer.clone()]));
+
+        assert_eq!(active_peers(&peers, "local-device").len(), 1);
+
+        let mut entries = vec![peer];
+        prune_stale_peer_entries(&mut entries, now_ms());
+        assert_eq!(entries.len(), 1);
+    }
+
+    #[test]
     fn peer_presence_keeps_discovered_peer_online_without_input_ready() {
         let mut layout = test_layout();
         let mut peer = test_peer();
@@ -7702,6 +7832,18 @@ mod tests {
         let specs = edge_drop_specs_for_layout(&layout, &[]);
 
         assert!(specs.is_empty());
+    }
+
+    #[test]
+    fn edge_drop_specs_pause_when_main_window_is_hidden() {
+        let mut layout = test_layout();
+        layout.devices[1].screens[0].x = 1920;
+
+        assert_eq!(
+            edge_drop_specs_for_window_visibility(&layout, &[], true).len(),
+            1
+        );
+        assert!(edge_drop_specs_for_window_visibility(&layout, &[], false).is_empty());
     }
 
     #[test]
@@ -8655,14 +8797,15 @@ mod tests {
     }
 
     #[test]
-    fn device_matching_rejects_same_host_with_different_identity() {
+    fn device_matching_rejects_same_host_from_other_cluster() {
         let layout = test_layout();
         let device = &layout.devices[1];
         let mut peer = test_peer();
         peer.id = "peer-other".into();
         peer.transport_public_key = "different-key".into();
+        peer.cluster_id = "other-cluster".into();
 
-        assert!(!device_matches_peer(device, &peer));
+        assert!(!device_matches_peer(device, &peer, &layout.cluster_id));
     }
 
     #[test]

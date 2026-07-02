@@ -44,6 +44,57 @@ const RETURN_EDGE_INSET: f64 = 0.0;
 const RETURN_COOLDOWN_MS: u64 = 150;
 const MOUSE_MOVE_SEND_INTERVAL_MS: u64 = 8;
 const DRAG_MOVE_SEND_INTERVAL_MS: u64 = 8;
+#[cfg(target_os = "macos")]
+const MACOS_IDLE_CAPTURE_LOOP_MS: u64 = 100;
+#[cfg(target_os = "macos")]
+const MACOS_VISIBLE_REMOTE_CAPTURE_LOOP_MS: u64 = 16;
+#[cfg(target_os = "macos")]
+const MACOS_HIDDEN_REMOTE_CAPTURE_LOOP_MS: u64 = 50;
+#[cfg(target_os = "macos")]
+const MACOS_HIDDEN_WINDOW_CURSOR_HIDE_REASSERT_MS: u64 = 250;
+#[cfg(target_os = "macos")]
+const MACOS_NSEVENT_TYPE_SYSTEM_DEFINED: u32 = 14;
+#[cfg(target_os = "macos")]
+const MACOS_NSEVENT_TYPE_ROTATE: u32 = 18;
+#[cfg(target_os = "macos")]
+const MACOS_NSEVENT_TYPE_BEGIN_GESTURE: u32 = 19;
+#[cfg(target_os = "macos")]
+const MACOS_NSEVENT_TYPE_END_GESTURE: u32 = 20;
+#[cfg(target_os = "macos")]
+const MACOS_NSEVENT_TYPE_GESTURE: u32 = 29;
+#[cfg(target_os = "macos")]
+const MACOS_NSEVENT_TYPE_MAGNIFY: u32 = 30;
+#[cfg(target_os = "macos")]
+const MACOS_NSEVENT_TYPE_SWIPE: u32 = 31;
+#[cfg(target_os = "macos")]
+const MACOS_NSEVENT_TYPE_SMART_MAGNIFY: u32 = 32;
+#[cfg(target_os = "macos")]
+const MACOS_NSEVENT_TYPE_QUICK_LOOK: u32 = 33;
+#[cfg(target_os = "macos")]
+const MACOS_NSEVENT_TYPE_PRESSURE: u32 = 34;
+#[cfg(target_os = "macos")]
+const MACOS_NSEVENT_TYPE_DIRECT_TOUCH: u32 = 37;
+#[cfg(target_os = "macos")]
+const MACOS_NSEVENT_TYPE_CHANGE_MODE: u32 = 38;
+#[cfg(target_os = "macos")]
+const MACOS_RAW_EVENT_TAP_DISABLED_BY_TIMEOUT: u32 = 0xFFFF_FFFE;
+#[cfg(target_os = "macos")]
+const MACOS_RAW_EVENT_TAP_DISABLED_BY_USER_INPUT: u32 = 0xFFFF_FFFF;
+#[cfg(target_os = "macos")]
+const MACOS_RAW_GESTURE_EVENT_TYPES: &[u32] = &[
+    MACOS_NSEVENT_TYPE_SYSTEM_DEFINED,
+    MACOS_NSEVENT_TYPE_ROTATE,
+    MACOS_NSEVENT_TYPE_BEGIN_GESTURE,
+    MACOS_NSEVENT_TYPE_END_GESTURE,
+    MACOS_NSEVENT_TYPE_GESTURE,
+    MACOS_NSEVENT_TYPE_MAGNIFY,
+    MACOS_NSEVENT_TYPE_SWIPE,
+    MACOS_NSEVENT_TYPE_SMART_MAGNIFY,
+    MACOS_NSEVENT_TYPE_QUICK_LOOK,
+    MACOS_NSEVENT_TYPE_PRESSURE,
+    MACOS_NSEVENT_TYPE_DIRECT_TOUCH,
+    MACOS_NSEVENT_TYPE_CHANGE_MODE,
+];
 #[cfg(target_os = "windows")]
 const WINDOWS_FULLSCREEN_EDGE_TOLERANCE: i32 = 3;
 #[cfg(target_os = "windows")]
@@ -432,7 +483,7 @@ fn start_platform_capture(
     quic_transport: quic_transport::TransportHandle,
     stop: Arc<AtomicBool>,
     remote_active: Arc<AtomicBool>,
-    _main_window_visible: Arc<AtomicBool>,
+    main_window_visible: Arc<AtomicBool>,
     _main_window_focused: Arc<AtomicBool>,
     clipboard_target: Arc<Mutex<Option<ClipboardTarget>>>,
     input_events: Arc<AtomicU64>,
@@ -456,12 +507,15 @@ fn start_platform_capture(
             native_layout,
             active: Mutex::new(None),
             remote_active,
+            main_window_visible,
             clipboard_target,
             input_events,
             targets,
             switch_request,
             anchor: Mutex::new(None),
             cursor_hidden: Mutex::new(false),
+            cursor_hide_depth: Mutex::new(0),
+            last_cursor_hide_reassert: Mutex::new(None),
             last_mouse_move_sent: Mutex::new(None),
             last_cursor_repin: Mutex::new(None),
             last_return: Mutex::new(None),
@@ -522,16 +576,49 @@ fn start_platform_capture(
             }
         };
         CFRunLoop::get_current().add_source(&loop_source, unsafe { kCFRunLoopCommonModes });
+        let mut raw_gesture_taps = Vec::new();
+        let mut _raw_gesture_loop_sources = Vec::new();
+        for location in [CGEventTapLocation::HID, CGEventTapLocation::Session] {
+            match RawMacosGestureTap::new(location, Arc::clone(&context)) {
+                Ok(raw_tap) => match raw_tap.mach_port().create_runloop_source(0) {
+                    Ok(source) => {
+                        CFRunLoop::get_current()
+                            .add_source(&source, unsafe { kCFRunLoopCommonModes });
+                        raw_tap.enable();
+                        _raw_gesture_loop_sources.push(source);
+                        raw_gesture_taps.push(raw_tap);
+                    }
+                    Err(_) => {
+                        log::warn!(
+                            "failed to attach raw macOS gesture event tap {:?} to run loop",
+                            location
+                        );
+                    }
+                },
+                Err(_) => {
+                    log::warn!(
+                        "failed to create raw macOS gesture event tap {:?}",
+                        location
+                    );
+                }
+            }
+        }
         tap.enable();
-        // Keep this background capture thread off App Nap so the run loop and
-        // its timers are not throttled while MyKVM is not frontmost/minimized.
-        set_macos_app_nap_suppressed(true);
         let _ = ready_tx.send(Ok(()));
+        let mut app_nap_suppressed = false;
 
         while !stop.load(Ordering::Relaxed) {
+            let was_remote_active = context.remote_active.load(Ordering::Relaxed);
+            if app_nap_suppressed != was_remote_active {
+                set_macos_app_nap_suppressed(was_remote_active);
+                app_nap_suppressed = was_remote_active;
+            }
             let _ = CFRunLoop::run_in_mode(
                 unsafe { kCFRunLoopDefaultMode },
-                Duration::from_millis(100),
+                Duration::from_millis(macos_capture_loop_ms(
+                    was_remote_active,
+                    context.main_window_visible.load(Ordering::Relaxed),
+                )),
                 false,
             );
             drain_switch_request_macos(&context);
@@ -541,12 +628,23 @@ fn start_platform_capture(
             // while" failure. Re-arm it as soon as we notice.
             if context.tap_disabled.swap(false, Ordering::Relaxed) {
                 tap.enable();
-                log::info!("[diag] event tap re-enabled after being disabled");
+                for raw_tap in &raw_gesture_taps {
+                    raw_tap.enable();
+                }
+                log::debug!("[diag] event tap re-enabled after being disabled");
             }
-            // No cursor-hide reassert needed here: the transparent cursor pushed
-            // on entry stays active for the whole remote session with no
-            // hide/show state for WindowServer to drop. See
-            // set_macos_cursor_transparent.
+            // While controlling a remote, macOS can re-associate the physical
+            // mouse with the local cursor (especially when backgrounded),
+            // making the server pointer reappear and follow the mouse.
+            // Re-pin it to the anchor and re-assert hide while active.
+            let is_remote_active = context.remote_active.load(Ordering::Relaxed);
+            if app_nap_suppressed != is_remote_active {
+                set_macos_app_nap_suppressed(is_remote_active);
+                app_nap_suppressed = is_remote_active;
+            }
+            if is_remote_active {
+                repin_macos_cursor_while_remote(&context);
+            }
         }
 
         // Critical safety: never leave the cursor decoupled after capture stops,
@@ -554,7 +652,9 @@ fn start_platform_capture(
         set_macos_cursor_decoupled(false);
         set_macos_warp_suppression_interval(MACOS_DEFAULT_WARP_SUPPRESSION_SECS);
         show_macos_cursor_if_needed(&context);
-        set_macos_app_nap_suppressed(false);
+        if app_nap_suppressed {
+            set_macos_app_nap_suppressed(false);
+        }
         context.remote_active.store(false, Ordering::Relaxed);
         clear_clipboard_target(&context.clipboard_target);
     });
@@ -1813,12 +1913,15 @@ struct MacCaptureContext {
     native_layout: LayoutState,
     active: Mutex<Option<ActiveTarget>>,
     remote_active: Arc<AtomicBool>,
+    main_window_visible: Arc<AtomicBool>,
     clipboard_target: Arc<Mutex<Option<ClipboardTarget>>>,
     input_events: Arc<AtomicU64>,
     targets: Vec<InputTarget>,
     switch_request: Arc<Mutex<Option<SwitchDirection>>>,
     anchor: Mutex<Option<(f64, f64)>>,
     cursor_hidden: Mutex<bool>,
+    cursor_hide_depth: Mutex<usize>,
+    last_cursor_hide_reassert: Mutex<Option<Instant>>,
     last_mouse_move_sent: Mutex<Option<Instant>>,
     last_cursor_repin: Mutex<Option<Instant>>,
     // Instant we last returned control to the local machine. We now land the
@@ -1836,6 +1939,131 @@ struct MacCaptureContext {
     just_crossed: AtomicBool,
     local_y_bounds: Option<(f64, f64)>,
     display_snapshots: Vec<MacDisplaySnapshot>,
+}
+
+#[cfg(target_os = "macos")]
+struct RawMacosGestureTap {
+    mach_port: core_foundation::mach_port::CFMachPort,
+    _context: Arc<MacCaptureContext>,
+}
+
+#[cfg(target_os = "macos")]
+impl RawMacosGestureTap {
+    fn new(
+        location: core_graphics::event::CGEventTapLocation,
+        context: Arc<MacCaptureContext>,
+    ) -> Result<Self, ()> {
+        use core_foundation::base::TCFType;
+        use core_foundation::mach_port::CFMachPort;
+        use core_graphics::event::{CGEventTapOptions, CGEventTapPlacement};
+
+        let mach_port = unsafe {
+            macos_raw_event_tap_create(
+                location,
+                CGEventTapPlacement::HeadInsertEventTap,
+                CGEventTapOptions::Default,
+                macos_raw_gesture_event_mask(),
+                macos_raw_gesture_event_callback,
+                Arc::as_ptr(&context).cast(),
+            )
+        };
+        if mach_port.is_null() {
+            return Err(());
+        }
+
+        Ok(Self {
+            mach_port: unsafe { CFMachPort::wrap_under_create_rule(mach_port) },
+            _context: context,
+        })
+    }
+
+    fn mach_port(&self) -> &core_foundation::mach_port::CFMachPort {
+        &self.mach_port
+    }
+
+    fn enable(&self) {
+        use core_foundation::base::TCFType;
+
+        unsafe {
+            macos_raw_event_tap_enable(self.mach_port.as_concrete_TypeRef(), true);
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for RawMacosGestureTap {
+    fn drop(&mut self) {
+        use core_foundation::base::TCFType;
+        use core_foundation::mach_port::CFMachPortInvalidate;
+
+        unsafe {
+            CFMachPortInvalidate(self.mach_port.as_CFTypeRef() as *mut _);
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+type MacosRawEventTapCallback = unsafe extern "C" fn(
+    proxy: core_graphics::event::CGEventTapProxy,
+    event_type: u32,
+    event: core_graphics::sys::CGEventRef,
+    user_info: *const std::ffi::c_void,
+) -> core_graphics::sys::CGEventRef;
+
+#[cfg(target_os = "macos")]
+#[link(name = "ApplicationServices", kind = "framework")]
+extern "C" {
+    #[link_name = "CGEventTapCreate"]
+    fn macos_raw_event_tap_create(
+        tap: core_graphics::event::CGEventTapLocation,
+        place: core_graphics::event::CGEventTapPlacement,
+        options: core_graphics::event::CGEventTapOptions,
+        events_of_interest: u64,
+        callback: MacosRawEventTapCallback,
+        user_info: *const std::ffi::c_void,
+    ) -> core_foundation::mach_port::CFMachPortRef;
+
+    #[link_name = "CGEventTapEnable"]
+    fn macos_raw_event_tap_enable(tap: core_foundation::mach_port::CFMachPortRef, enable: bool);
+}
+
+#[cfg(target_os = "macos")]
+fn macos_raw_gesture_event_mask() -> u64 {
+    MACOS_RAW_GESTURE_EVENT_TYPES
+        .iter()
+        .fold(0_u64, |mask, event_type| mask | (1_u64 << *event_type))
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" fn macos_raw_gesture_event_callback(
+    _proxy: core_graphics::event::CGEventTapProxy,
+    event_type: u32,
+    event: core_graphics::sys::CGEventRef,
+    user_info: *const std::ffi::c_void,
+) -> core_graphics::sys::CGEventRef {
+    if user_info.is_null() {
+        return event;
+    }
+
+    let context = unsafe { &*(user_info as *const MacCaptureContext) };
+    if matches!(
+        event_type,
+        MACOS_RAW_EVENT_TAP_DISABLED_BY_TIMEOUT | MACOS_RAW_EVENT_TAP_DISABLED_BY_USER_INPUT
+    ) {
+        context.tap_disabled.store(true, Ordering::Relaxed);
+        return event;
+    }
+
+    if context.remote_active.load(Ordering::Relaxed) {
+        repin_macos_cursor_while_remote(context);
+        log::debug!(
+            "remote-active macOS gesture/system event {} was dropped",
+            event_type
+        );
+        return std::ptr::null_mut();
+    }
+
+    event
 }
 
 #[cfg(target_os = "macos")]
@@ -2811,7 +3039,8 @@ fn handle_macos_event(
                 &context.layout_state,
                 &context.input_events,
             ) {
-                return CallbackResult::Keep;
+                repin_macos_cursor_while_remote(context);
+                return CallbackResult::Drop;
             }
             mark_mouse_move_sent(&context.last_mouse_move_sent);
             send_packet(
@@ -2848,11 +3077,14 @@ fn handle_macos_event(
         _ => false,
     };
 
-    if sent {
-        CallbackResult::Drop
-    } else {
-        CallbackResult::Keep
+    repin_macos_cursor_while_remote(context);
+    if !sent {
+        log::debug!(
+            "remote-active local event {:?} was dropped after remote send miss",
+            event_type
+        );
     }
+    CallbackResult::Drop
 }
 
 #[cfg(target_os = "macos")]
@@ -2917,7 +3149,7 @@ fn handle_macos_mouse_move(
                 move_macos_cursor_without_event(context, CGPoint::new(point.0, point.1));
                 set_macos_cursor_decoupled(false);
                 set_macos_warp_suppression_interval(MACOS_DEFAULT_WARP_SUPPRESSION_SECS);
-                log::info!("[diag] cross BACK to local — showing cursor now");
+                log::debug!("[diag] cross BACK to local — showing cursor now");
                 show_macos_cursor_if_needed(context);
                 return CallbackResult::Drop;
             }
@@ -2956,11 +3188,8 @@ fn handle_macos_mouse_move(
                 }
             }
             repin_macos_cursor_if_drifted(context, location);
-            // Cursor hide re-assertion runs from the capture run loop (see
-            // start_platform_capture), NOT from this mouse-move callback: once the
-            // pointer is over the client the server stops getting mouse-move
-            // events, so a reassert hooked here would silently stop and leave the
-            // pointer visible when WindowServer drops our background hide.
+            // Re-pinning also runs from the capture run loop because mouse-move
+            // callbacks can stop arriving once the pointer is over the client.
             return CallbackResult::Drop;
         }
     }
@@ -2995,7 +3224,7 @@ fn handle_macos_mouse_move(
         // visible offset scales with flick speed. Hiding first means the pointer
         // vanishes where it is, then jumps to the anchor invisibly, so no edge
         // stick is ever visible regardless of scheduling latency.
-        log::info!("[diag] cross INTO remote — hiding+decoupling now");
+        log::debug!("[diag] cross INTO remote — hiding+decoupling now");
         hide_macos_cursor_if_needed(context);
         move_macos_cursor_without_event(context, CGPoint::new(anchor.0, anchor.1));
         if !send_remote_mouse_move(
@@ -3510,7 +3739,7 @@ fn enter_remote_target_macos(context: &MacCaptureContext, active_target: ActiveT
 fn return_to_local_macos(context: &MacCaptureContext) {
     use core_graphics::geometry::CGPoint;
 
-    let mut active_target = match context.active.lock().ok().and_then(|mut a| a.take()) {
+    let active_target = match context.active.lock().ok().and_then(|mut a| a.take()) {
         Some(target) => target,
         None => return,
     };
@@ -3542,6 +3771,45 @@ fn return_to_local_macos(context: &MacCaptureContext) {
     show_macos_cursor_if_needed(context);
 }
 
+/// Re-assert cursor decouple + position lock while a remote session is active.
+///
+/// When MyKVM is backgrounded (the normal state while controlling a remote),
+/// macOS can silently re-associate the physical mouse with the on-screen cursor
+/// despite an earlier `CGAssociateMouseAndMouseCursorPosition(false)`. The
+/// pointer then follows the mouse. Reuse the same drift-limited repin path used
+/// by the mouse callback, because the callback can stop firing while the main
+/// window is hidden. Do not repeatedly push hide/transparent cursor state here:
+/// those APIs are stack-based and must stay one enter paired with one return.
+#[cfg(target_os = "macos")]
+fn repin_macos_cursor_while_remote(context: &MacCaptureContext) {
+    set_macos_cursor_decoupled(true);
+    if !context.main_window_visible.load(Ordering::Relaxed) {
+        if let Some(location) = macos_current_cursor_location() {
+            repin_macos_cursor_if_drifted(context, location);
+        } else {
+            force_repin_macos_cursor_to_anchor(context);
+        }
+        reassert_macos_hidden_window_cursor(context);
+        return;
+    }
+
+    if let Some(location) = macos_current_cursor_location() {
+        repin_macos_cursor_if_drifted(context, location);
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_capture_loop_ms(remote_active: bool, main_window_visible: bool) -> u64 {
+    if !remote_active {
+        return MACOS_IDLE_CAPTURE_LOOP_MS;
+    }
+    if main_window_visible {
+        MACOS_VISIBLE_REMOTE_CAPTURE_LOOP_MS
+    } else {
+        MACOS_HIDDEN_REMOTE_CAPTURE_LOOP_MS
+    }
+}
+
 /// Poll the shared switch-request slot and act on it. Called from the capture
 /// loop on each iteration. Centralises the macOS enter/return side effects so
 /// both the mouse-crossing path and the hotkey path stay in sync.
@@ -3552,8 +3820,12 @@ fn drain_switch_request_macos(context: &MacCaptureContext) {
         Err(_) => return,
     };
     let Some(direction) = direction else { return };
-    match request_screen_switch(direction, &context.layout_state, &context.native_layout, &context.active)
-    {
+    match request_screen_switch(
+        direction,
+        &context.layout_state,
+        &context.native_layout,
+        &context.active,
+    ) {
         SwitchOutcome::Enter(active_target) => {
             log::info!(
                 "screen switch entering device={}",
@@ -3578,8 +3850,12 @@ fn drain_switch_request_windows(context: &WindowsCaptureContext) {
         Err(_) => return,
     };
     let Some(direction) = direction else { return };
-    match request_screen_switch(direction, &context.layout_state, &context.native_layout, &context.active)
-    {
+    match request_screen_switch(
+        direction,
+        &context.layout_state,
+        &context.native_layout,
+        &context.active,
+    ) {
         SwitchOutcome::Enter(active_target) => {
             log::info!(
                 "screen switch entering device={}",
@@ -3833,7 +4109,12 @@ fn set_macos_cursor_transparent(transparent: bool) {
         let data_sel = sel_registerName(b"dataWithBytes:length:\0".as_ptr() as *const c_char);
         let data_with: extern "C" fn(*mut c_void, *mut c_void, *const u8, usize) -> *mut c_void =
             std::mem::transmute(objc_msgSend as *const ());
-        let data = data_with(nsdata, data_sel, TRANSPARENT_BYTES.as_ptr(), TRANSPARENT_BYTES.len());
+        let data = data_with(
+            nsdata,
+            data_sel,
+            TRANSPARENT_BYTES.as_ptr(),
+            TRANSPARENT_BYTES.len(),
+        );
         if data.is_null() {
             return;
         }
@@ -3863,8 +4144,13 @@ fn set_macos_cursor_transparent(transparent: bool) {
         // two doubles after the object-pointer argument.
         let cursor_init_sel =
             sel_registerName(b"initWithImage:hotSpot:\0".as_ptr() as *const c_char);
-        let cursor_init: extern "C" fn(*mut c_void, *mut c_void, *mut c_void, c_double, c_double) -> *mut c_void =
-            std::mem::transmute(objc_msgSend as *const ());
+        let cursor_init: extern "C" fn(
+            *mut c_void,
+            *mut c_void,
+            *mut c_void,
+            c_double,
+            c_double,
+        ) -> *mut c_void = std::mem::transmute(objc_msgSend as *const ());
         let cursor_obj = alloc(nscursor, alloc_sel);
         let cursor = cursor_init(cursor_obj, cursor_init_sel, image, 0.0, 0.0);
         if cursor.is_null() {
@@ -3910,7 +4196,19 @@ fn repin_macos_cursor_if_drifted(
     // Re-pin only after actual drift and at a capped rate.
     set_macos_cursor_decoupled(true);
     move_macos_cursor_without_event(context, core_graphics::geometry::CGPoint::new(x, y));
-    hide_macos_cursor_if_needed(context);
+}
+
+#[cfg(target_os = "macos")]
+fn force_repin_macos_cursor_to_anchor(context: &MacCaptureContext) {
+    let Ok(anchor) = context.anchor.lock() else {
+        return;
+    };
+    let Some((x, y)) = *anchor else {
+        return;
+    };
+    drop(anchor);
+
+    move_macos_cursor_without_event(context, core_graphics::geometry::CGPoint::new(x, y));
 }
 
 #[cfg(target_os = "macos")]
@@ -3931,10 +4229,51 @@ fn macos_cursor_repin_due(context: &MacCaptureContext, interval: Duration) -> bo
 }
 
 #[cfg(target_os = "macos")]
+fn macos_current_cursor_location() -> Option<core_graphics::geometry::CGPoint> {
+    use core_graphics::{
+        event::CGEvent,
+        event_source::{CGEventSource, CGEventSourceStateID},
+    };
+
+    let source = CGEventSource::new(CGEventSourceStateID::CombinedSessionState).ok()?;
+    CGEvent::new(source).ok().map(|event| event.location())
+}
+
+#[cfg(target_os = "macos")]
 fn reset_cursor_repin_timer(context: &MacCaptureContext) {
     if let Ok(mut last_repin) = context.last_cursor_repin.lock() {
         *last_repin = None;
     }
+}
+
+#[cfg(target_os = "macos")]
+fn reassert_macos_hidden_window_cursor(context: &MacCaptureContext) {
+    let Ok(hidden) = context.cursor_hidden.lock() else {
+        return;
+    };
+    if !*hidden {
+        return;
+    }
+    drop(hidden);
+
+    let Ok(mut last_reassert) = context.last_cursor_hide_reassert.lock() else {
+        return;
+    };
+    let now = Instant::now();
+    if last_reassert
+        .as_ref()
+        .map(|last| {
+            now.duration_since(*last)
+                < Duration::from_millis(MACOS_HIDDEN_WINDOW_CURSOR_HIDE_REASSERT_MS)
+        })
+        .unwrap_or(false)
+    {
+        return;
+    }
+    *last_reassert = Some(now);
+    drop(last_reassert);
+
+    push_macos_cursor_hide(context);
 }
 
 #[cfg(target_os = "macos")]
@@ -4070,9 +4409,21 @@ fn hide_macos_cursor_if_needed(context: &MacCaptureContext) {
     // the thing we rely on.
     enable_macos_background_cursor_hide();
     set_macos_cursor_transparent(true);
-    set_macos_cursor_hidden_with_appkit(true);
-    log::info!("[diag] transparent cursor pushed + hide issued (cursor_hidden false->true)");
+    push_macos_cursor_hide(context);
+    if let Ok(mut last_reassert) = context.last_cursor_hide_reassert.lock() {
+        *last_reassert = None;
+    }
+    log::debug!("[diag] transparent cursor pushed + hide issued (cursor_hidden false->true)");
+    *hidden = true;
+}
 
+#[cfg(target_os = "macos")]
+fn push_macos_cursor_hide(context: &MacCaptureContext) {
+    let Ok(mut depth) = context.cursor_hide_depth.lock() else {
+        return;
+    };
+
+    set_macos_cursor_hidden_with_appkit(true);
     if context.display_snapshots.is_empty() {
         let _ = core_graphics::display::CGDisplay::main().hide_cursor();
     } else {
@@ -4080,7 +4431,7 @@ fn hide_macos_cursor_if_needed(context: &MacCaptureContext) {
             let _ = core_graphics::display::CGDisplay::new(display.id).hide_cursor();
         }
     }
-    *hidden = true;
+    *depth = depth.saturating_add(1);
 }
 
 #[cfg(target_os = "macos")]
@@ -4096,18 +4447,36 @@ fn show_macos_cursor_if_needed(context: &MacCaptureContext) {
     // and is the reliable inverse of the hide. The CGDisplay/NSCursor show calls
     // balance the secondary hide calls.
     set_macos_cursor_transparent(false);
-    if context.display_snapshots.is_empty() {
-        let _ = core_graphics::display::CGDisplay::main().show_cursor();
-    } else {
-        for display in &context.display_snapshots {
-            let _ = core_graphics::display::CGDisplay::new(display.id).show_cursor();
-        }
+    drain_macos_cursor_hide(context);
+    if let Ok(mut last_reassert) = context.last_cursor_hide_reassert.lock() {
+        *last_reassert = None;
     }
-    set_macos_cursor_hidden_with_appkit(false);
     *hidden = false;
-    log::info!(
-        "[diag] transparent cursor popped + show issued (cursor_hidden true->false)"
-    );
+    log::debug!("[diag] transparent cursor popped + show issued (cursor_hidden true->false)");
+}
+
+#[cfg(target_os = "macos")]
+fn drain_macos_cursor_hide(context: &MacCaptureContext) {
+    let count = context
+        .cursor_hide_depth
+        .lock()
+        .map(|mut depth| {
+            let count = *depth;
+            *depth = 0;
+            count
+        })
+        .unwrap_or(0);
+
+    for _ in 0..count {
+        if context.display_snapshots.is_empty() {
+            let _ = core_graphics::display::CGDisplay::main().show_cursor();
+        } else {
+            for display in &context.display_snapshots {
+                let _ = core_graphics::display::CGDisplay::new(display.id).show_cursor();
+            }
+        }
+        set_macos_cursor_hidden_with_appkit(false);
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -4645,6 +5014,37 @@ mod tests {
         // Ordinary keys carry no modifier flag.
         assert!(windows_vk_to_mac_flag(0x41).is_none()); // 'A'
         assert!(windows_vk_to_mac_flag(0x20).is_none()); // Space
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_raw_gesture_mask_covers_trackpad_system_gestures() {
+        let mask = macos_raw_gesture_event_mask();
+
+        for event_type in MACOS_RAW_GESTURE_EVENT_TYPES {
+            assert_ne!(mask & (1_u64 << *event_type), 0);
+        }
+        assert_ne!(mask & (1_u64 << MACOS_NSEVENT_TYPE_SWIPE), 0);
+        assert_ne!(mask & (1_u64 << MACOS_NSEVENT_TYPE_SYSTEM_DEFINED), 0);
+        assert_eq!(mask & (1_u64 << 22), 0);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_hidden_remote_loop_is_slower_than_visible_remote_loop() {
+        assert_eq!(
+            macos_capture_loop_ms(false, false),
+            MACOS_IDLE_CAPTURE_LOOP_MS
+        );
+        assert_eq!(
+            macos_capture_loop_ms(true, true),
+            MACOS_VISIBLE_REMOTE_CAPTURE_LOOP_MS
+        );
+        assert_eq!(
+            macos_capture_loop_ms(true, false),
+            MACOS_HIDDEN_REMOTE_CAPTURE_LOOP_MS
+        );
+        assert!(MACOS_HIDDEN_REMOTE_CAPTURE_LOOP_MS > MACOS_VISIBLE_REMOTE_CAPTURE_LOOP_MS);
     }
 
     fn screen(device_id: &str, id: &str, x: i32, y: i32, width: i32, height: i32) -> Screen {

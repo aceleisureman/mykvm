@@ -170,6 +170,7 @@ function App() {
   const [isSaving, setIsSaving] = useState(false);
   const [isRuntimePending, setIsRuntimePending] = useState(false);
   const [isScanningLan, setIsScanningLan] = useState(false);
+  const [scanCountdown, setScanCountdown] = useState(0);
   const [isAddingDevice, setIsAddingDevice] = useState(false);
   const [isPairingDevice, setIsPairingDevice] = useState(false);
   const [isDismissingPairing, setIsDismissingPairing] = useState(false);
@@ -499,11 +500,20 @@ function App() {
         return;
       }
 
-      readRuntimeStatus()
-        .then((nextRuntime) => {
+      // Refresh runtime + layout together: device online/inputReady status
+      // lives in layout, and without re-fetching it the UI shows stale
+      // "offline" even after discovery has found the peer again.
+      Promise.all([readRuntimeStatus(), loadAppState()])
+        .then(([nextRuntime, nextSnapshot]) => {
           if (!active) {
             return;
           }
+
+          setSnapshot((current) =>
+            current
+              ? { ...nextSnapshot, runtime: nextRuntime }
+              : nextSnapshot,
+          );
 
           const currentSnapshot = snapshotRef.current;
           if (
@@ -512,24 +522,16 @@ function App() {
             nextRuntime.pairing.state === "paired"
           ) {
             void loadAppState()
-              .then((nextSnapshot) => {
+              .then((pairingSnapshot) => {
                 if (active) {
-                  setSnapshot(nextSnapshot);
+                  setSnapshot({
+                    ...pairingSnapshot,
+                    runtime: nextRuntime,
+                  });
                 }
               })
-              .catch(() => {
-                // Keep the runtime-only refresh below if the full snapshot read fails.
-              });
+              .catch(() => {});
           }
-
-          setSnapshot((current) =>
-            current
-              ? {
-                  ...current,
-                  runtime: nextRuntime,
-                }
-              : current,
-          );
 
           // Keep a persistent blocking condition visible. The inject stage holds
           // the receiver-side reason keys/clicks get dropped (macOS Accessibility
@@ -1088,8 +1090,19 @@ function App() {
   }
 
   async function scanLan() {
-    setIsScanningLan(true);
     setErrorMessage(null);
+    setScanCountdown(6);
+    setIsScanningLan(true);
+
+    // Let the browser paint the modal before we hit the blocking backend call,
+    // otherwise the IPC freezes the UI thread and the modal never shows.
+    await new Promise((resolve) => requestAnimationFrame(resolve));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    const countdownTimer = setInterval(() => {
+      setScanCountdown((remaining) => (remaining > 0 ? remaining - 1 : 0));
+    }, 1000);
+    const startedAt = Date.now();
 
     try {
       const discovery = await scanLanPeers();
@@ -1109,7 +1122,18 @@ function App() {
         error instanceof Error ? error.message : ui.errors.scanLan,
       );
     } finally {
-      setIsScanningLan(false);
+      clearInterval(countdownTimer);
+      const elapsed = Date.now() - startedAt;
+      const minDisplayMs = 2500;
+      if (elapsed < minDisplayMs) {
+        setTimeout(() => {
+          setScanCountdown(0);
+          setIsScanningLan(false);
+        }, minDisplayMs - elapsed);
+      } else {
+        setScanCountdown(0);
+        setIsScanningLan(false);
+      }
     }
   }
 
@@ -1836,7 +1860,7 @@ function App() {
   const lanPeers = runtime.discovery.peers;
   const fileTransferEnabled = layout.fileTransferEnabled;
   const addedOnlyDevices = displayLayout.devices.filter(
-    (device) => !lanPeers.some((peer) => deviceMatchesPeer(device, peer)),
+    (device) => !lanPeers.some((peer) => deviceMatchesPeer(layout, device, peer)),
   );
   const serverFileTransferTargets = displayLayout.devices.filter(
     (device) =>
@@ -2141,7 +2165,7 @@ function App() {
                     >
                       <div className="connection-main">
                         <span
-                          className={`device-badge ${peer.inputReady ? "device-badge-online" : "device-badge-offline"}`}
+                          className="device-badge device-badge-online"
                         />
                         <div>
                           <div className="connection-title">
@@ -2153,6 +2177,11 @@ function App() {
                               {addedDevice?.upgrading ? (
                                 <span className="tag-pill tag-pill-upgrading">
                                   {ui.common.upgrading}
+                                </span>
+                              ) : null}
+                              {!peer.inputReady ? (
+                                <span className="tag-pill tag-pill-warning">
+                                  {ui.devices.inputNotReady}
                                 </span>
                               ) : null}
                             </div>
@@ -2209,6 +2238,11 @@ function App() {
                             {device.upgrading ? (
                               <span className="tag-pill tag-pill-upgrading">
                                 {ui.common.upgrading}
+                              </span>
+                            ) : null}
+                            {device.online && !device.inputReady ? (
+                              <span className="tag-pill tag-pill-warning">
+                                {ui.devices.inputNotReady}
                               </span>
                             ) : null}
                           </div>
@@ -2941,6 +2975,21 @@ function App() {
           <GitHubIcon />
         </a>
       </footer>
+
+      {isScanningLan ? (
+        <div className="scan-modal-backdrop" role="presentation">
+          <div className="scan-modal">
+            <div className="scan-modal-spinner" aria-hidden="true" />
+            <strong className="scan-modal-title">
+              {ui.devices.scanningTitle}
+            </strong>
+            <p className="muted-copy">{ui.devices.scanningCopy}</p>
+            {scanCountdown > 0 ? (
+              <span className="scan-modal-countdown">{scanCountdown}s</span>
+            ) : null}
+          </div>
+        </div>
+      ) : null}
     </main>
   );
 }
@@ -3280,7 +3329,7 @@ function applyPeerPresence(layout: LayoutState, peers: LanPeer[]): LayoutState {
       }
 
       const peer = peers.find((candidate) =>
-        deviceMatchesPeer(device, candidate),
+        deviceMatchesPeer(layout, device, candidate),
       );
       if (!peer) {
         return {
@@ -3535,14 +3584,35 @@ function peerDeviceId(peer: LanPeer) {
 }
 
 function findPeerDevice(layout: LayoutState, peer: LanPeer) {
-  return layout.devices.find((device) => deviceMatchesPeer(device, peer));
+  return layout.devices.find((device) => deviceMatchesPeer(layout, device, peer));
 }
 
-function deviceMatchesPeer(device: Device, peer: LanPeer) {
+function deviceMatchesPeer(layout: LayoutState, device: Device, peer: LanPeer) {
   return (
     device.id === peerDeviceId(peer) ||
     (device.transportPublicKey.trim().length > 0 &&
-      device.transportPublicKey === peer.transportPublicKey)
+      device.transportPublicKey === peer.transportPublicKey) ||
+    sameClusterHost(layout, device, peer)
+  );
+}
+
+function sameClusterHost(layout: LayoutState, device: Device, peer: LanPeer) {
+  return (
+    layout.clusterId.trim().length > 0 &&
+    !peer.pairingRequired &&
+    peer.clusterId === layout.clusterId &&
+    (sameHost(device.host, peer.host) || sameHost(device.host, peer.ip))
+  );
+}
+
+function sameHost(value: string, host: string) {
+  const normalizedHost = host.trim().toLowerCase();
+  return (
+    normalizedHost.length > 0 &&
+    value
+      .split("/")
+      .map((part) => part.trim().toLowerCase())
+      .some((part) => part === normalizedHost)
   );
 }
 

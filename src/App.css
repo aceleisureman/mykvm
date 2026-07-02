@@ -275,6 +275,11 @@
   color: #9a5a00;
 }
 
+.theme-light .tag-pill-warning {
+  background: #fff7ed;
+  color: #c2410c;
+}
+
 .theme-light .tag-pill-upgrading {
   background: #ede9fe;
   color: #6d28d9;
@@ -1222,6 +1227,11 @@
 .tag-pill-manual {
   background: rgba(245, 158, 11, 0.14);
   color: #fbbf24;
+}
+
+.tag-pill-warning {
+  background: rgba(249, 115, 22, 0.16);
+  color: #fb923c;
 }
 
 .tag-pill-upgrading {
@@ -2288,6 +2298,60 @@
   margin: 0;
   color: #a1a1aa;
   line-height: 1.7;
+}
+
+.scan-modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  display: grid;
+  place-items: center;
+  padding: 20px;
+  background: rgba(5, 8, 14, 0.66);
+  backdrop-filter: blur(6px);
+}
+
+.scan-modal {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  padding: 32px 36px;
+  border: 1px solid rgba(148, 163, 184, 0.2);
+  border-radius: 12px;
+  background: #191a1f;
+  text-align: center;
+}
+
+.scan-modal-title {
+  font-size: 1.05rem;
+}
+
+.scan-modal p {
+  margin: 0;
+  font-size: 0.85rem;
+  line-height: 1.5;
+}
+
+.scan-modal-spinner {
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  border: 3px solid rgba(148, 163, 184, 0.25);
+  border-top-color: #2f7af8;
+  animation: scan-spin 0.7s linear infinite;
+}
+
+.scan-modal-countdown {
+  font-size: 0.8rem;
+  color: #71717a;
+  font-variant-numeric: tabular-nums;
+}
+
+@keyframes scan-spin {
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 .pairing-code-input {
