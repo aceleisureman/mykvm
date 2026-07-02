@@ -74,7 +74,7 @@ export const TEXT = {
       screenSwitchTitle: "快捷切屏",
       screenSwitchRecording: "按下快捷键...",
       screenSwitchCopy:
-        "不用移动鼠标到屏幕边缘，直接按方向快捷键把控制权切到对应方向的相邻屏幕。再按一次切回本机。",
+        "仅服务端注册。按方向快捷键把控制权切到对应方向的相邻客户端；控制远端时再按任意切屏快捷键切回本机。",
       appearanceTitle: "配置",
       language: "语言",
       simplifiedChinese: "cn 中文简体",
@@ -312,7 +312,7 @@ export const TEXT = {
       screenSwitchTitle: "Quick switch",
       screenSwitchRecording: "Press shortcut...",
       screenSwitchCopy:
-        "Jump to the adjacent screen in a direction without moving the mouse to the edge. Press again to return to this machine.",
+        "Registered only on the server. Press a direction shortcut to jump to an adjacent client; while controlling a peer, press any quick-switch shortcut again to return to this machine.",
       appearanceTitle: "Configuration",
       language: "Language",
       simplifiedChinese: "cn 中文简体",

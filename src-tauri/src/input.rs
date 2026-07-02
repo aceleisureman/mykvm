@@ -256,6 +256,108 @@ pub enum SwitchOutcome {
     Noop,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct HotkeyModifiers {
+    ctrl: bool,
+    alt: bool,
+    shift: bool,
+    meta: bool,
+}
+
+fn screen_switch_hotkey_matches_vk(
+    layout_state: &Arc<Mutex<LayoutState>>,
+    key_code: u16,
+    modifiers: HotkeyModifiers,
+) -> bool {
+    let Ok(layout) = layout_state.lock() else {
+        return false;
+    };
+    if layout.machine_role != "server" {
+        return false;
+    }
+
+    screen_switch_hotkeys_match_vk(&layout.screen_switch_hotkeys, key_code, modifiers)
+}
+
+fn screen_switch_hotkeys_match_vk(
+    hotkeys: &crate::ScreenSwitchHotkeys,
+    key_code: u16,
+    modifiers: HotkeyModifiers,
+) -> bool {
+    [
+        hotkeys.left.as_str(),
+        hotkeys.right.as_str(),
+        hotkeys.up.as_str(),
+        hotkeys.down.as_str(),
+    ]
+    .into_iter()
+    .any(|hotkey| hotkey_matches_vk(hotkey, key_code, modifiers))
+}
+
+fn hotkey_matches_vk(value: &str, key_code: u16, modifiers: HotkeyModifiers) -> bool {
+    let normalized = value.trim().to_ascii_lowercase().replace(' ', "");
+    if normalized.is_empty()
+        || matches!(normalized.as_str(), "disabled" | "disable" | "off" | "none")
+    {
+        return false;
+    }
+
+    let mut required = HotkeyModifiers::default();
+    let mut main_key = None;
+    for part in normalized.split('+').filter(|part| !part.is_empty()) {
+        match part {
+            "ctrl" | "control" => required.ctrl = true,
+            "alt" | "option" => required.alt = true,
+            "shift" => required.shift = true,
+            "meta" | "cmd" | "command" | "win" | "windows" | "super" | "os" => {
+                required.meta = true;
+            }
+            key => {
+                if main_key.is_some() {
+                    return false;
+                }
+                main_key = hotkey_key_to_windows_vk(key);
+            }
+        }
+    }
+
+    main_key == Some(key_code) && required == modifiers
+}
+
+fn hotkey_key_to_windows_vk(key: &str) -> Option<u16> {
+    if key.len() == 1 {
+        let byte = key.as_bytes()[0];
+        if byte.is_ascii_alphabetic() {
+            return Some(byte.to_ascii_uppercase() as u16);
+        }
+        if byte.is_ascii_digit() {
+            return Some(byte as u16);
+        }
+    }
+
+    if let Some(function_number) = key
+        .strip_prefix('f')
+        .and_then(|value| value.parse::<u16>().ok())
+    {
+        if (1..=24).contains(&function_number) {
+            return Some(0x70 + function_number - 1);
+        }
+    }
+
+    Some(match key {
+        "space" | "spacebar" => 0x20,
+        "tab" => 0x09,
+        "enter" | "return" => 0x0D,
+        "esc" | "escape" => 0x1B,
+        "scrolllock" | "scroll" | "scrlk" => 0x91,
+        "up" | "arrowup" => 0x26,
+        "down" | "arrowdown" => 0x28,
+        "left" | "arrowleft" => 0x25,
+        "right" | "arrowright" => 0x27,
+        _ => return None,
+    })
+}
+
 /// Resolve a hotkey switch request against the current targets and active
 /// state. Called from the capture thread's poll loop.
 ///
@@ -2410,6 +2512,11 @@ unsafe extern "system" fn windows_keyboard_proc(code: i32, wparam: usize, lparam
         let event = unsafe { *(lparam as *const KBDLLHOOKSTRUCT) };
         let key_code = event.vkCode as u16;
         let down = matches!(message, WM_KEYDOWN | WM_SYSKEYDOWN);
+        if down && windows_event_matches_screen_switch_hotkey(&context, key_code) {
+            log::info!("screen switch hotkey returning to local from keyboard hook");
+            release_windows_remote_control(&context, false);
+            return 1;
+        }
         if send_packet(
             &context.quic_transport,
             &target,
@@ -2423,6 +2530,36 @@ unsafe extern "system" fn windows_keyboard_proc(code: i32, wparam: usize, lparam
     }
 
     unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) }
+}
+
+#[cfg(target_os = "windows")]
+fn windows_event_matches_screen_switch_hotkey(
+    context: &WindowsCaptureContext,
+    key_code: u16,
+) -> bool {
+    screen_switch_hotkey_matches_vk(
+        &context.layout_state,
+        key_code,
+        windows_current_hotkey_modifiers(),
+    )
+}
+
+#[cfg(target_os = "windows")]
+fn windows_current_hotkey_modifiers() -> HotkeyModifiers {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+        GetAsyncKeyState, VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
+    };
+
+    fn down(vk: u16) -> bool {
+        unsafe { (GetAsyncKeyState(vk as i32) as u16 & 0x8000) != 0 }
+    }
+
+    HotkeyModifiers {
+        ctrl: down(VK_CONTROL),
+        alt: down(VK_MENU),
+        shift: down(VK_SHIFT),
+        meta: down(VK_LWIN) || down(VK_RWIN),
+    }
 }
 
 /// Remembers which keys we have forwarded as pressed so they can be released if
@@ -3052,6 +3189,13 @@ fn handle_macos_event(
             )
         }
         CGEventType::KeyDown | CGEventType::KeyUp => {
+            if matches!(event_type, CGEventType::KeyDown)
+                && macos_event_matches_screen_switch_hotkey(context, event)
+            {
+                log::info!("screen switch hotkey returning to local from input tap");
+                return_to_local_macos(context);
+                return CallbackResult::Drop;
+            }
             let mac_code = event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE) as u16;
             if let Some(key_code) = mac_key_to_windows_vk(mac_code) {
                 let down = matches!(event_type, CGEventType::KeyDown);
@@ -3085,6 +3229,28 @@ fn handle_macos_event(
         );
     }
     CallbackResult::Drop
+}
+
+#[cfg(target_os = "macos")]
+fn macos_event_matches_screen_switch_hotkey(
+    context: &MacCaptureContext,
+    event: &core_graphics::event::CGEvent,
+) -> bool {
+    use core_graphics::event::{CGEventFlags, EventField};
+
+    let mac_code = event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE) as u16;
+    let Some(key_code) = mac_key_to_windows_vk(mac_code) else {
+        return false;
+    };
+    let flags = event.get_flags();
+    let modifiers = HotkeyModifiers {
+        ctrl: flags.contains(CGEventFlags::CGEventFlagControl),
+        alt: flags.contains(CGEventFlags::CGEventFlagAlternate),
+        shift: flags.contains(CGEventFlags::CGEventFlagShift),
+        meta: flags.contains(CGEventFlags::CGEventFlagCommand),
+    };
+
+    screen_switch_hotkey_matches_vk(&context.layout_state, key_code, modifiers)
 }
 
 #[cfg(target_os = "macos")]
@@ -3732,7 +3898,10 @@ fn enter_remote_target_macos(context: &MacCaptureContext, active_target: ActiveT
     if let Ok(mut anchor_state) = context.anchor.lock() {
         *anchor_state = Some(anchor);
     }
-    context.just_crossed.store(true, Ordering::Relaxed);
+    // Hotkey entry lands at the remote screen centre, not at a physical shared
+    // edge, so the first user delta is real input and must not be swallowed by
+    // the edge-crossing anchor guard.
+    context.just_crossed.store(false, Ordering::Relaxed);
 }
 
 #[cfg(target_os = "macos")]
@@ -3861,16 +4030,18 @@ fn drain_switch_request_windows(context: &WindowsCaptureContext) {
                 "screen switch entering device={}",
                 active_target.target.device_id
             );
-            // Mirror the Windows mouse-crossing enter path: send the initial
-            // move, hide the local cursor, mark remote_active. The remote will
-            // start receiving deltas from subsequent mouse moves.
+            // Mirror the Windows mouse-crossing enter path. Hotkey entry has no
+            // physical mouse position at the edge, so we explicitly pin to the
+            // local anchor and start sending deltas from there.
+            let anchor = local_anchor_point(&active_target);
+            hide_windows_cursor_if_needed(context);
+            set_windows_cursor(anchor.0.round() as i32, anchor.1.round() as i32);
             if send_remote_mouse_move(
                 &context.quic_transport,
                 &active_target,
                 &context.layout_state,
                 &context.input_events,
             ) {
-                hide_windows_cursor_if_needed(context);
                 context.remote_active.store(true, Ordering::Relaxed);
                 set_control_clipboard_target(
                     &context.clipboard_target,
@@ -3880,7 +4051,16 @@ fn drain_switch_request_windows(context: &WindowsCaptureContext) {
                 if let Ok(mut active) = context.active.lock() {
                     *active = Some(active_target);
                 }
-                context.just_crossed.store(true, Ordering::Relaxed);
+                if let Ok(mut anchor_state) = context.anchor.lock() {
+                    *anchor_state = Some(anchor);
+                }
+                // Hotkey entry lands at the remote centre. The edge-crossing
+                // first-delta guard would eat the user's first real movement.
+                context.just_crossed.store(false, Ordering::Relaxed);
+            } else {
+                reset_mouse_move_timer(&context.last_mouse_move_sent);
+                reset_remote_button_mask(&context.remote_button_mask);
+                show_windows_cursor_if_needed(context);
             }
         }
         SwitchOutcome::Return => {
@@ -5344,6 +5524,75 @@ mod tests {
 
         assert!(!returned);
         assert_eq!(guarded.x, 1.0);
+    }
+
+    #[test]
+    fn screen_switch_hotkey_matching_requires_exact_modifiers() {
+        let hotkeys = crate::ScreenSwitchHotkeys {
+            left: "alt+left".into(),
+            right: "alt+arrowright".into(),
+            up: "disabled".into(),
+            down: "alt+shift+down".into(),
+        };
+
+        assert!(screen_switch_hotkeys_match_vk(
+            &hotkeys,
+            0x25,
+            HotkeyModifiers {
+                alt: true,
+                ..HotkeyModifiers::default()
+            },
+        ));
+        assert!(screen_switch_hotkeys_match_vk(
+            &hotkeys,
+            0x27,
+            HotkeyModifiers {
+                alt: true,
+                ..HotkeyModifiers::default()
+            },
+        ));
+        assert!(screen_switch_hotkeys_match_vk(
+            &hotkeys,
+            0x28,
+            HotkeyModifiers {
+                alt: true,
+                shift: true,
+                ..HotkeyModifiers::default()
+            },
+        ));
+        assert!(!screen_switch_hotkeys_match_vk(
+            &hotkeys,
+            0x25,
+            HotkeyModifiers {
+                alt: true,
+                shift: true,
+                ..HotkeyModifiers::default()
+            },
+        ));
+        assert!(!screen_switch_hotkeys_match_vk(
+            &hotkeys,
+            0x26,
+            HotkeyModifiers {
+                alt: true,
+                ..HotkeyModifiers::default()
+            },
+        ));
+    }
+
+    #[test]
+    fn screen_switch_request_enters_remote_at_screen_center() {
+        let layout = layout_for_target_tests();
+        let layout_state = Arc::new(Mutex::new(layout.clone()));
+        let active = Mutex::new(None);
+
+        match request_screen_switch(SwitchDirection::Right, &layout_state, &layout, &active) {
+            SwitchOutcome::Enter(active_target) => {
+                assert_eq!(active_target.target.device_id, "peer-device");
+                assert_eq!(active_target.x, 960.0);
+                assert_eq!(active_target.y, 540.0);
+            }
+            _ => panic!("expected right quick switch to enter the online client"),
+        }
     }
 
     #[test]

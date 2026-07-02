@@ -2397,69 +2397,79 @@ function App() {
                     </button>
                   </div>
                 </div>
-                <div className="settings-control-row">
-                  <span>{ui.settings.edgeSwitchHotkey}</span>
-                  <button
-                    type="button"
-                    ref={edgeSwitchHotkeyButtonRef}
-                    className={`hotkey-recorder-button ${
-                      isCapturingEdgeSwitchHotkey ? "recording" : ""
-                    }`}
-                    aria-pressed={isCapturingEdgeSwitchHotkey}
-                    onClick={() =>
-                      setIsCapturingEdgeSwitchHotkey((recording) => !recording)
-                    }
-                  >
-                    {isCapturingEdgeSwitchHotkey
-                      ? ui.settings.edgeSwitchHotkeyRecording
-                      : renderHotkeyTags(
-                          formatEdgeSwitchHotkeyForDisplay(
-                            layout.edgeSwitchHotkey,
-                            metaKeyLabel,
-                          ),
-                        )}
-                  </button>
-                </div>
-                <div className="settings-control-row">
-                  <span>
-                    {ui.settings.screenSwitchTitle}
-                    <span className="info-tooltip-host" tabIndex={0}>
-                      ⓘ
-                      <span className="info-tooltip">
-                        {ui.settings.screenSwitchCopy}
-                      </span>
-                    </span>
-                  </span>
-                  <div className="screen-switch-hotkeys">
-                    {(["left", "right", "up", "down"] as const).map((dir) => (
+                {machineRole === "server" ? (
+                  <>
+                    <div className="settings-control-row">
+                      <span>{ui.settings.edgeSwitchHotkey}</span>
                       <button
-                        key={dir}
                         type="button"
-                        ref={(el) => {
-                          screenSwitchButtonRefs.current[dir] = el;
-                        }}
+                        ref={edgeSwitchHotkeyButtonRef}
                         className={`hotkey-recorder-button ${
-                          capturingDirection === dir ? "recording" : ""
+                          isCapturingEdgeSwitchHotkey ? "recording" : ""
                         }`}
-                        aria-pressed={capturingDirection === dir}
+                        aria-pressed={isCapturingEdgeSwitchHotkey}
                         onClick={() =>
-                          setCapturingDirection((current) =>
-                            current === dir ? null : dir,
+                          setIsCapturingEdgeSwitchHotkey(
+                            (recording) => !recording,
                           )
                         }
                       >
-                        {capturingDirection === dir
-                          ? ui.settings.screenSwitchRecording
+                        {isCapturingEdgeSwitchHotkey
+                          ? ui.settings.edgeSwitchHotkeyRecording
                           : renderHotkeyTags(
                               formatEdgeSwitchHotkeyForDisplay(
-                                layout.screenSwitchHotkeys[dir],
+                                layout.edgeSwitchHotkey,
                                 metaKeyLabel,
                               ),
+                              localPlatform,
                             )}
                       </button>
-                    ))}
-                  </div>
-                </div>
+                    </div>
+                    <div className="settings-control-row">
+                      <span>
+                        {ui.settings.screenSwitchTitle}
+                        <span className="info-tooltip-host" tabIndex={0}>
+                          ⓘ
+                          <span className="info-tooltip">
+                            {ui.settings.screenSwitchCopy}
+                          </span>
+                        </span>
+                      </span>
+                      <div className="screen-switch-hotkeys">
+                        {(["left", "right", "up", "down"] as const).map(
+                          (dir) => (
+                            <button
+                              key={dir}
+                              type="button"
+                              ref={(el) => {
+                                screenSwitchButtonRefs.current[dir] = el;
+                              }}
+                              className={`hotkey-recorder-button ${
+                                capturingDirection === dir ? "recording" : ""
+                              }`}
+                              aria-pressed={capturingDirection === dir}
+                              onClick={() =>
+                                setCapturingDirection((current) =>
+                                  current === dir ? null : dir,
+                                )
+                              }
+                            >
+                              {capturingDirection === dir
+                                ? ui.settings.screenSwitchRecording
+                                : renderHotkeyTags(
+                                    formatEdgeSwitchHotkeyForDisplay(
+                                      layout.screenSwitchHotkeys[dir],
+                                      metaKeyLabel,
+                                    ),
+                                    localPlatform,
+                                  )}
+                            </button>
+                          ),
+                        )}
+                      </div>
+                    </div>
+                  </>
+                ) : null}
                 <div className="settings-control-row">
                   <span>{ui.settings.clipboard}</span>
                   <div className="segmented-control">
@@ -3084,7 +3094,7 @@ function normalizeEdgeSwitchHotkeyInput(value: string) {
   return normalized.length === 0 ? "alt+shift+k" : normalized;
 }
 
-function renderHotkeyTags(displayHotkey: string) {
+function renderHotkeyTags(displayHotkey: string, platform = "") {
   const parts = displayHotkey
     .split("+")
     .map((part) => part.trim())
@@ -3094,27 +3104,29 @@ function renderHotkeyTags(displayHotkey: string) {
     <span className="hotkey-tag-list">
       {parts.map((part) => (
         <span className="hotkey-tag" key={part}>
-          {hotkeyTagLabel(part)}
+          {hotkeyTagLabel(part, platform)}
         </span>
       ))}
     </span>
   );
 }
 
-function hotkeyTagLabel(part: string) {
+function hotkeyTagLabel(part: string, platform: string) {
+  const useTextModifiers = prefersTextHotkeyModifiers(platform);
+
   switch (part.toLowerCase()) {
     case "command":
     case "cmd":
     case "meta":
-      return "⌘";
+      return useTextModifiers ? "Meta" : "⌘";
     case "shift":
-      return "⇧";
+      return useTextModifiers ? "Shift" : "⇧";
     case "alt":
     case "option":
-      return "⌥";
+      return useTextModifiers ? "Alt" : "⌥";
     case "control":
     case "ctrl":
-      return "⌃";
+      return useTextModifiers ? "Ctrl" : "⌃";
     case "win":
     case "windows":
       return "Win";
@@ -3137,6 +3149,11 @@ function hotkeyTagLabel(part: string) {
     default:
       return part.length === 1 ? part.toUpperCase() : part.toUpperCase();
   }
+}
+
+function prefersTextHotkeyModifiers(platform: string) {
+  const normalized = platform.toLowerCase();
+  return normalized.includes("win") || normalized.includes("linux");
 }
 
 function clampZoom(value: number) {

@@ -1813,6 +1813,10 @@ fn sync_runtime_toggle_shortcut(app: &AppHandle) -> Result<(), String> {
 }
 
 fn runtime_toggle_shortcut_for_layout(layout: &LayoutState) -> Result<Option<String>, String> {
+    if layout.machine_role != "server" {
+        return Ok(None);
+    }
+
     canonical_runtime_toggle_shortcut(&layout.edge_switch_hotkey)
 }
 
@@ -1824,20 +1828,7 @@ fn sync_screen_switch_shortcuts(app: &AppHandle) -> Result<(), String> {
         return Ok(());
     };
     let layout = state.layout_snapshot();
-    let next = ScreenSwitchHotkeys {
-        left: canonical_runtime_toggle_shortcut(&layout.screen_switch_hotkeys.left)
-            .unwrap_or(None)
-            .unwrap_or_default(),
-        right: canonical_runtime_toggle_shortcut(&layout.screen_switch_hotkeys.right)
-            .unwrap_or(None)
-            .unwrap_or_default(),
-        up: canonical_runtime_toggle_shortcut(&layout.screen_switch_hotkeys.up)
-            .unwrap_or(None)
-            .unwrap_or_default(),
-        down: canonical_runtime_toggle_shortcut(&layout.screen_switch_hotkeys.down)
-            .unwrap_or(None)
-            .unwrap_or_default(),
-    };
+    let next = screen_switch_shortcuts_for_layout(&layout);
 
     let mut current = state
         .screen_switch_shortcuts
@@ -1871,6 +1862,36 @@ fn sync_screen_switch_shortcuts(app: &AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+fn screen_switch_shortcuts_for_layout(layout: &LayoutState) -> ScreenSwitchHotkeys {
+    if layout.machine_role != "server" {
+        return empty_screen_switch_hotkeys();
+    }
+
+    ScreenSwitchHotkeys {
+        left: canonical_runtime_toggle_shortcut(&layout.screen_switch_hotkeys.left)
+            .unwrap_or(None)
+            .unwrap_or_default(),
+        right: canonical_runtime_toggle_shortcut(&layout.screen_switch_hotkeys.right)
+            .unwrap_or(None)
+            .unwrap_or_default(),
+        up: canonical_runtime_toggle_shortcut(&layout.screen_switch_hotkeys.up)
+            .unwrap_or(None)
+            .unwrap_or_default(),
+        down: canonical_runtime_toggle_shortcut(&layout.screen_switch_hotkeys.down)
+            .unwrap_or(None)
+            .unwrap_or_default(),
+    }
+}
+
+fn empty_screen_switch_hotkeys() -> ScreenSwitchHotkeys {
+    ScreenSwitchHotkeys {
+        left: String::new(),
+        right: String::new(),
+        up: String::new(),
+        down: String::new(),
+    }
+}
+
 /// Dispatch a pressed global shortcut to its action. The runtime-toggle
 /// shortcut starts/stops capture; the four direction shortcuts post a switch
 /// request that the capture loop consumes.
@@ -1881,6 +1902,9 @@ fn route_global_shortcut(
     let Some(state) = app.try_state::<AppRuntime>() else {
         return Ok(());
     };
+    if state.layout_snapshot().machine_role != "server" {
+        return Ok(());
+    }
 
     // Runtime toggle (quick start/stop).
     let toggle = state
@@ -7740,6 +7764,33 @@ mod tests {
     #[test]
     fn runtime_toggle_shortcut_rejects_single_letter_globals() {
         assert!(canonical_runtime_toggle_shortcut("k").is_err());
+    }
+
+    #[test]
+    fn runtime_toggle_shortcut_disabled_for_client_role() {
+        let mut layout = test_layout();
+        layout.machine_role = "client".into();
+
+        assert_eq!(
+            runtime_toggle_shortcut_for_layout(&layout).expect("shortcut"),
+            None
+        );
+    }
+
+    #[test]
+    fn screen_switch_shortcuts_disabled_for_client_role() {
+        let mut layout = test_layout();
+        layout.machine_role = "client".into();
+
+        assert_eq!(
+            screen_switch_shortcuts_for_layout(&layout),
+            ScreenSwitchHotkeys {
+                left: String::new(),
+                right: String::new(),
+                up: String::new(),
+                down: String::new(),
+            }
+        );
     }
 
     #[test]
