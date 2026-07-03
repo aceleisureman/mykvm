@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     net::SocketAddr,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -250,8 +251,14 @@ impl SwitchDirection {
 /// Outcome of a hotkey-driven switch request. The capture loop acts on it: an
 /// `Enter` builds an `ActiveTarget` and runs the enter sequence; a `Return`
 /// hands control back to the local machine.
-pub enum SwitchOutcome {
+enum SwitchOutcome {
     Enter(ActiveTarget),
+    LocalMove {
+        from_screen_id: String,
+        to_screen_id: String,
+        x: f64,
+        y: f64,
+    },
     Return,
     Noop,
 }
@@ -361,17 +368,28 @@ fn hotkey_key_to_windows_vk(key: &str) -> Option<u16> {
 /// Resolve a hotkey switch request against the current targets and active
 /// state. Called from the capture thread's poll loop.
 ///
-/// - If we are currently local (`active` is `None`): pick the first online
-///   target whose `edge` matches the requested direction and build an
-///   `ActiveTarget` centred on the remote screen.
+/// - If we are currently local (`active` is `None`): move to a local screen in
+///   that direction when one exists, otherwise pick the first online remote
+///   target whose `edge` matches the requested direction.
 /// - If we are already controlling a remote (`active` is `Some`): request a
 ///   return to local. The user can then press the direction key again to cross
 ///   into a different remote.
-pub fn request_screen_switch(
+#[cfg(test)]
+fn request_screen_switch(
     direction: SwitchDirection,
     layout_state: &Arc<Mutex<LayoutState>>,
     native_layout: &LayoutState,
     active: &Mutex<Option<ActiveTarget>>,
+) -> SwitchOutcome {
+    request_screen_switch_from_point(direction, layout_state, native_layout, active, None)
+}
+
+fn request_screen_switch_from_point(
+    direction: SwitchDirection,
+    layout_state: &Arc<Mutex<LayoutState>>,
+    native_layout: &LayoutState,
+    active: &Mutex<Option<ActiveTarget>>,
+    current_point: Option<(f64, f64)>,
 ) -> SwitchOutcome {
     let currently_remote = active.lock().map(|a| a.is_some()).unwrap_or(false);
     if currently_remote {
@@ -384,13 +402,39 @@ pub fn request_screen_switch(
     let Ok(layout) = layout_state.lock() else {
         return SwitchOutcome::Noop;
     };
+    let source_screen_id =
+        source_local_screen(&layout, native_layout, current_point).map(|screen| screen.id.clone());
+    if let Some(local_move) = local_screen_switch_point(
+        direction,
+        &layout,
+        native_layout,
+        source_screen_id.as_deref(),
+    ) {
+        return SwitchOutcome::LocalMove {
+            from_screen_id: local_move.from_screen_id,
+            to_screen_id: local_move.to_screen_id,
+            x: local_move.x,
+            y: local_move.y,
+        };
+    }
     let targets = build_input_targets(&layout, native_layout);
     drop(layout);
 
-    let Some(target) = targets
+    let target = targets
         .iter()
+        .filter(|target| {
+            source_screen_id
+                .as_deref()
+                .map(|id| target.layout_local_screen.id == id)
+                .unwrap_or(true)
+        })
         .find(|target| direction.matches_edge(target.edge))
-    else {
+        .or_else(|| {
+            targets
+                .iter()
+                .find(|target| direction.matches_edge(target.edge))
+        });
+    let Some(target) = target else {
         return SwitchOutcome::Noop;
     };
 
@@ -413,6 +457,107 @@ pub fn request_screen_switch(
         y: remote_y,
         invert_y: false,
     })
+}
+
+fn source_local_screen<'a>(
+    layout: &'a LayoutState,
+    native_layout: &LayoutState,
+    current_point: Option<(f64, f64)>,
+) -> Option<&'a Screen> {
+    let local = local_device(layout)?;
+    if let Some((x, y)) = current_point {
+        if let Some(native_local) = local_device(native_layout) {
+            for native_screen in &native_local.screens {
+                let native_screen = platform_native_screen(native_screen);
+                if point_in_screen(&native_screen, x, y) {
+                    if let Some(screen) = local
+                        .screens
+                        .iter()
+                        .find(|screen| screen.id == native_screen.id)
+                    {
+                        return Some(screen);
+                    }
+                }
+            }
+        }
+        if let Some(screen) = local
+            .screens
+            .iter()
+            .find(|screen| point_in_screen(screen, x, y))
+        {
+            return Some(screen);
+        }
+    }
+
+    local
+        .screens
+        .iter()
+        .find(|screen| screen.is_primary)
+        .or_else(|| local.screens.first())
+}
+
+struct LocalScreenMove {
+    from_screen_id: String,
+    to_screen_id: String,
+    x: f64,
+    y: f64,
+}
+
+fn local_screen_switch_point(
+    direction: SwitchDirection,
+    layout: &LayoutState,
+    native_layout: &LayoutState,
+    source_screen_id: Option<&str>,
+) -> Option<LocalScreenMove> {
+    let local = local_device(layout)?;
+    let source = source_screen_id
+        .and_then(|id| local.screens.iter().find(|screen| screen.id == id))
+        .or_else(|| local.screens.iter().find(|screen| screen.is_primary))
+        .or_else(|| local.screens.first())?;
+
+    let target = local.screens.iter().find(|screen| {
+        screen.id != source.id
+            && !screens_overlap(source, screen)
+            && touching_edge(source, screen)
+                .map(|edge| direction.matches_edge(edge))
+                .unwrap_or(false)
+    })?;
+
+    let native_target = local_device(native_layout)
+        .and_then(|device| device.screens.iter().find(|screen| screen.id == target.id))
+        .map(platform_native_screen)
+        .unwrap_or_else(|| platform_native_screen(target));
+    let (x, y) = screen_center_point(&native_target);
+    Some(LocalScreenMove {
+        from_screen_id: source.id.clone(),
+        to_screen_id: target.id.clone(),
+        x,
+        y,
+    })
+}
+
+fn screen_center_point(screen: &Screen) -> (f64, f64) {
+    (
+        screen.x as f64 + (screen.width as f64 / 2.0).clamp(0.0, (screen.width - 1).max(0) as f64),
+        screen.y as f64
+            + (screen.height as f64 / 2.0).clamp(0.0, (screen.height - 1).max(0) as f64),
+    )
+}
+
+fn remembered_local_screen_point(
+    points: &Mutex<HashMap<String, (f64, f64)>>,
+    from_screen_id: &str,
+    to_screen_id: &str,
+    current_point: Option<(f64, f64)>,
+    fallback: (f64, f64),
+) -> (f64, f64) {
+    let Ok(mut points) = points.lock() else {
+        return fallback;
+    };
+    if let Some(point) = current_point {
+        points.insert(from_screen_id.to_string(), point);
+    }
+    points.get(to_screen_id).copied().unwrap_or(fallback)
 }
 
 pub fn start_input_runtime(
@@ -626,6 +771,9 @@ fn start_platform_capture(
             pressed_keys: Mutex::new(Vec::new()),
             tap_disabled: AtomicBool::new(false),
             just_crossed: AtomicBool::new(false),
+            suppress_next_mouse_delta: AtomicBool::new(false),
+            hotkey_return_point: Mutex::new(None),
+            local_screen_points: Mutex::new(HashMap::new()),
             local_y_bounds,
             display_snapshots,
         });
@@ -820,6 +968,7 @@ fn start_platform_capture(
             cursor_hide_calls: Mutex::new(0),
             fullscreen_foreground_cache: Mutex::new(None),
             just_crossed: AtomicBool::new(false),
+            local_screen_points: Mutex::new(HashMap::new()),
         });
 
         if let Ok(mut current) = WINDOWS_CAPTURE_CONTEXT.lock() {
@@ -2039,6 +2188,9 @@ struct MacCaptureContext {
     pressed_keys: Mutex<Vec<u16>>,
     tap_disabled: AtomicBool,
     just_crossed: AtomicBool,
+    suppress_next_mouse_delta: AtomicBool,
+    hotkey_return_point: Mutex<Option<(f64, f64)>>,
+    local_screen_points: Mutex<HashMap<String, (f64, f64)>>,
     local_y_bounds: Option<(f64, f64)>,
     display_snapshots: Vec<MacDisplaySnapshot>,
 }
@@ -2203,6 +2355,7 @@ struct WindowsCaptureContext {
     // Swallow the first post-crossing delta so a fast flick across the edge
     // does not shove the cursor inward on Windows, where we pin by warping.
     just_crossed: AtomicBool,
+    local_screen_points: Mutex<HashMap<String, (f64, f64)>>,
 }
 
 #[cfg(target_os = "windows")]
@@ -3040,6 +3193,19 @@ fn set_windows_cursor(x: i32, y: i32) {
 }
 
 #[cfg(target_os = "windows")]
+fn windows_current_cursor_point() -> Option<(f64, f64)> {
+    use windows_sys::Win32::{Foundation::POINT, UI::WindowsAndMessaging::GetCursorPos};
+
+    unsafe {
+        let mut point = POINT { x: 0, y: 0 };
+        if GetCursorPos(&mut point) == 0 {
+            return None;
+        }
+        Some((point.x as f64, point.y as f64))
+    }
+}
+
+#[cfg(target_os = "windows")]
 fn hide_windows_cursor_if_needed(context: &WindowsCaptureContext) {
     let Ok(mut calls) = context.cursor_hide_calls.lock() else {
         return;
@@ -3266,6 +3432,13 @@ fn handle_macos_mouse_move(
     if let Ok(mut active) = context.active.lock() {
         if let Some(active_target) = active.as_mut() {
             let dy = if active_target.invert_y { -dy } else { dy };
+            if context
+                .suppress_next_mouse_delta
+                .swap(false, Ordering::Relaxed)
+            {
+                repin_macos_cursor_if_drifted(context, location);
+                return CallbackResult::Drop;
+            }
             if context.just_crossed.swap(false, Ordering::Relaxed)
                 && should_ignore_initial_anchor_warp_delta(active_target.target.edge, dx, dy)
             {
@@ -3290,6 +3463,9 @@ fn handle_macos_mouse_move(
                 *active = None;
                 context.remote_active.store(false, Ordering::Relaxed);
                 context.just_crossed.store(false, Ordering::Relaxed);
+                context
+                    .suppress_next_mouse_delta
+                    .store(false, Ordering::Relaxed);
                 // Record the return instant so the crossing test can enforce a
                 // short cooldown — without it, landing flush on the edge (inset
                 // 0) would let a fast back-flick immediately re-cross.
@@ -3337,6 +3513,9 @@ fn handle_macos_mouse_move(
                     *active = None;
                     context.remote_active.store(false, Ordering::Relaxed);
                     context.just_crossed.store(false, Ordering::Relaxed);
+                    context
+                        .suppress_next_mouse_delta
+                        .store(false, Ordering::Relaxed);
                     clear_clipboard_target(&context.clipboard_target);
                     reset_mouse_move_timer(&context.last_mouse_move_sent);
                     reset_cursor_repin_timer(context);
@@ -3807,6 +3986,23 @@ fn local_return_point(active: &ActiveTarget) -> (f64, f64) {
     }
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn local_center_point(active: &ActiveTarget) -> (f64, f64) {
+    let local = &active.target.local_screen;
+    (
+        local.x as f64 + (local.width as f64 / 2.0).clamp(0.0, (local.width - 1).max(0) as f64),
+        local.y as f64 + (local.height as f64 / 2.0).clamp(0.0, (local.height - 1).max(0) as f64),
+    )
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn local_hotkey_return_point(
+    active: &ActiveTarget,
+    recorded_point: Option<(f64, f64)>,
+) -> (f64, f64) {
+    recorded_point.unwrap_or_else(|| local_center_point(active))
+}
+
 fn send_remote_mouse_move(
     quic_transport: &quic_transport::TransportHandle,
     active: &ActiveTarget,
@@ -3859,15 +4055,12 @@ fn send_remote_cursor_park(
 fn enter_remote_target_macos(context: &MacCaptureContext, active_target: ActiveTarget) {
     use core_graphics::geometry::CGPoint;
 
+    let return_point = macos_current_cursor_location().map(|point| (point.x, point.y));
     let anchor = mac_cursor_point(
         context,
         local_anchor_point(&active_target),
         active_target.invert_y,
     );
-    set_macos_cursor_decoupled(true);
-    set_macos_warp_suppression_interval(0.0);
-    hide_macos_cursor_if_needed(context);
-    move_macos_cursor_without_event(context, CGPoint::new(anchor.0, anchor.1));
     if !send_remote_mouse_move(
         &context.quic_transport,
         &active_target,
@@ -3881,8 +4074,18 @@ fn enter_remote_target_macos(context: &MacCaptureContext, active_target: ActiveT
         set_macos_cursor_decoupled(false);
         show_macos_cursor_if_needed(context);
         context.just_crossed.store(false, Ordering::Relaxed);
+        context
+            .suppress_next_mouse_delta
+            .store(false, Ordering::Relaxed);
+        if let Ok(mut hotkey_return_point) = context.hotkey_return_point.lock() {
+            *hotkey_return_point = None;
+        }
         return;
     }
+    set_macos_cursor_decoupled(true);
+    set_macos_warp_suppression_interval(0.0);
+    hide_macos_cursor_if_needed(context);
+    move_macos_cursor_without_event(context, CGPoint::new(anchor.0, anchor.1));
     reset_mouse_move_timer(&context.last_mouse_move_sent);
     reset_cursor_repin_timer(context);
     reset_remote_button_mask(&context.remote_button_mask);
@@ -3898,10 +4101,15 @@ fn enter_remote_target_macos(context: &MacCaptureContext, active_target: ActiveT
     if let Ok(mut anchor_state) = context.anchor.lock() {
         *anchor_state = Some(anchor);
     }
-    // Hotkey entry lands at the remote screen centre, not at a physical shared
-    // edge, so the first user delta is real input and must not be swallowed by
-    // the edge-crossing anchor guard.
+    if let Ok(mut hotkey_return_point) = context.hotkey_return_point.lock() {
+        *hotkey_return_point = return_point;
+    }
+    // Hotkey entry lands at the remote screen centre. macOS can still emit one
+    // synthetic delta from the local anchor warp; drop only that next delta.
     context.just_crossed.store(false, Ordering::Relaxed);
+    context
+        .suppress_next_mouse_delta
+        .store(true, Ordering::Relaxed);
 }
 
 #[cfg(target_os = "macos")]
@@ -3912,7 +4120,12 @@ fn return_to_local_macos(context: &MacCaptureContext) {
         Some(target) => target,
         None => return,
     };
-    let point = local_return_point(&active_target);
+    let recorded_point = context
+        .hotkey_return_point
+        .lock()
+        .ok()
+        .and_then(|mut point| point.take());
+    let point = local_hotkey_return_point(&active_target, recorded_point);
     let invert_y = active_target.invert_y;
     let target = active_target.target.clone();
     let _ = send_remote_cursor_park(
@@ -3923,6 +4136,9 @@ fn return_to_local_macos(context: &MacCaptureContext) {
     );
     context.remote_active.store(false, Ordering::Relaxed);
     context.just_crossed.store(false, Ordering::Relaxed);
+    context
+        .suppress_next_mouse_delta
+        .store(false, Ordering::Relaxed);
     if let Ok(mut last_return) = context.last_return.lock() {
         *last_return = Some(Instant::now());
     }
@@ -3932,7 +4148,11 @@ fn return_to_local_macos(context: &MacCaptureContext) {
     if let Ok(mut anchor) = context.anchor.lock() {
         *anchor = None;
     }
-    let point = mac_cursor_point(context, point, invert_y);
+    let point = if recorded_point.is_some() {
+        point
+    } else {
+        mac_cursor_point(context, point, invert_y)
+    };
     set_macos_warp_suppression_interval(0.0);
     move_macos_cursor_without_event(context, CGPoint::new(point.0, point.1));
     set_macos_cursor_decoupled(false);
@@ -3989,11 +4209,13 @@ fn drain_switch_request_macos(context: &MacCaptureContext) {
         Err(_) => return,
     };
     let Some(direction) = direction else { return };
-    match request_screen_switch(
+    let current_point = macos_current_cursor_location().map(|point| (point.x, point.y));
+    match request_screen_switch_from_point(
         direction,
         &context.layout_state,
         &context.native_layout,
         &context.active,
+        current_point,
     ) {
         SwitchOutcome::Enter(active_target) => {
             log::info!(
@@ -4005,6 +4227,26 @@ fn drain_switch_request_macos(context: &MacCaptureContext) {
         SwitchOutcome::Return => {
             log::info!("screen switch returning to local");
             return_to_local_macos(context);
+        }
+        SwitchOutcome::LocalMove {
+            from_screen_id,
+            to_screen_id,
+            x,
+            y,
+        } => {
+            let (x, y) = remembered_local_screen_point(
+                &context.local_screen_points,
+                &from_screen_id,
+                &to_screen_id,
+                current_point,
+                (x, y),
+            );
+            log::info!("screen switch moving local cursor to ({x:.0}, {y:.0})");
+            set_macos_cursor_decoupled(false);
+            set_macos_warp_suppression_interval(0.0);
+            move_macos_cursor_without_event(context, core_graphics::geometry::CGPoint::new(x, y));
+            set_macos_warp_suppression_interval(MACOS_DEFAULT_WARP_SUPPRESSION_SECS);
+            show_macos_cursor_if_needed(context);
         }
         SwitchOutcome::Noop => {
             log::warn!("screen switch {direction:?} ignored: no matching online target");
@@ -4019,11 +4261,13 @@ fn drain_switch_request_windows(context: &WindowsCaptureContext) {
         Err(_) => return,
     };
     let Some(direction) = direction else { return };
-    match request_screen_switch(
+    let current_point = windows_current_cursor_point();
+    match request_screen_switch_from_point(
         direction,
         &context.layout_state,
         &context.native_layout,
         &context.active,
+        current_point,
     ) {
         SwitchOutcome::Enter(active_target) => {
             log::info!(
@@ -4066,6 +4310,22 @@ fn drain_switch_request_windows(context: &WindowsCaptureContext) {
         SwitchOutcome::Return => {
             log::info!("screen switch returning to local");
             release_windows_remote_control(context, false);
+        }
+        SwitchOutcome::LocalMove {
+            from_screen_id,
+            to_screen_id,
+            x,
+            y,
+        } => {
+            let (x, y) = remembered_local_screen_point(
+                &context.local_screen_points,
+                &from_screen_id,
+                &to_screen_id,
+                current_point,
+                (x, y),
+            );
+            log::info!("screen switch moving local cursor to ({x:.0}, {y:.0})");
+            set_windows_cursor(x.round() as i32, y.round() as i32);
         }
         SwitchOutcome::Noop => {
             log::warn!("screen switch {direction:?} ignored: no matching online target");
@@ -5593,6 +5853,109 @@ mod tests {
             }
             _ => panic!("expected right quick switch to enter the online client"),
         }
+    }
+
+    #[test]
+    fn screen_switch_request_moves_between_local_screens() {
+        let mut layout = layout_for_target_tests();
+        layout.devices[0].screens.push(screen(
+            "local-device",
+            "local-display-2",
+            512,
+            1080,
+            1512,
+            982,
+        ));
+        let layout_state = Arc::new(Mutex::new(layout.clone()));
+        let active = Mutex::new(None);
+
+        match request_screen_switch_from_point(
+            SwitchDirection::Down,
+            &layout_state,
+            &layout,
+            &active,
+            Some((960.0, 540.0)),
+        ) {
+            SwitchOutcome::LocalMove {
+                from_screen_id,
+                to_screen_id,
+                x,
+                y,
+            } => {
+                assert_eq!(from_screen_id, "local-display-1");
+                assert_eq!(to_screen_id, "local-display-2");
+                assert_eq!(x, 1268.0);
+                assert_eq!(y, 1571.0);
+            }
+            _ => panic!("expected down quick switch to move to the lower local screen"),
+        }
+
+        match request_screen_switch_from_point(
+            SwitchDirection::Up,
+            &layout_state,
+            &layout,
+            &active,
+            Some((1268.0, 1571.0)),
+        ) {
+            SwitchOutcome::LocalMove {
+                from_screen_id,
+                to_screen_id,
+                x,
+                y,
+            } => {
+                assert_eq!(from_screen_id, "local-display-2");
+                assert_eq!(to_screen_id, "local-display-1");
+                assert_eq!(x, 960.0);
+                assert_eq!(y, 540.0);
+            }
+            _ => panic!("expected up quick switch to move back to the upper local screen"),
+        }
+    }
+
+    #[test]
+    fn local_screen_switch_remembers_points_by_screen_id() {
+        let points = Mutex::new(HashMap::new());
+
+        let first_target = remembered_local_screen_point(
+            &points,
+            "local-display-1",
+            "local-display-2",
+            Some((333.0, 444.0)),
+            (1268.0, 1571.0),
+        );
+        assert_eq!(first_target, (1268.0, 1571.0));
+
+        let return_target = remembered_local_screen_point(
+            &points,
+            "local-display-2",
+            "local-display-1",
+            Some((1200.0, 1500.0)),
+            (960.0, 540.0),
+        );
+        assert_eq!(return_target, (333.0, 444.0));
+
+        let points = points.lock().unwrap();
+        assert_eq!(points.get("local-display-1"), Some(&(333.0, 444.0)));
+        assert_eq!(points.get("local-display-2"), Some(&(1200.0, 1500.0)));
+    }
+
+    #[test]
+    fn hotkey_return_uses_recorded_point_then_local_screen_center() {
+        let active = crossing_target(
+            &[target_for_coordinate_tests()],
+            1919.0,
+            500.0,
+            40.0,
+            0.0,
+            &Arc::new(Mutex::new(layout_for_target_tests())),
+        )
+        .expect("target should be active");
+
+        assert_eq!(
+            local_hotkey_return_point(&active, Some((321.0, 654.0))),
+            (321.0, 654.0)
+        );
+        assert_eq!(local_hotkey_return_point(&active, None), (960.0, 540.0));
     }
 
     #[test]
