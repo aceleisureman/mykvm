@@ -1417,7 +1417,9 @@ fn restart_runtime_if_running(state: &AppRuntime) -> Result<(), String> {
 
     state.stop_input();
     state.stop_clipboard();
-    state.stop_discovery();
+    // Keep discovery/QUIC alive across input/clipboard restarts. Rebuilding the
+    // QUIC endpoint on the same UDP port can briefly race the old endpoint and
+    // make peers see "server refused to accept a new connection".
     thread::sleep(Duration::from_millis(300));
     state.start_discovery()?;
     let layout = state.layout_snapshot();
