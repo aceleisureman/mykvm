@@ -322,7 +322,7 @@ jobs:
             data.version = version;
             if (file === 'src-tauri/tauri.conf.json' && channel === 'beta') {
               data.plugins.updater.endpoints = [
-                'https://github.com/XxMinor/mykvm/releases/download/beta/latest.json',
+                'https://github.com/aceleisureman/mykvm/releases/download/beta/latest.json',
               ];
             }
             fs.writeFileSync(file, `${JSON.stringify(data, null, 2)}\n`);
