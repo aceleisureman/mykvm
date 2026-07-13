@@ -2,7 +2,7 @@ use std::{
     collections::{hash_map::DefaultHasher, HashMap, HashSet},
     env, fs,
     hash::{Hash, Hasher},
-    io::{Read, Write},
+    io::{Read, Seek, SeekFrom, Write},
     net::{Ipv4Addr, SocketAddr, UdpSocket},
     path::{Path, PathBuf},
     process::Command,
@@ -5891,7 +5891,7 @@ fn send_file_transfer_packet(
         target.protocol_version,
     );
     quic_transport
-        .send_stream_expect_ack(peer, payload)
+        .send_bulk_stream_expect_ack(peer, payload)
         .map_err(|error| format!("文件传输失败: {error}"))
 }
 
@@ -6292,7 +6292,26 @@ fn append_incoming_file_transfer_chunk(
         || packet.target_id != transfer.target_id
         || packet.file_name != transfer.file_name
         || packet.total_bytes != transfer.total_bytes
-        || packet.chunk_index != transfer.next_chunk_index
+    {
+        return false;
+    }
+
+    let duplicate_end = packet.offset.saturating_add(packet.data.len() as u64);
+    if packet.chunk_index.saturating_add(1) == transfer.next_chunk_index
+        && duplicate_end == transfer.received_bytes
+    {
+        let existing_matches = fs::File::open(&transfer.temp_path)
+            .and_then(|mut file| {
+                file.seek(SeekFrom::Start(packet.offset))?;
+                let mut existing = vec![0_u8; packet.data.len()];
+                file.read_exact(&mut existing)?;
+                Ok(existing == packet.data)
+            })
+            .unwrap_or(false);
+        return existing_matches;
+    }
+
+    if packet.chunk_index != transfer.next_chunk_index
         || packet.offset != transfer.received_bytes
         || transfer
             .received_bytes
@@ -9074,6 +9093,63 @@ mod tests {
             &transfers,
             &root
         ));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn file_transfer_accepts_identical_retried_chunk_once() {
+        let layout = test_layout();
+        let root = temp_test_dir("file-transfer-retry");
+        let transfers = Arc::new(Mutex::new(HashMap::new()));
+
+        for packet in [
+            test_file_transfer_packet("start", "transfer-retry", "note.txt", 5, 0, 0, b""),
+            test_file_transfer_packet("chunk", "transfer-retry", "note.txt", 5, 0, 0, b"hello"),
+        ] {
+            let payload = encode_wire_packet(&packet).expect("file packet should encode");
+            assert!(handle_file_transfer_packet_with_root(
+                &payload,
+                &layout,
+                "local-device",
+                &transfers,
+                &root
+            ));
+        }
+
+        let duplicate =
+            test_file_transfer_packet("chunk", "transfer-retry", "note.txt", 5, 0, 0, b"hello");
+        let duplicate_payload = encode_wire_packet(&duplicate).expect("duplicate should encode");
+        assert!(handle_file_transfer_packet_with_root(
+            &duplicate_payload,
+            &layout,
+            "local-device",
+            &transfers,
+            &root
+        ));
+
+        let mismatched =
+            test_file_transfer_packet("chunk", "transfer-retry", "note.txt", 5, 0, 0, b"HELLO");
+        let mismatched_payload = encode_wire_packet(&mismatched).expect("mismatch should encode");
+        assert!(!handle_file_transfer_packet_with_root(
+            &mismatched_payload,
+            &layout,
+            "local-device",
+            &transfers,
+            &root
+        ));
+
+        let finish =
+            test_file_transfer_packet("finish", "transfer-retry", "note.txt", 5, 1, 5, b"");
+        let finish_payload = encode_wire_packet(&finish).expect("finish should encode");
+        assert!(handle_file_transfer_packet_with_root(
+            &finish_payload,
+            &layout,
+            "local-device",
+            &transfers,
+            &root
+        ));
+        assert_eq!(fs::read(root.join("note.txt")).unwrap(), b"hello");
 
         let _ = fs::remove_dir_all(root);
     }

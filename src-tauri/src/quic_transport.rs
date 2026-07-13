@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
-        mpsc, Arc,
+        mpsc, Arc, Mutex,
     },
     thread,
     time::{Duration, Instant},
@@ -25,7 +25,7 @@ use quinn::{
     },
     ClientConfig, Endpoint, ServerConfig,
 };
-use tokio::sync::mpsc as tokio_mpsc;
+use tokio::sync::{mpsc as tokio_mpsc, Mutex as TokioMutex};
 
 pub const PROTOCOL_VERSION: u16 = 1;
 
@@ -51,6 +51,65 @@ pub struct PeerEndpoint {
 /// with an error so the input layer can release the cursor immediately.
 const DATAGRAM_FAIL_THRESHOLD: u64 = 3;
 const DATAGRAM_QUEUE_CAP: u64 = 32;
+const DATAGRAM_HARD_QUEUE_CAP: u64 = 64;
+const STREAM_QUEUE_CAP: u64 = 8;
+const BULK_STREAM_QUEUE_CAP: u64 = 6;
+const MAX_DATAGRAM_HEALTH_PEERS: usize = 64;
+
+fn try_reserve_pending(pending: &AtomicU64, cap: u64) -> bool {
+    pending
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            (current < cap).then_some(current + 1)
+        })
+        .is_ok()
+}
+
+fn release_pending(pending: &AtomicU64) {
+    let _ = pending.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        Some(current.saturating_sub(1))
+    });
+}
+
+#[derive(Default)]
+struct DatagramHealth {
+    failures: HashMap<String, u64>,
+}
+
+impl DatagramHealth {
+    fn should_fast_fail(&self, peer: &str) -> bool {
+        self.failure_count(peer) >= DATAGRAM_FAIL_THRESHOLD
+    }
+
+    fn failure_count(&self, peer: &str) -> u64 {
+        self.failures.get(peer).copied().unwrap_or(0)
+    }
+
+    fn record_failure(&mut self, peer: &str) -> u64 {
+        if !self.failures.contains_key(peer) && self.failures.len() >= MAX_DATAGRAM_HEALTH_PEERS {
+            if let Some(stale) = self.failures.keys().next().cloned() {
+                self.failures.remove(&stale);
+            }
+        }
+        let failures = self.failures.entry(peer.to_string()).or_default();
+        *failures = failures.saturating_add(1);
+        *failures
+    }
+
+    fn record_success(&mut self, peer: &str) {
+        self.failures.remove(peer);
+    }
+
+    fn reset(&mut self) {
+        self.failures.clear();
+    }
+}
+
+fn datagram_health_key(peer: &PeerEndpoint) -> String {
+    format!(
+        "{}\0{}\0{}",
+        peer.addr, peer.public_key, peer.protocol_version
+    )
+}
 
 #[derive(Clone)]
 pub struct TransportHandle {
@@ -60,8 +119,9 @@ pub struct TransportHandle {
     /// Consecutive datagram send failures observed by the transport loop.
     /// Shared with the input layer so it can detect a dead peer without
     /// waiting for the async transport to propagate the error.
-    datagram_failures: Arc<AtomicU64>,
+    datagram_health: Arc<Mutex<DatagramHealth>>,
     datagram_pending: Arc<AtomicU64>,
+    stream_pending: Arc<AtomicU64>,
 }
 
 impl TransportHandle {
@@ -82,6 +142,19 @@ impl TransportHandle {
     }
 
     pub fn send_datagram(&self, peer: PeerEndpoint, payload: Vec<u8>) -> Result<(), String> {
+        self.send_datagram_with_policy(peer, payload, false)
+    }
+
+    pub fn send_datagram_lossy(&self, peer: PeerEndpoint, payload: Vec<u8>) -> Result<(), String> {
+        self.send_datagram_with_policy(peer, payload, true)
+    }
+
+    fn send_datagram_with_policy(
+        &self,
+        peer: PeerEndpoint,
+        payload: Vec<u8>,
+        lossy: bool,
+    ) -> Result<(), String> {
         if payload.len() > MAX_DATAGRAM_BYTES {
             return Err(format!(
                 "QUIC datagram is too large: {} bytes",
@@ -92,20 +165,40 @@ impl TransportHandle {
         // Fast-fail: if the transport loop has observed multiple consecutive
         // datagram failures for the current peer, report the error immediately
         // so the input layer can release the cursor.
-        if self.datagram_failures.load(Ordering::Relaxed) >= DATAGRAM_FAIL_THRESHOLD {
+        let health_key = datagram_health_key(&peer);
+        if self
+            .datagram_health
+            .lock()
+            .map(|health| health.should_fast_fail(&health_key))
+            .unwrap_or(false)
+        {
             return Err(
                 "QUIC datagram send failed: peer unreachable (consecutive failures)".to_string(),
             );
         }
 
-        if self.datagram_pending.load(Ordering::Relaxed) >= DATAGRAM_QUEUE_CAP {
-            return Ok(());
+        let cap = if lossy {
+            DATAGRAM_QUEUE_CAP
+        } else {
+            DATAGRAM_HARD_QUEUE_CAP
+        };
+        if !try_reserve_pending(&self.datagram_pending, cap) {
+            return if lossy {
+                Ok(())
+            } else {
+                Err("QUIC input queue is full".into())
+            };
         }
-        self.datagram_pending.fetch_add(1, Ordering::Relaxed);
 
-        self.commands
+        if self
+            .commands
             .send(TransportCommand::SendDatagram { peer, payload })
-            .map_err(|_| "QUIC transport is stopped".to_string())
+            .is_err()
+        {
+            release_pending(&self.datagram_pending);
+            return Err("QUIC transport is stopped".into());
+        }
+        Ok(())
     }
 
     pub fn send_stream_expect_ack(
@@ -113,7 +206,15 @@ impl TransportHandle {
         peer: PeerEndpoint,
         payload: Vec<u8>,
     ) -> Result<(), String> {
-        self.send_stream_inner(peer, payload, true)
+        self.send_stream_inner(peer, payload, true, false)
+    }
+
+    pub fn send_bulk_stream_expect_ack(
+        &self,
+        peer: PeerEndpoint,
+        payload: Vec<u8>,
+    ) -> Result<(), String> {
+        self.send_stream_inner(peer, payload, true, true)
     }
 
     fn send_stream_inner(
@@ -121,6 +222,7 @@ impl TransportHandle {
         peer: PeerEndpoint,
         payload: Vec<u8>,
         ack_required: bool,
+        bulk: bool,
     ) -> Result<(), String> {
         if payload.len() > MAX_STREAM_BYTES {
             return Err(format!(
@@ -129,15 +231,29 @@ impl TransportHandle {
             ));
         }
 
+        let queue_cap = if bulk {
+            BULK_STREAM_QUEUE_CAP
+        } else {
+            STREAM_QUEUE_CAP
+        };
+        if !try_reserve_pending(&self.stream_pending, queue_cap) {
+            return Err("QUIC reliable stream queue is full".into());
+        }
+
         let (result_tx, result_rx) = mpsc::channel();
-        self.commands
+        if self
+            .commands
             .send(TransportCommand::SendStream {
                 peer,
                 payload,
                 ack_required,
                 result: result_tx,
             })
-            .map_err(|_| "QUIC transport is stopped".to_string())?;
+            .is_err()
+        {
+            release_pending(&self.stream_pending);
+            return Err("QUIC transport is stopped".into());
+        }
         result_rx
             .recv_timeout(Duration::from_secs(3))
             .map_err(|_| "QUIC stream send timed out".to_string())?
@@ -147,7 +263,9 @@ impl TransportHandle {
     /// re-discovered so subsequent sends are attempted immediately instead
     /// of being short-circuited.
     pub fn reset_datagram_failures(&self) {
-        self.datagram_failures.store(0, Ordering::Relaxed);
+        if let Ok(mut health) = self.datagram_health.lock() {
+            health.reset();
+        }
     }
 
     pub fn shutdown(&self) {
@@ -175,6 +293,8 @@ struct PeerKey {
     public_key: String,
 }
 
+type SharedConnections = Arc<TokioMutex<HashMap<PeerKey, quinn::Connection>>>;
+
 pub fn start(
     preferred_port: u16,
     identity_dir: PathBuf,
@@ -188,10 +308,12 @@ pub fn start(
     let identity = load_or_create_identity(&identity_dir)?;
     let (ready_tx, ready_rx) = mpsc::channel();
     let (command_tx, command_rx) = tokio_mpsc::unbounded_channel();
-    let datagram_failures = Arc::new(AtomicU64::new(0));
-    let datagram_failures_inner = Arc::clone(&datagram_failures);
+    let datagram_health = Arc::new(Mutex::new(DatagramHealth::default()));
+    let datagram_health_inner = Arc::clone(&datagram_health);
     let datagram_pending = Arc::new(AtomicU64::new(0));
     let datagram_pending_inner = Arc::clone(&datagram_pending);
+    let stream_pending = Arc::new(AtomicU64::new(0));
+    let stream_pending_inner = Arc::clone(&stream_pending);
 
     thread::Builder::new()
         .name("mykvm-quic-transport".into())
@@ -216,8 +338,9 @@ pub fn start(
                 on_datagram,
                 on_stream,
                 ready_tx,
-                datagram_failures_inner,
+                datagram_health_inner,
                 datagram_pending_inner,
+                stream_pending_inner,
             ));
         })
         .map_err(|error| format!("failed to spawn QUIC transport thread: {error}"))?;
@@ -230,8 +353,9 @@ pub fn start(
         commands: command_tx,
         port: ready.port,
         public_key: ready.public_key,
-        datagram_failures,
+        datagram_health,
         datagram_pending,
+        stream_pending,
     })
 }
 
@@ -247,8 +371,9 @@ async fn run_transport(
     on_datagram: DatagramHandler,
     on_stream: StreamHandler,
     ready_tx: mpsc::Sender<Result<ReadyTransport, String>>,
-    datagram_failures: Arc<AtomicU64>,
+    datagram_health: Arc<Mutex<DatagramHealth>>,
     datagram_pending: Arc<AtomicU64>,
+    stream_pending: Arc<AtomicU64>,
 ) {
     let (endpoint, public_key) = match bind_endpoint(preferred_port, &identity) {
         Ok(bound) => bound,
@@ -269,7 +394,7 @@ async fn run_transport(
     let _ = ready_tx.send(Ok(ReadyTransport { port, public_key }));
     spawn_accept_loop(endpoint.clone(), on_datagram, on_stream);
 
-    let mut connections: HashMap<PeerKey, quinn::Connection> = HashMap::new();
+    let connections: SharedConnections = Arc::new(TokioMutex::new(HashMap::new()));
     let mut last_datagram_fail_log: Option<Instant> = None;
     // Cache of peers whose connection recently failed, to avoid repeated 2s
     // timeout attempts on every mouse-move datagram.
@@ -278,6 +403,7 @@ async fn run_transport(
         match command {
             TransportCommand::SendDatagram { peer, payload } => {
                 datagram_pending.fetch_sub(1, Ordering::Relaxed);
+                let health_key = datagram_health_key(&peer);
                 // Skip send attempt if this peer failed recently (within 5s).
                 let skip = resolve_peer_addr(&peer.addr)
                     .ok()
@@ -287,17 +413,20 @@ async fn run_transport(
                 let result = if skip {
                     Err("peer recently unreachable".to_string())
                 } else {
-                    send_datagram(&endpoint, &mut connections, peer.clone(), payload).await
+                    send_datagram(&endpoint, &connections, peer.clone(), payload).await
                 };
                 if let Err(error) = result {
-                    let count = datagram_failures.fetch_add(1, Ordering::Relaxed) + 1;
+                    let count = datagram_health
+                        .lock()
+                        .map(|mut health| health.record_failure(&health_key))
+                        .unwrap_or(1);
                     // Evict the dead connection so next attempt reconnects.
                     if let Ok(addr) = resolve_peer_addr(&peer.addr) {
                         let key = PeerKey {
                             addr,
                             public_key: peer.public_key.clone(),
                         };
-                        connections.remove(&key);
+                        connections.lock().await.remove(&key);
                         datagram_fail_cache.insert(addr, Instant::now());
                     }
                     // Rate-limit the warning log.
@@ -309,7 +438,9 @@ async fn run_transport(
                         last_datagram_fail_log = Some(Instant::now());
                     }
                 } else {
-                    datagram_failures.store(0, Ordering::Relaxed);
+                    if let Ok(mut health) = datagram_health.lock() {
+                        health.record_success(&health_key);
+                    }
                     // Clear fail cache on success so we try normally next time.
                     if let Ok(addr) = resolve_peer_addr(&peer.addr) {
                         datagram_fail_cache.remove(&addr);
@@ -322,31 +453,33 @@ async fn run_transport(
                 ack_required,
                 result,
             } => {
-                let send_result = send_stream(
-                    &endpoint,
-                    &mut connections,
-                    peer.clone(),
-                    payload.clone(),
-                    ack_required,
-                )
-                .await;
-                let send_result = if send_result.is_err() {
-                    if let Ok(addr) = resolve_peer_addr(&peer.addr) {
-                        let key = PeerKey {
-                            addr,
-                            public_key: peer.public_key.clone(),
-                        };
-                        connections.remove(&key);
+                let endpoint = endpoint.clone();
+                let connections = Arc::clone(&connections);
+                let stream_pending = Arc::clone(&stream_pending);
+                tokio::spawn(async move {
+                    let send_result = send_stream(
+                        &endpoint,
+                        &connections,
+                        peer.clone(),
+                        payload.clone(),
+                        ack_required,
+                    )
+                    .await;
+                    let send_result = if send_result.is_err() {
+                        if let Ok(key) = peer_key(&peer) {
+                            connections.lock().await.remove(&key);
+                        }
+                        log::info!("QUIC stream send retry after connection eviction");
+                        send_stream(&endpoint, &connections, peer, payload, ack_required).await
+                    } else {
+                        send_result
+                    };
+                    if let Err(error) = &send_result {
+                        log::warn!("QUIC stream send failed: {error}");
                     }
-                    log::info!("QUIC stream send retry after connection eviction");
-                    send_stream(&endpoint, &mut connections, peer, payload, ack_required).await
-                } else {
-                    send_result
-                };
-                if let Err(error) = &send_result {
-                    log::warn!("QUIC stream send failed: {error}");
-                }
-                let _ = result.send(send_result);
+                    release_pending(&stream_pending);
+                    let _ = result.send(send_result);
+                });
             }
             TransportCommand::Shutdown => break,
         }
@@ -705,7 +838,7 @@ fn spawn_stream_reader(
 
 async fn send_datagram(
     endpoint: &Endpoint,
-    connections: &mut HashMap<PeerKey, quinn::Connection>,
+    connections: &SharedConnections,
     peer: PeerEndpoint,
     payload: Vec<u8>,
 ) -> Result<(), String> {
@@ -713,7 +846,7 @@ async fn send_datagram(
     match connection.send_datagram(payload.into()) {
         Ok(()) => Ok(()),
         Err(error) => {
-            connections.remove(&key);
+            connections.lock().await.remove(&key);
             Err(error.to_string())
         }
     }
@@ -721,7 +854,7 @@ async fn send_datagram(
 
 async fn send_stream(
     endpoint: &Endpoint,
-    connections: &mut HashMap<PeerKey, quinn::Connection>,
+    connections: &SharedConnections,
     peer: PeerEndpoint,
     payload: Vec<u8>,
     ack_required: bool,
@@ -729,7 +862,7 @@ async fn send_stream(
     let (key, connection) = connection_for(endpoint, connections, &peer).await?;
     let result = send_stream_on_connection(connection, payload, ack_required).await;
     if result.is_err() {
-        connections.remove(&key);
+        connections.lock().await.remove(&key);
     }
     result
 }
@@ -776,17 +909,20 @@ fn verify_stream_ack(bytes: &[u8]) -> Result<(), String> {
 
 async fn connection_for(
     endpoint: &Endpoint,
-    connections: &mut HashMap<PeerKey, quinn::Connection>,
+    connections: &SharedConnections,
     peer: &PeerEndpoint,
 ) -> Result<(PeerKey, quinn::Connection), String> {
     let key = peer_key(peer)?;
 
-    if let Some(connection) = connections.get(&key) {
-        if connection.close_reason().is_none() {
-            return Ok((key, connection.clone()));
+    {
+        let mut connections = connections.lock().await;
+        if let Some(connection) = connections.get(&key) {
+            if connection.close_reason().is_none() {
+                return Ok((key, connection.clone()));
+            }
         }
+        connections.remove(&key);
     }
-    connections.remove(&key);
 
     let config = client_config(peer)?;
     let connecting = endpoint
@@ -796,7 +932,10 @@ async fn connection_for(
         .await
         .map_err(|_| format!("QUIC connection to {} timed out", key.addr))?
         .map_err(|error| format!("failed to connect QUIC to {}: {error}", key.addr))?;
-    connections.insert(key.clone(), connection.clone());
+    connections
+        .lock()
+        .await
+        .insert(key.clone(), connection.clone());
     Ok((key, connection))
 }
 
@@ -890,6 +1029,49 @@ mod tests {
     #[test]
     fn quic_runtime_uses_small_worker_pool() {
         assert_eq!(QUIC_WORKER_THREADS, 2);
+    }
+
+    #[test]
+    fn datagram_health_is_isolated_per_peer() {
+        let mut health = DatagramHealth::default();
+        for _ in 0..DATAGRAM_FAIL_THRESHOLD {
+            health.record_failure("peer-a");
+        }
+
+        assert!(health.should_fast_fail("peer-a"));
+        assert!(!health.should_fast_fail("peer-b"));
+
+        health.record_failure("peer-b");
+        health.record_success("peer-a");
+
+        assert!(!health.should_fast_fail("peer-a"));
+        assert_eq!(health.failure_count("peer-b"), 1);
+    }
+
+    #[test]
+    fn pending_budget_is_bounded_and_reusable() {
+        let pending = AtomicU64::new(0);
+
+        assert!(try_reserve_pending(&pending, 2));
+        assert!(try_reserve_pending(&pending, 2));
+        assert!(!try_reserve_pending(&pending, 2));
+
+        release_pending(&pending);
+        assert!(try_reserve_pending(&pending, 2));
+        assert_eq!(pending.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn bulk_streams_leave_capacity_for_priority_streams() {
+        let pending = AtomicU64::new(0);
+        for _ in 0..BULK_STREAM_QUEUE_CAP {
+            assert!(try_reserve_pending(&pending, BULK_STREAM_QUEUE_CAP));
+        }
+        assert!(!try_reserve_pending(&pending, BULK_STREAM_QUEUE_CAP));
+
+        assert!(try_reserve_pending(&pending, STREAM_QUEUE_CAP));
+        assert!(try_reserve_pending(&pending, STREAM_QUEUE_CAP));
+        assert!(!try_reserve_pending(&pending, STREAM_QUEUE_CAP));
     }
 
     #[test]

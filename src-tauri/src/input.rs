@@ -1414,6 +1414,7 @@ fn send_packet(
 ) -> bool {
     let packet_context = input_packet_context(target, event, layout_state);
     let event = packet_context.event;
+    let lossy = matches!(&event, InputEvent::MouseMove { .. });
     let packet = InputPacket {
         protocol: INPUT_PROTOCOL.into(),
         target_device_id: target.device_id.clone(),
@@ -1441,7 +1442,12 @@ fn send_packet(
         }
     };
 
-    match quic_transport.send_datagram(peer, payload) {
+    let send_result = if lossy {
+        quic_transport.send_datagram_lossy(peer, payload)
+    } else {
+        quic_transport.send_datagram(peer, payload)
+    };
+    match send_result {
         Ok(()) => {
             input_events.fetch_add(1, Ordering::Relaxed);
             true
