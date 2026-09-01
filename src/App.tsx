@@ -4,6 +4,7 @@ import {
   useEffect,
   useEffectEvent,
   useMemo,
+  useReducer,
   useRef,
   useState,
 } from "react";
@@ -176,6 +177,34 @@ type NativeFileDragPayload =
   | { type: "cancel" }
   | { type: string; paths?: string[]; position?: FileDropPosition };
 
+interface RemoteBrowseState {
+  entries: RemoteDirEntry[];
+  loading: boolean;
+  error: string | null;
+}
+
+type RemoteBrowseAction =
+  | { type: "reset" }
+  | { type: "start" }
+  | { type: "success"; entries: RemoteDirEntry[] }
+  | { type: "failure"; error: string };
+
+function remoteBrowseReducer(
+  state: RemoteBrowseState,
+  action: RemoteBrowseAction,
+): RemoteBrowseState {
+  switch (action.type) {
+    case "reset":
+      return { entries: [], loading: false, error: null };
+    case "start":
+      return { ...state, loading: true, error: null };
+    case "success":
+      return { entries: action.entries, loading: false, error: null };
+    case "failure":
+      return { entries: [], loading: false, error: action.error };
+  }
+}
+
 function App() {
   const [snapshot, setSnapshot] = useState<AppStateSnapshot | null>(null);
   const [dragState, setDragState] = useState<DragState | null>(null);
@@ -237,11 +266,14 @@ function App() {
   const [syncFilter, setSyncFilter] = useState<"all" | "clipboard" | "file">("all");
   const [remoteBrowseDeviceId, setRemoteBrowseDeviceId] = useState<string>("");
   const [remoteBrowsePath, setRemoteBrowsePath] = useState<string>("");
-  const [remoteBrowseEntries, setRemoteBrowseEntries] = useState<RemoteDirEntry[]>(
-    [],
-  );
-  const [remoteBrowseLoading, setRemoteBrowseLoading] = useState(false);
-  const [remoteBrowseError, setRemoteBrowseError] = useState<string | null>(null);
+  const [remoteBrowseState, dispatchRemoteBrowse] = useReducer(remoteBrowseReducer, {
+    entries: [],
+    loading: false,
+    error: null,
+  });
+  const remoteBrowseEntries = remoteBrowseState.entries;
+  const remoteBrowseLoading = remoteBrowseState.loading;
+  const remoteBrowseError = remoteBrowseState.error;
   const [remoteBrowsePulling, setRemoteBrowsePulling] = useState(false);
   const [remotePullMessage, setRemotePullMessage] = useState<string | null>(null);
   const [isCapturingEdgeSwitchHotkey, setIsCapturingEdgeSwitchHotkey] =
@@ -703,13 +735,11 @@ function App() {
 
   useEffect(() => {
     if (currentTab !== "files" || remoteBrowseDeviceId === "") {
-      setRemoteBrowseEntries([]);
-      setRemoteBrowseError(null);
+      dispatchRemoteBrowse({ type: "reset" });
       return;
     }
     let cancelled = false;
-    setRemoteBrowseLoading(true);
-    setRemoteBrowseError(null);
+    dispatchRemoteBrowse({ type: "start" });
     const fetchDir = async () => {
       try {
         const entries = await listRemoteDirectory(
@@ -717,16 +747,11 @@ function App() {
           remoteBrowsePath,
         );
         if (!cancelled) {
-          setRemoteBrowseEntries(entries);
+          dispatchRemoteBrowse({ type: "success", entries });
         }
       } catch (error) {
         if (!cancelled) {
-          setRemoteBrowseEntries([]);
-          setRemoteBrowseError(String(error));
-        }
-      } finally {
-        if (!cancelled) {
-          setRemoteBrowseLoading(false);
+          dispatchRemoteBrowse({ type: "failure", error: String(error) });
         }
       }
     };
