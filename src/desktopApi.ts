@@ -280,6 +280,14 @@ export async function openLogDirectory(): Promise<void> {
   await invoke('open_log_directory')
 }
 
+export async function clearLog(): Promise<void> {
+  if (!isTauri()) {
+    return
+  }
+
+  await invoke('clear_log')
+}
+
 export async function stopRuntime(): Promise<RuntimeStatus> {
   if (!isTauri()) {
     browserRuntime = FALLBACK_RUNTIME

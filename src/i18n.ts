@@ -214,6 +214,7 @@ export const TEXT = {
       filterFile: "文件",
       to: "发送到",
       refresh: "刷新",
+      clearLog: "清除日志",
     },
     remoteFiles: {
       title: "远程文件",
@@ -521,6 +522,7 @@ export const TEXT = {
       filterFile: "File",
       to: "Sent to",
       refresh: "Refresh",
+      clearLog: "Clear Log",
     },
     remoteFiles: {
       title: "Remote Files",

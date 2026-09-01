@@ -2573,6 +2573,8 @@
 .log-action-btn{padding:4px 10px;font-size:11px;font-weight:600;border:1px solid var(--border,rgba(63,63,70,.5));border-radius:6px;background:transparent;color:var(--text-secondary,#a1a1aa);cursor:pointer;transition:all .15s;white-space:nowrap}
 .log-action-btn:hover{background:rgba(255,255,255,.06);color:var(--text-primary,#fafafa)}
 .log-action-btn.active{background:var(--accent,#2f7af8);border-color:var(--accent,#2f7af8);color:#fff}
+.log-action-btn.log-action-danger{color:#f87171;border-color:rgba(248,113,113,.35)}
+.log-action-btn.log-action-danger:hover{background:rgba(248,113,113,.12);color:#f87171}
 .log-container{flex:1 1 0;min-height:200px;max-height:calc(100vh - 220px);overflow-y:auto;overflow-x:hidden;background:#0d0d0f;border-left:1px solid var(--border,rgba(63,63,70,.5));border-right:1px solid var(--border,rgba(63,63,70,.5));padding:4px 0;font-family:"Cascadia Code","JetBrains Mono","Fira Code",Consolas,monospace;font-size:12px;line-height:1.65}
 .log-container::-webkit-scrollbar{width:6px}
 .log-container::-webkit-scrollbar-track{background:transparent}

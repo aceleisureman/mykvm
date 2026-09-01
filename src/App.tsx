@@ -13,6 +13,7 @@ import type { Theme } from "@tauri-apps/api/window";
 import "./App.css";
 import {
   checkForAppUpdate,
+  clearLog,
   confirmLanPairing,
   dismissPairingRequest,
   hideMainWindow,
@@ -990,6 +991,27 @@ function App() {
       );
     } finally {
       setIsDiagnosticPending(false);
+    }
+  }
+
+  async function handleClearLog() {
+    setErrorMessage(null);
+
+    try {
+      await clearLog();
+      setSyncRecords([]);
+      setLogLines([]);
+      if (currentTab === "sync") {
+        const records = await readSyncHistory(200);
+        setSyncRecords(records);
+      } else if (currentTab === "logs") {
+        const lines = await readLogLines(LOG_MAX_LINES);
+        setLogLines(lines);
+      }
+    } catch (error: unknown) {
+      setErrorMessage(
+        error instanceof Error ? error.message : ui.errors.updateRuntime,
+      );
     }
   }
 
@@ -3226,6 +3248,10 @@ function App() {
                 onClick={() => { void readSyncHistory(200).then(setSyncRecords); }}>
                 {"\u21BB"} {ui.syncHistory.refresh}
               </button>
+              <button type="button" className="log-action-btn log-action-danger"
+                onClick={() => { void handleClearLog(); }}>
+                {"\u2715"} {ui.syncHistory.clearLog}
+              </button>
             </div>
           </div>
           <div className="sync-history-list log-container">
@@ -3472,6 +3498,10 @@ function App() {
                 <button type="button" className="log-action-btn"
                   onClick={() => void openLogDirectory()}>
                   {"\u2197"} {ui.logs.openLogDir}
+                </button>
+                <button type="button" className="log-action-btn log-action-danger"
+                  onClick={() => { void handleClearLog(); }}>
+                  {"\u2715"} {ui.logs.clear}
                 </button>
               </div>
             </div>

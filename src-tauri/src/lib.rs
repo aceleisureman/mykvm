@@ -1523,6 +1523,42 @@ fn open_log_directory(app: AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn clear_log(app: AppHandle) -> Result<(), String> {
+    let log_dir = app
+        .path()
+        .app_log_dir()
+        .map_err(|error| format!("failed to resolve log directory: {error}"))?;
+    fs::create_dir_all(&log_dir).map_err(|error| {
+        format!(
+            "failed to create log directory {}: {error}",
+            log_dir.display()
+        )
+    })?;
+    let log_file = log_dir.join("mykvm.log");
+    // Truncate instead of deleting: the log plugin keeps an append handle on
+    // this file, so removing it would leave new records written to an
+    // orphaned inode until the app restarts.
+    fs::write(&log_file, b"").map_err(|error| {
+        format!(
+            "failed to clear log file {}: {error}",
+            log_file.display()
+        )
+    })?;
+    // Best-effort removal of rotated archives; the plugin only keeps an open
+    // handle on the active mykvm.log, so archived mykvm_*.log files are safe
+    // to delete.
+    if let Ok(entries) = fs::read_dir(&log_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with("mykvm_") && name.ends_with(".log") {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
 fn save_layout(
     layout: LayoutState,
     state: tauri::State<'_, AppRuntime>,
@@ -3812,6 +3848,7 @@ pub fn run() {
             read_sync_history,
             read_log_lines,
             open_log_directory,
+            clear_log,
             save_layout,
             start_runtime,
             stop_runtime,
