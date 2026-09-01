@@ -6,6 +6,7 @@ export const TEXT = {
       settings: "设置",
       logs: "日志",
       sync: "同步记录",
+      files: "远程文件",
     },
     roles: {
       server: "服务端",
@@ -196,6 +197,25 @@ export const TEXT = {
       to: "发送到",
       refresh: "刷新",
     },
+    remoteFiles: {
+      title: "远程文件",
+      subtitle: "浏览并拉取已配对客户端上的文件。",
+      selectDevice: "选择设备",
+      noPairedDevices: "暂无可浏览的已配对设备。",
+      root: "根目录",
+      folder: "文件夹",
+      file: "文件",
+      loading: "加载中…",
+      empty: "此目录为空。",
+      listFailed: "读取目录失败。",
+      pull: "拉取",
+      pulling: "拉取中…",
+      pullDone: "拉取完成：{count} 个文件，共 {size}。",
+      pullFailed: "拉取失败。",
+      modified: "修改于",
+      selectHint: "点击文件可拉取；点击文件夹进入。",
+      sizeUnknown: "—",
+    },
     layout: {
       eyebrow: "Device layout",
       title: "显示器布局",
@@ -265,6 +285,7 @@ export const TEXT = {
       settings: "Settings",
       logs: "Logs",
       sync: "Sync",
+      files: "Remote Files",
     },
     roles: {
       server: "Server",
@@ -457,6 +478,25 @@ export const TEXT = {
       to: "Sent to",
       refresh: "Refresh",
     },
+    remoteFiles: {
+      title: "Remote Files",
+      subtitle: "Browse and pull files from paired clients.",
+      selectDevice: "Select device",
+      noPairedDevices: "No paired devices to browse yet.",
+      root: "Root",
+      folder: "Folder",
+      file: "File",
+      loading: "Loading…",
+      empty: "This directory is empty.",
+      listFailed: "Failed to read directory.",
+      pull: "Pull",
+      pulling: "Pulling…",
+      pullDone: "Pull complete: {count} file(s), {size} total.",
+      pullFailed: "Pull failed.",
+      modified: "Modified",
+      selectHint: "Click a file to pull it; click a folder to enter it.",
+      sizeUnknown: "—",
+    },
     layout: {
       eyebrow: "Device layout",
       title: "Display Layout",
@@ -522,4 +562,3 @@ export const TEXT = {
 } as const;
 
 export type AppText = (typeof TEXT)[keyof typeof TEXT];
-

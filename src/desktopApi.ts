@@ -39,6 +39,13 @@ export interface FileTransferSummary {
   byteCount: number
 }
 
+export interface RemoteDirEntry {
+  name: string
+  path: string
+  isDir: boolean
+  size: number
+  modifiedMs: number
+}
 
 // ponytail: static stopped-state stub so `npm run dev` in a plain browser still
 // renders the layout editor; the real runtime lives in the Tauri backend.
@@ -324,7 +331,31 @@ export async function sendFilesToDevice(deviceId: string, paths: string[]): Prom
   return invoke<FileTransferSummary>('send_files_to_device', { deviceId, paths })
 }
 
+export async function listRemoteDirectory(
+  deviceId: string,
+  path: string,
+): Promise<RemoteDirEntry[]> {
+  if (!isTauri()) {
+    return []
+  }
 
+  return invoke<RemoteDirEntry[]>('list_remote_directory', { deviceId, path })
+}
+
+export async function pullRemoteFiles(
+  deviceId: string,
+  paths: string[],
+): Promise<FileTransferSummary> {
+  if (!isTauri()) {
+    return {
+      targetName: 'Desktop fallback',
+      fileCount: paths.length,
+      byteCount: 0,
+    }
+  }
+
+  return invoke<FileTransferSummary>('pull_remote_files', { deviceId, paths })
+}
 
 export async function relaunchApp(): Promise<void> {
   if (!isTauri()) {
@@ -454,4 +485,3 @@ export async function installAppUpdate(): Promise<void> {
   }
   await relaunch()
 }
-

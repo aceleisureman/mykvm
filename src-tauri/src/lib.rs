@@ -41,8 +41,8 @@ const TRANSPORT_PORT_MAX: u16 = 65_535;
 // ports starting from the configured base, so two peers that landed on different
 // ports (e.g. 47833 and 47834) still reach each other.
 const DISCOVERY_PORT_SPAN: u16 = 8;
-const REPOSITORY_URL: &str = "https://github.com/XxMinor/mykvm";
-const RELEASES_URL: &str = "https://github.com/XxMinor/mykvm/releases/latest";
+const REPOSITORY_URL: &str = "https://github.com/aceleisureman/mykvm";
+const RELEASES_URL: &str = "https://github.com/aceleisureman/mykvm/releases/latest";
 const DISCOVERY_PROTOCOL: &str = "mykvm.discovery.v1";
 // UDP discovery is a heartbeat, not the transport itself. Keep peers through
 // short announce gaps so online clients do not flicker offline in the UI.
@@ -63,6 +63,7 @@ const CLIPBOARD_RETRY_INTERVAL_MS: u64 = 2000;
 const CLIPBOARD_WRITE_ATTEMPTS: usize = 5;
 const CLIPBOARD_WRITE_RETRY_DELAY_MS: u64 = 30;
 const FILE_TRANSFER_PROTOCOL: &str = "mykvm.file-transfer.v1";
+const REMOTE_FILE_PROTOCOL: &str = "mykvm.remote-file.v1";
 const FILE_TRANSFER_CHUNK_BYTES: usize = 256 * 1024;
 const FILE_TRANSFER_MAX_FILE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const LOG_MAX_FILE_SIZE_BYTES: u128 = 1024 * 1024;
@@ -468,6 +469,47 @@ struct FileTransferSummary {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct RemoteFilePacket {
+    protocol: String,
+    kind: String,
+    request_id: String,
+    origin_id: String,
+    target_id: String,
+    cluster_id: String,
+    pair_secret: String,
+    path: String,
+    #[serde(default)]
+    file_paths: Vec<String>,
+    #[serde(default)]
+    entries: Vec<RemoteDirEntry>,
+    #[serde(default)]
+    file_count: u64,
+    #[serde(default)]
+    byte_count: u64,
+    #[serde(default)]
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RemoteDirEntry {
+    name: String,
+    path: String,
+    is_dir: bool,
+    size: u64,
+    modified_ms: u64,
+}
+
+#[derive(Debug)]
+struct RemoteFileResponse {
+    entries: Vec<RemoteDirEntry>,
+    file_count: u64,
+    byte_count: u64,
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct FileTransferPacket {
     protocol: String,
     kind: String,
@@ -515,6 +557,8 @@ struct AppRuntime {
     screen_switch_request: Arc<Mutex<Option<input::SwitchDirection>>>,
     screen_switch_shortcuts: Mutex<ScreenSwitchHotkeys>,
     config_path: PathBuf,
+    remote_file_transport: Arc<Mutex<Option<quic_transport::TransportHandle>>>,
+    remote_file_pending: Arc<Mutex<HashMap<String, tokio::sync::oneshot::Sender<RemoteFileResponse>>>>,
 }
 
 impl AppRuntime {
@@ -553,6 +597,8 @@ impl AppRuntime {
             screen_switch_request: Arc::new(Mutex::new(None)),
             screen_switch_shortcuts: Mutex::new(empty_screen_switch_hotkeys()),
             config_path,
+            remote_file_transport: Arc::new(Mutex::new(None)),
+            remote_file_pending: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -710,6 +756,8 @@ impl AppRuntime {
         let pairing_challenge_for_stream = Arc::clone(&self.pairing_challenge);
         let config_path_for_pairing = self.config_path.clone();
         let peers_for_pairing = Arc::clone(&self.peers);
+        let remote_file_transport_for_stream = Arc::clone(&self.remote_file_transport);
+        let remote_file_pending_for_stream = Arc::clone(&self.remote_file_pending);
 
         let on_datagram = Arc::new(move |payload: Vec<u8>, source| {
             if !input_receive_enabled.load(Ordering::Relaxed) {
@@ -765,6 +813,18 @@ impl AppRuntime {
                 return true;
             }
 
+            if handle_remote_file_packet(
+                &payload,
+                &layout,
+                &current_peer.id,
+                &remote_file_transport_for_stream,
+                &peers_for_pairing,
+                &remote_file_pending_for_stream,
+            ) {
+                transport_packets_for_stream.fetch_add(1, Ordering::Relaxed);
+                return true;
+            }
+
             if !clipboard_receive_enabled.load(Ordering::Relaxed) {
                 return false;
             }
@@ -795,6 +855,9 @@ impl AppRuntime {
             .lock()
             .map_err(|_| "QUIC transport lock poisoned".to_string())?;
         *stored = Some(transport.clone());
+        if let Ok(mut shared_transport) = self.remote_file_transport.lock() {
+            *shared_transport = Some(transport.clone());
+        }
         Ok(transport)
     }
 
@@ -1209,6 +1272,160 @@ fn read_diagnostic_info(
     state: tauri::State<'_, AppRuntime>,
 ) -> Result<DiagnosticInfo, String> {
     diagnostic_info(&app, state.inner())
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SyncRecord {
+    timestamp: String,
+    kind: String,
+    direction: String,
+    target: String,
+    content_type: String,
+    preview: String,
+    detail: String,
+}
+
+#[tauri::command]
+async fn read_sync_history(app: AppHandle, count: Option<usize>) -> Result<Vec<SyncRecord>, String> {
+    let log_dir = app
+        .path()
+        .app_log_dir()
+        .map_err(|e| format!("failed to resolve log dir: {e}"))?;
+    let log_file = log_dir.join("mykvm.log");
+    tokio::task::spawn_blocking(move || -> Result<Vec<SyncRecord>, String> {
+        if !log_file.exists() {
+            return Ok(vec![]);
+        }
+        let content = fs::read_to_string(&log_file)
+            .map_err(|e| format!("failed to read log file: {e}"))?;
+        let mut records: Vec<SyncRecord> = Vec::new();
+        for line in content.lines() {
+            if let Some(rec) = parse_sync_line(line) {
+                records.push(rec);
+            }
+        }
+        let max = count.unwrap_or(100);
+        let start = if records.len() > max { records.len() - max } else { 0 };
+        Ok(records[start..].to_vec())
+    })
+    .await
+    .map_err(|e| format!("sync history task failed: {e}"))?
+}
+
+fn parse_sync_line(line: &str) -> Option<SyncRecord> {
+    let ts = line.get(1..20)?.to_string();
+    if line.contains("sync:clipboard:sent") {
+        let to = extract_kv(line, "to=");
+        let content_raw = extract_kv(line, "content=");
+        let (ct, preview) = split_content_field(&content_raw);
+        Some(SyncRecord {
+            timestamp: ts,
+            kind: "clipboard".into(),
+            direction: "sent".into(),
+            target: to,
+            content_type: ct,
+            preview,
+            detail: String::new(),
+        })
+    } else if line.contains("sync:clipboard:received") {
+        let from = extract_kv(line, "from=");
+        let content_raw = extract_kv(line, "content=");
+        let (ct, preview) = split_content_field(&content_raw);
+        Some(SyncRecord {
+            timestamp: ts,
+            kind: "clipboard".into(),
+            direction: "received".into(),
+            target: from,
+            content_type: ct,
+            preview,
+            detail: String::new(),
+        })
+    } else if line.contains("sync:file:sent") {
+        let to = extract_kv(line, "to=");
+        let files = extract_kv(line, "files=");
+        let bytes = extract_kv(line, "bytes=");
+        let detail = format!("{} files, {} bytes", files, bytes);
+        Some(SyncRecord {
+            timestamp: ts,
+            kind: "file".into(),
+            direction: "sent".into(),
+            target: to,
+            content_type: "file".into(),
+            preview: String::new(),
+            detail,
+        })
+    } else if line.contains("received file transfer") {
+        let rest = line
+            .split("received file transfer ")
+            .nth(1)
+            .unwrap_or("")
+            .trim();
+        let parts: Vec<&str> = rest.splitn(2, ' ').collect();
+        let file_name = parts.first().unwrap_or(&"").to_string();
+        let detail = parts.get(1).unwrap_or(&"").to_string();
+        Some(SyncRecord {
+            timestamp: ts,
+            kind: "file".into(),
+            direction: "received".into(),
+            target: String::new(),
+            content_type: "file".into(),
+            preview: file_name,
+            detail,
+        })
+    } else {
+        None
+    }
+}
+
+fn extract_kv(line: &str, key: &str) -> String {
+    let Some(start) = line.find(key) else { return String::new() };
+    let rest = &line[start + key.len()..];
+    if let Some(pos) = rest
+        .find(" content=")
+        .or_else(|| rest.find(" files="))
+        .or_else(|| rest.find(" bytes="))
+    {
+        rest[..pos].to_string()
+    } else {
+        rest.trim().to_string()
+    }
+}
+
+fn split_content_field(raw: &str) -> (String, String) {
+    if raw.starts_with("text:") {
+        ("text".into(), raw[5..].to_string())
+    } else if raw == "image" {
+        ("image".into(), String::new())
+    } else {
+        ("unknown".into(), raw.to_string())
+    }
+}
+
+#[tauri::command]
+async fn read_log_lines(app: AppHandle, count: Option<usize>) -> Result<Vec<String>, String> {
+    let log_dir = app
+        .path()
+        .app_log_dir()
+        .map_err(|error| format!("failed to resolve log dir: {error}"))?;
+    let log_file = log_dir.join("mykvm.log");
+    tokio::task::spawn_blocking(move || -> Result<Vec<String>, String> {
+        if !log_file.exists() {
+            return Ok(vec![]);
+        }
+        let content = fs::read_to_string(&log_file)
+            .map_err(|error| format!("failed to read log file: {error}"))?;
+        let lines: Vec<String> = content.lines().map(String::from).collect();
+        let max_lines = count.unwrap_or(200);
+        let start = if lines.len() > max_lines {
+            lines.len() - max_lines
+        } else {
+            0
+        };
+        Ok(lines[start..].to_vec())
+    })
+    .await
+    .map_err(|error| format!("log lines task failed: {error}"))?
 }
 
 #[tauri::command]
@@ -2102,10 +2319,135 @@ fn send_files_to_device(
         byte_count = byte_count.saturating_add(file.total_bytes);
     }
 
+    log::info!(
+        "sync:file:sent to={} files={} bytes={}",
+        target.name,
+        file_count,
+        byte_count
+    );
     Ok(FileTransferSummary {
         target_name: target.name,
         file_count,
         byte_count,
+    })
+}
+
+const REMOTE_FILE_REQUEST_TIMEOUT_SECS: u64 = 10;
+
+#[tauri::command]
+async fn list_remote_directory(
+    device_id: String,
+    path: String,
+    state: tauri::State<'_, AppRuntime>,
+) -> Result<Vec<RemoteDirEntry>, String> {
+    let state = state.inner();
+    state.start_discovery()?;
+    let layout = state.layout_snapshot();
+    if !layout.file_transfer_enabled {
+        return Err("文件传输未开启。".into());
+    }
+    let mut local_peer = local_peer_from_layout(&layout);
+    let quic_transport = state
+        .quic_transport_handle()
+        .ok_or_else(|| "QUIC transport is not ready; start the runtime first.".to_string())?;
+    apply_transport_to_peer(&mut local_peer, &quic_transport);
+
+    let peers = active_peer_snapshot(&state.peers);
+    let target = file_transfer_target_for_device(&layout, &peers, &device_id)?;
+    let request_id = format!("remote-list-{}-{}", now_ms(), random_hex(6));
+    let (sender, receiver) = tokio::sync::oneshot::channel::<RemoteFileResponse>();
+    {
+        let mut pending = state
+            .remote_file_pending
+            .lock()
+            .map_err(|_| "remote file pending lock poisoned".to_string())?;
+        pending.insert(request_id.clone(), sender);
+    }
+
+    let request = remote_file_packet(
+        "list",
+        &request_id,
+        &local_peer.id,
+        &target,
+        path,
+        Vec::new(),
+        Vec::new(),
+        0,
+        0,
+        None,
+    );
+    send_remote_file_packet(&quic_transport, &target, request)?;
+
+    let response = tokio::time::timeout(Duration::from_secs(REMOTE_FILE_REQUEST_TIMEOUT_SECS), receiver)
+        .await
+        .map_err(|_| "远程目录列表超时。".to_string())?
+        .map_err(|_| "远程目录列表请求被取消。".to_string())?;
+    if let Some(error) = response.error {
+        return Err(error);
+    }
+    Ok(response.entries)
+}
+
+const REMOTE_PULL_TIMEOUT_SECS: u64 = 300;
+
+#[tauri::command]
+async fn pull_remote_files(
+    device_id: String,
+    paths: Vec<String>,
+    state: tauri::State<'_, AppRuntime>,
+) -> Result<FileTransferSummary, String> {
+    let state = state.inner();
+    if paths.is_empty() {
+        return Err("请选择要拉取的文件。".into());
+    }
+    state.start_discovery()?;
+    let layout = state.layout_snapshot();
+    if !layout.file_transfer_enabled {
+        return Err("文件传输未开启。".into());
+    }
+    let mut local_peer = local_peer_from_layout(&layout);
+    let quic_transport = state
+        .quic_transport_handle()
+        .ok_or_else(|| "QUIC transport is not ready; start the runtime first.".to_string())?;
+    apply_transport_to_peer(&mut local_peer, &quic_transport);
+
+    let peers = active_peer_snapshot(&state.peers);
+    let target = file_transfer_target_for_device(&layout, &peers, &device_id)?;
+    let request_id = format!("remote-pull-{}-{}", now_ms(), random_hex(6));
+    let (sender, receiver) = tokio::sync::oneshot::channel::<RemoteFileResponse>();
+    {
+        let mut pending = state
+            .remote_file_pending
+            .lock()
+            .map_err(|_| "remote file pending lock poisoned".to_string())?;
+        pending.insert(request_id.clone(), sender);
+    }
+
+    let request = remote_file_packet(
+        "pull",
+        &request_id,
+        &local_peer.id,
+        &target,
+        String::new(),
+        paths,
+        Vec::new(),
+        0,
+        0,
+        None,
+    );
+    send_remote_file_packet(&quic_transport, &target, request)?;
+
+    let response = tokio::time::timeout(Duration::from_secs(REMOTE_PULL_TIMEOUT_SECS), receiver)
+        .await
+        .map_err(|_| "远程文件拉取超时。".to_string())?
+        .map_err(|_| "远程文件拉取请求被取消。".to_string())?;
+    if let Some(error) = response.error {
+        return Err(error);
+    }
+    Ok(FileTransferSummary {
+        target_name: target.name,
+        file_count: response.file_count as usize,
+        byte_count: response.byte_count,
     })
 }
 
@@ -2912,6 +3254,8 @@ pub fn run() {
             load_app_state,
             read_runtime_status,
             read_diagnostic_info,
+            read_sync_history,
+            read_log_lines,
             open_log_directory,
             save_layout,
             start_runtime,
@@ -2934,6 +3278,8 @@ pub fn run() {
             uninstall_input_service,
             send_secure_attention,
             send_files_to_device,
+            list_remote_directory,
+            pull_remote_files,
             sync_window_chrome,
             minimize_main_window,
             hide_main_window,
@@ -4592,6 +4938,16 @@ fn run_clipboard_sync(
         }
 
         sequence = sequence.saturating_add(1);
+        let clip_preview = match &content {
+            ClipboardContent::Text(text) => {
+                if text.len() > 60 {
+                    format!("text:{:.60}...", text)
+                } else {
+                    format!("text:{}", text)
+                }
+            }
+            ClipboardContent::Image(_) => "image".to_string(),
+        };
         let packet = clipboard_packet_from_content(
             content,
             local_peer_id.clone(),
@@ -4612,6 +4968,7 @@ fn run_clipboard_sync(
             if send_result.is_ok() {
                 transport_packets.fetch_add(1, Ordering::Relaxed);
                 clipboard_packets.fetch_add(1, Ordering::Relaxed);
+                log::info!("sync:clipboard:sent to={} content={}", target.device_id, clip_preview);
                 last_failed = None;
                 last_sent = Some((target.device_id, target.addr, signature));
             } else {
@@ -4737,6 +5094,7 @@ where
     }
 
     let accepted_sequence = clipboard_packet_sequence(&packet);
+    let packet_origin_id = packet.origin_id.clone();
     let content = clipboard_content_from_packet(packet);
 
     let Some(content) = content else {
@@ -4756,6 +5114,21 @@ where
     };
 
     if written {
+        let recv_preview = match &content {
+            ClipboardContent::Text(text) => {
+                if text.len() > 60 {
+                    format!("text:{:.60}...", text)
+                } else {
+                    format!("text:{}", text)
+                }
+            }
+            ClipboardContent::Image(_) => "image".to_string(),
+        };
+        log::info!(
+            "sync:clipboard:received from={} content={}",
+            packet_origin_id,
+            recv_preview
+        );
         if let Some((origin_id, sequence)) = accepted_sequence {
             remember_clipboard_packet_sequence(clipboard_last_sequences, origin_id, sequence);
         }
@@ -5409,6 +5782,341 @@ fn file_transfer_packet_targets_local(
         .devices
         .iter()
         .any(|device| device.role == "local" && device.id == packet.target_id)
+}
+
+fn remote_file_packet_authorized(layout: &LayoutState, packet: &RemoteFilePacket) -> bool {
+    if layout.cluster_id.trim().is_empty()
+        || layout.pair_secret.trim().is_empty()
+        || packet.cluster_id != layout.cluster_id
+        || packet.pair_secret != layout.pair_secret
+    {
+        return false;
+    }
+
+    if layout.machine_role == "client" && !layout.paired_controllers.is_empty() {
+        return layout
+            .paired_controllers
+            .iter()
+            .any(|controller| controller.id == packet.origin_id);
+    }
+
+    true
+}
+
+fn remote_file_packet_targets_local(
+    layout: &LayoutState,
+    packet: &RemoteFilePacket,
+    local_peer_id: &str,
+) -> bool {
+    if packet.target_id.trim().is_empty() || packet.target_id == local_peer_id {
+        return true;
+    }
+
+    layout
+        .devices
+        .iter()
+        .any(|device| device.role == "local" && device.id == packet.target_id)
+}
+
+fn home_directory() -> Option<PathBuf> {
+    #[cfg(target_os = "windows")]
+    let candidate = std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOMEDRIVE").zip(std::env::var_os("HOMEPATH"))
+            .map(|(drive, path)| {
+                let mut combined = drive.into_string().unwrap_or_default();
+                combined.push_str(&path.into_string().unwrap_or_default());
+                std::ffi::OsString::from(combined)
+            }));
+    #[cfg(not(target_os = "windows"))]
+    let candidate = std::env::var_os("HOME");
+
+    candidate.map(PathBuf::from).filter(|path| path.is_dir())
+}
+
+fn enumerate_remote_directory(path: &str) -> Result<Vec<RemoteDirEntry>, String> {
+    let trimmed = path.trim();
+    let directory = if trimmed.is_empty() {
+        home_directory()
+            .ok_or_else(|| "无法解析用户主目录，请直接输入路径。".to_string())?
+    } else {
+        PathBuf::from(trimmed)
+    };
+    let read_dir = fs::read_dir(&directory)
+        .map_err(|error| format!("无法读取目录 {}: {error}", directory.display()))?;
+    let mut entries = Vec::new();
+    for entry in read_dir {
+        let entry = entry.map_err(|error| format!("读取目录条目失败: {error}"))?;
+        let metadata = entry
+            .metadata()
+            .map_err(|error| format!("读取目录条目元数据失败: {error}"))?;
+        let is_dir = metadata.is_dir();
+        let size = if is_dir { 0 } else { metadata.len() };
+        let modified_ms = metadata
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+            .map(|duration| duration.as_millis() as u64)
+            .unwrap_or(0);
+        entries.push(RemoteDirEntry {
+            name: entry.file_name().to_string_lossy().into_owned(),
+            path: entry.path().to_string_lossy().into_owned(),
+            is_dir,
+            size,
+            modified_ms,
+        });
+    }
+    entries.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(entries)
+}
+
+fn remote_file_packet(
+    kind: &str,
+    request_id: &str,
+    origin_id: &str,
+    target: &FileTransferTarget,
+    path: String,
+    file_paths: Vec<String>,
+    entries: Vec<RemoteDirEntry>,
+    file_count: u64,
+    byte_count: u64,
+    error: Option<String>,
+) -> RemoteFilePacket {
+    RemoteFilePacket {
+        protocol: REMOTE_FILE_PROTOCOL.into(),
+        kind: kind.into(),
+        request_id: request_id.into(),
+        origin_id: origin_id.into(),
+        target_id: target.device_id.clone(),
+        cluster_id: target.cluster_id.clone(),
+        pair_secret: target.pair_secret.clone(),
+        path,
+        file_paths,
+        entries,
+        file_count,
+        byte_count,
+        error,
+    }
+}
+
+fn send_remote_file_packet(
+    quic_transport: &quic_transport::TransportHandle,
+    target: &FileTransferTarget,
+    packet: RemoteFilePacket,
+) -> Result<(), String> {
+    let payload = encode_wire_packet(&packet)?;
+    let peer = quic_transport.peer(
+        target.addr.clone(),
+        target.transport_public_key.clone(),
+        target.protocol_version,
+    );
+    quic_transport
+        .send_stream_expect_ack(peer, payload)
+        .map_err(|error| format!("远程文件指令发送失败: {error}"))
+}
+
+/// Resolves the target (the requester) and returns `(target, remote_transport)`
+/// used by the client-side `list`/`pull` handlers to reply back.
+fn remote_file_target_for_origin(
+    layout: &LayoutState,
+    peers: &[LanPeer],
+    origin_id: &str,
+) -> Result<FileTransferTarget, String> {
+    file_transfer_target_for_device(layout, peers, origin_id)
+}
+
+fn resolve_remote_file_pending(
+    packet: RemoteFilePacket,
+    pending: &Arc<Mutex<HashMap<String, tokio::sync::oneshot::Sender<RemoteFileResponse>>>>,
+) -> bool {
+    if packet.request_id.trim().is_empty() {
+        return false;
+    }
+    let Some(sender) = pending
+        .lock()
+        .ok()
+        .and_then(|mut map| map.remove(&packet.request_id))
+    else {
+        return false;
+    };
+    let _ = sender.send(RemoteFileResponse {
+        entries: packet.entries,
+        file_count: packet.file_count,
+        byte_count: packet.byte_count,
+        error: packet.error,
+    });
+    true
+}
+
+/// Client-side handler for a `list` request: enumerate the directory on a
+/// blocking worker and send a `listResult` back to the requester.
+fn handle_remote_list_request(
+    packet: RemoteFilePacket,
+    layout: &LayoutState,
+    local_peer_id: &str,
+    remote_file_transport: &Arc<Mutex<Option<quic_transport::TransportHandle>>>,
+    peers: &Arc<Mutex<Vec<LanPeer>>>,
+) -> bool {
+    let peers_snapshot = active_peer_snapshot(peers);
+    let Ok(target) = remote_file_target_for_origin(layout, &peers_snapshot, &packet.origin_id) else {
+        return false;
+    };
+    let Some(transport) = remote_file_transport
+        .lock()
+        .ok()
+        .and_then(|transport| transport.clone())
+    else {
+        return false;
+    };
+    let request_id = packet.request_id.clone();
+    let path = packet.path.clone();
+    let origin_id = packet.origin_id.clone();
+    let target_for_reply = target.clone();
+    let local_peer_id_owned = local_peer_id.to_string();
+    tauri::async_runtime::spawn_blocking(move || {
+        let (entries, error) = match enumerate_remote_directory(&path) {
+            Ok(entries) => (entries, None),
+            Err(message) => (Vec::new(), Some(message)),
+        };
+        let reply = remote_file_packet(
+            "listResult",
+            &request_id,
+            &local_peer_id_owned,
+            &target_for_reply,
+            path,
+            Vec::new(),
+            entries,
+            0,
+            0,
+            error,
+        );
+        if let Err(send_error) = send_remote_file_packet(&transport, &target_for_reply, reply) {
+            log::warn!("remote file list reply failed to={origin_id}: {send_error}");
+        }
+    });
+    true
+}
+
+/// Client-side handler for a `pull` request: read each requested file on a
+/// blocking worker, send it back over the existing file-transfer pipeline, and
+/// then send a `pullResult` with the aggregate counts.
+fn handle_remote_pull_request(
+    packet: RemoteFilePacket,
+    layout: &LayoutState,
+    local_peer_id: &str,
+    remote_file_transport: &Arc<Mutex<Option<quic_transport::TransportHandle>>>,
+    peers: &Arc<Mutex<Vec<LanPeer>>>,
+) -> bool {
+    let peers_snapshot = active_peer_snapshot(peers);
+    let Ok(target) = remote_file_target_for_origin(layout, &peers_snapshot, &packet.origin_id) else {
+        return false;
+    };
+    let Some(transport) = remote_file_transport
+        .lock()
+        .ok()
+        .and_then(|transport| transport.clone())
+    else {
+        return false;
+    };
+    let request_id = packet.request_id.clone();
+    let origin_id = packet.origin_id.clone();
+    let file_paths = packet.file_paths.clone();
+    let target_for_reply = target.clone();
+    let local_peer_id_owned = local_peer_id.to_string();
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut file_count = 0_u64;
+        let mut byte_count = 0_u64;
+        for path_value in &file_paths {
+            let path_value = path_value.trim();
+            if path_value.is_empty() {
+                continue;
+            }
+            let path = PathBuf::from(path_value);
+            let metadata = match fs::metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(_) => continue,
+            };
+            if !metadata.is_file() {
+                continue;
+            }
+            if metadata.len() > FILE_TRANSFER_MAX_FILE_BYTES {
+                log::warn!(
+                    "remote pull skipped oversized file {} ({} bytes)",
+                    path.display(),
+                    metadata.len()
+                );
+                continue;
+            }
+            let name = match transfer_file_name(&path) {
+                Ok(name) => name,
+                Err(_) => continue,
+            };
+            let file = TransferFile {
+                path,
+                name,
+                total_bytes: metadata.len(),
+            };
+            match send_transfer_file(&transport, &local_peer_id_owned, &target_for_reply, &file) {
+                Ok(_) => {
+                    file_count += 1;
+                    byte_count = byte_count.saturating_add(file.total_bytes);
+                }
+                Err(error) => {
+                    log::warn!("remote pull file {} failed: {error}", file.path.display());
+                }
+            }
+        }
+        let reply = remote_file_packet(
+            "pullResult",
+            &request_id,
+            &local_peer_id_owned,
+            &target_for_reply,
+            String::new(),
+            Vec::new(),
+            Vec::new(),
+            file_count,
+            byte_count,
+            None,
+        );
+        if let Err(send_error) = send_remote_file_packet(&transport, &target_for_reply, reply) {
+            log::warn!("remote file pull reply failed to={origin_id}: {send_error}");
+        }
+    });
+    true
+}
+
+fn handle_remote_file_packet(
+    payload: &[u8],
+    layout: &LayoutState,
+    local_peer_id: &str,
+    remote_file_transport: &Arc<Mutex<Option<quic_transport::TransportHandle>>>,
+    peers: &Arc<Mutex<Vec<LanPeer>>>,
+    pending: &Arc<Mutex<HashMap<String, tokio::sync::oneshot::Sender<RemoteFileResponse>>>>,
+) -> bool {
+    let Some(packet) = decode_wire_packet::<RemoteFilePacket>(payload) else {
+        return false;
+    };
+    if packet.protocol != REMOTE_FILE_PROTOCOL {
+        return false;
+    }
+    if !layout.file_transfer_enabled {
+        return false;
+    }
+    if !remote_file_packet_authorized(layout, &packet) {
+        return false;
+    }
+    if !remote_file_packet_targets_local(layout, &packet, local_peer_id) {
+        return false;
+    }
+    if packet.origin_id == local_peer_id {
+        return true;
+    }
+
+    match packet.kind.as_str() {
+        "list" => handle_remote_list_request(packet, layout, local_peer_id, remote_file_transport, peers),
+        "pull" => handle_remote_pull_request(packet, layout, local_peer_id, remote_file_transport, peers),
+        "listResult" | "pullResult" => resolve_remote_file_pending(packet, pending),
+        _ => false,
+    }
 }
 
 fn sanitize_transfer_file_name(name: &str) -> Option<String> {
@@ -8109,5 +8817,184 @@ mod tests {
         );
         // A non-numeric trailing segment stays part of a bare host.
         assert_eq!(split_host_port("myhost"), ("myhost".to_string(), None));
+    }
+
+    fn test_remote_file_packet(kind: &str, request_id: &str) -> RemoteFilePacket {
+        RemoteFilePacket {
+            protocol: REMOTE_FILE_PROTOCOL.into(),
+            kind: kind.into(),
+            request_id: request_id.into(),
+            origin_id: "peer-client-10-0-0-2".into(),
+            target_id: "local-device".into(),
+            cluster_id: "cluster-test".into(),
+            pair_secret: "secret-test".into(),
+            path: "/tmp".into(),
+            file_paths: Vec::new(),
+            entries: Vec::new(),
+            file_count: 0,
+            byte_count: 0,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn remote_file_packet_round_trips_through_wire_encoding() {
+        let packet = test_remote_file_packet("list", "request-1");
+        let payload = encode_wire_packet(&packet).expect("remote file packet should encode");
+        let decoded = decode_wire_packet::<RemoteFilePacket>(&payload)
+            .expect("remote file packet should decode");
+        assert_eq!(decoded.protocol, REMOTE_FILE_PROTOCOL);
+        assert_eq!(decoded.kind, "list");
+        assert_eq!(decoded.request_id, "request-1");
+        assert_eq!(decoded.origin_id, "peer-client-10-0-0-2");
+        assert_eq!(decoded.target_id, "local-device");
+        assert_eq!(decoded.cluster_id, "cluster-test");
+        assert_eq!(decoded.pair_secret, "secret-test");
+    }
+
+    #[test]
+    fn remote_file_list_result_round_trips_entries() {
+        let mut packet = test_remote_file_packet("listResult", "request-2");
+        packet.entries = vec![RemoteDirEntry {
+            name: "note.txt".into(),
+            path: "/tmp/note.txt".into(),
+            is_dir: false,
+            size: 11,
+            modified_ms: 123456,
+        }];
+        let payload = encode_wire_packet(&packet).expect("list result should encode");
+        let decoded = decode_wire_packet::<RemoteFilePacket>(&payload)
+            .expect("list result should decode");
+        assert_eq!(decoded.entries.len(), 1);
+        assert_eq!(decoded.entries[0].name, "note.txt");
+        assert_eq!(decoded.entries[0].path, "/tmp/note.txt");
+        assert!(!decoded.entries[0].is_dir);
+        assert_eq!(decoded.entries[0].size, 11);
+        assert_eq!(decoded.entries[0].modified_ms, 123456);
+    }
+
+    #[test]
+    fn enumerate_remote_directory_lists_files_and_subdirs() {
+        let root = env::temp_dir().join(format!("mykvm-remote-enum-{}", now_ms()));
+        fs::create_dir_all(&root).expect("create temp dir");
+        fs::write(root.join("a.txt"), "hello").expect("write file");
+        fs::create_dir(root.join("sub")).expect("create subdir");
+
+        let entries = enumerate_remote_directory(&root.display().to_string())
+            .expect("enumerate should succeed");
+        let mut names: Vec<&str> = entries.iter().map(|entry| entry.name.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(names, vec!["a.txt", "sub"]);
+
+        let file_entry = entries
+            .iter()
+            .find(|entry| entry.name == "a.txt")
+            .expect("file entry");
+        assert!(!file_entry.is_dir);
+        assert_eq!(file_entry.size, 5);
+        assert!(file_entry.modified_ms > 0);
+
+        let dir_entry = entries
+            .iter()
+            .find(|entry| entry.name == "sub")
+            .expect("dir entry");
+        assert!(dir_entry.is_dir);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn enumerate_remote_directory_reports_missing_path() {
+        let missing = env::temp_dir()
+            .join(format!("mykvm-remote-missing-{}", now_ms()))
+            .display()
+            .to_string();
+        assert!(enumerate_remote_directory(&missing).is_err());
+    }
+
+    #[test]
+    fn remote_file_packet_authorization_rejects_wrong_secret() {
+        let layout = test_layout();
+        let mut packet = test_remote_file_packet("list", "request-3");
+        assert!(remote_file_packet_authorized(&layout, &packet));
+
+        packet.cluster_id = "wrong-cluster".into();
+        assert!(!remote_file_packet_authorized(&layout, &packet));
+
+        let mut packet = test_remote_file_packet("pull", "request-4");
+        packet.pair_secret = "wrong-secret".into();
+        assert!(!remote_file_packet_authorized(&layout, &packet));
+    }
+
+    #[test]
+    fn remote_file_packet_targets_local_accepts_local_target() {
+        let layout = test_layout();
+        let packet = test_remote_file_packet("list", "request-5");
+        // The packet targets the local device (id matches a role=local device).
+        assert!(remote_file_packet_targets_local(&layout, &packet, "local-device"));
+        assert!(remote_file_packet_targets_local(&layout, &packet, "other-device"));
+        // A packet targeting a remote device is only local when it names us.
+        let mut remote_target = packet;
+        remote_target.target_id = "peer-client-10-0-0-2".into();
+        assert!(!remote_file_packet_targets_local(&layout, &remote_target, "local-device"));
+        assert!(remote_file_packet_targets_local(
+            &layout,
+            &remote_target,
+            "peer-client-10-0-0-2"
+        ));
+    }
+
+    #[test]
+    fn remote_file_packet_dispatch_resolves_pending_from_list_result() {
+        let layout = test_layout();
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let (sender, receiver) = tokio::sync::oneshot::channel::<RemoteFileResponse>();
+        pending
+            .lock()
+            .unwrap()
+            .insert("request-6".to_string(), sender);
+
+        let mut packet = test_remote_file_packet("listResult", "request-6");
+        packet.entries = vec![RemoteDirEntry {
+            name: "note.txt".into(),
+            path: "/tmp/note.txt".into(),
+            is_dir: false,
+            size: 11,
+            modified_ms: 123456,
+        }];
+        let payload = encode_wire_packet(&packet).expect("list result should encode");
+        let transport = Arc::new(Mutex::new(None::<quic_transport::TransportHandle>));
+        let peers = Arc::new(Mutex::new(Vec::<LanPeer>::new()));
+        assert!(handle_remote_file_packet(
+            &payload,
+            &layout,
+            "local-device",
+            &transport,
+            &peers,
+            &pending,
+        ));
+        let response = receiver.blocking_recv().expect("pending resolved");
+        assert_eq!(response.error, None);
+        assert_eq!(response.entries.len(), 1);
+        assert_eq!(response.entries[0].name, "note.txt");
+    }
+
+    #[test]
+    fn remote_file_packet_list_without_transport_does_not_panic() {
+        let layout = test_layout();
+        let packet = test_remote_file_packet("list", "request-7");
+        let payload = encode_wire_packet(&packet).expect("list should encode");
+        let transport = Arc::new(Mutex::new(None::<quic_transport::TransportHandle>));
+        let peers = Arc::new(Mutex::new(Vec::<LanPeer>::new()));
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        // No transport: the handler returns false instead of panicking.
+        assert!(!handle_remote_file_packet(
+            &payload,
+            &layout,
+            "local-device",
+            &transport,
+            &peers,
+            &pending,
+        ));
     }
 }
