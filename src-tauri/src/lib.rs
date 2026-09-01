@@ -6835,6 +6835,10 @@ fn handle_remote_list_request(
 ) -> bool {
     let peers_snapshot = active_peer_snapshot(peers);
     let Ok(target) = remote_file_target_for_origin(layout, &peers_snapshot, &packet.origin_id) else {
+        log::warn!(
+            "remote file list request rejected: cannot resolve reply target for origin={}",
+            packet.origin_id
+        );
         return false;
     };
     let Some(transport) = remote_file_transport
@@ -6842,6 +6846,7 @@ fn handle_remote_list_request(
         .ok()
         .and_then(|transport| transport.clone())
     else {
+        log::warn!("remote file list request rejected: no local QUIC transport available");
         return false;
     };
     let request_id = packet.request_id.clone();
@@ -6970,29 +6975,76 @@ fn handle_remote_file_packet(
     pending: &Arc<Mutex<HashMap<String, tokio::sync::oneshot::Sender<RemoteFileResponse>>>>,
 ) -> bool {
     let Some(packet) = decode_wire_packet::<RemoteFilePacket>(payload) else {
+        log::debug!("remote file packet ignored: not a decodable remote-file payload");
         return false;
     };
     if packet.protocol != REMOTE_FILE_PROTOCOL {
+        log::debug!(
+            "remote file packet ignored: protocol {} != {}",
+            packet.protocol,
+            REMOTE_FILE_PROTOCOL
+        );
         return false;
     }
     if !layout.file_transfer_enabled {
+        log::warn!("remote file packet rejected: file transfer is disabled on this device");
         return false;
     }
     if !remote_file_packet_authorized(layout, &packet) {
+        log::warn!(
+            "remote file packet rejected: unauthorized kind={} origin={} cluster_match={} role={}",
+            packet.kind,
+            packet.origin_id,
+            packet.cluster_id == layout.cluster_id && packet.pair_secret == layout.pair_secret,
+            layout.machine_role,
+        );
         return false;
     }
     if !remote_file_packet_targets_local(layout, &packet, local_peer_id) {
+        log::warn!(
+            "remote file packet rejected: not targeted at local device target_id={} local={}",
+            packet.target_id,
+            local_peer_id
+        );
         return false;
     }
     if packet.origin_id == local_peer_id {
+        log::debug!("remote file packet ignored: origin is the local device");
         return true;
     }
 
     match packet.kind.as_str() {
-        "list" => handle_remote_list_request(packet, layout, local_peer_id, remote_file_transport, peers),
-        "pull" => handle_remote_pull_request(packet, layout, local_peer_id, remote_file_transport, peers),
+        "list" => {
+            let handled = handle_remote_list_request(
+                packet,
+                layout,
+                local_peer_id,
+                remote_file_transport,
+                peers,
+            );
+            if !handled {
+                log::warn!("remote file list request could not be handled on this device");
+            }
+            handled
+        }
+        "pull" => {
+            let handled = handle_remote_pull_request(
+                packet,
+                layout,
+                local_peer_id,
+                remote_file_transport,
+                peers,
+            );
+            if !handled {
+                log::warn!("remote file pull request could not be handled on this device");
+            }
+            handled
+        }
         "listResult" | "pullResult" => resolve_remote_file_pending(packet, pending),
-        _ => false,
+        _ => {
+            log::debug!("remote file packet ignored: unknown kind {}", packet.kind);
+            false
+        }
     }
 }
 
