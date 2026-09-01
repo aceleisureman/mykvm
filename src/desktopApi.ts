@@ -23,11 +23,22 @@ export interface AppUpdateCheckResult {
   update?: AppUpdateInfo
 }
 
+export interface SyncRecord {
+  timestamp: string
+  kind: 'clipboard' | 'file'
+  direction: 'sent' | 'received'
+  target: string
+  contentType: string
+  preview: string
+  detail: string
+}
+
 export interface FileTransferSummary {
   targetName: string
   fileCount: number
   byteCount: number
 }
+
 
 // ponytail: static stopped-state stub so `npm run dev` in a plain browser still
 // renders the layout editor; the real runtime lives in the Tauri backend.
@@ -179,6 +190,22 @@ export async function openLogDirectory(): Promise<void> {
   await invoke('open_log_directory')
 }
 
+export async function readSyncHistory(count?: number): Promise<SyncRecord[]> {
+  if (!isTauri()) {
+    return []
+  }
+
+  return invoke<SyncRecord[]>('read_sync_history', { count: count ?? 100 })
+}
+
+export async function readLogLines(count?: number): Promise<string[]> {
+  if (!isTauri()) {
+    return ['[browser] Log only available in desktop']
+  }
+
+  return invoke<string[]>('read_log_lines', { count: count ?? 200 })
+}
+
 export async function stopRuntime(): Promise<RuntimeStatus> {
   if (!isTauri()) {
     return BROWSER_RUNTIME
@@ -296,6 +323,8 @@ export async function sendFilesToDevice(deviceId: string, paths: string[]): Prom
 
   return invoke<FileTransferSummary>('send_files_to_device', { deviceId, paths })
 }
+
+
 
 export async function relaunchApp(): Promise<void> {
   if (!isTauri()) {
@@ -425,3 +454,4 @@ export async function installAppUpdate(): Promise<void> {
   }
   await relaunch()
 }
+
