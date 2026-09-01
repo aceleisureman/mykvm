@@ -20,6 +20,7 @@ import {
   installAppUpdate,
   isAutostartEnabled,
   isPortableMode,
+  listRemoteDirectory,
   loadAppState,
   minimizeMainWindow,
   openLogDirectory,
@@ -29,6 +30,7 @@ import {
   openRepositoryUrl,
   openUpdateReleasePage,
   probeLanPeer,
+  pullRemoteFiles,
   readDiagnosticInfo,
   readInputServiceStatus,
   readPerformanceSample,
@@ -49,7 +51,7 @@ import {
   uninstallInputService,
   writeClipboardText,
 } from "./desktopApi";
-import type { AppUpdateInfo } from "./desktopApi";
+import type { AppUpdateInfo, RemoteDirEntry } from "./desktopApi";
 import { APP_VERSION, REPOSITORY_URL } from "./constants";
 import { TEXT } from "./i18n";
 import type { AppText } from "./i18n";
@@ -117,6 +119,7 @@ const WORKSPACE_TABS = [
   { id: "settings" },
   { id: "logs" },
   { id: "sync" },
+  { id: "files" },
 ] as const;
 
 type WorkspaceTab = (typeof WORKSPACE_TABS)[number]["id"];
@@ -231,6 +234,15 @@ function App() {
   const logContainerRef = useRef<HTMLDivElement>(null);
   const [syncRecords, setSyncRecords] = useState<SyncRecord[]>([]);
   const [syncFilter, setSyncFilter] = useState<"all" | "clipboard" | "file">("all");
+  const [remoteBrowseDeviceId, setRemoteBrowseDeviceId] = useState<string>("");
+  const [remoteBrowsePath, setRemoteBrowsePath] = useState<string>("");
+  const [remoteBrowseEntries, setRemoteBrowseEntries] = useState<RemoteDirEntry[]>(
+    [],
+  );
+  const [remoteBrowseLoading, setRemoteBrowseLoading] = useState(false);
+  const [remoteBrowseError, setRemoteBrowseError] = useState<string | null>(null);
+  const [remoteBrowsePulling, setRemoteBrowsePulling] = useState(false);
+  const [remotePullMessage, setRemotePullMessage] = useState<string | null>(null);
   const [isCapturingEdgeSwitchHotkey, setIsCapturingEdgeSwitchHotkey] =
     useState(false);
   const [capturingDirection, setCapturingDirection] = useState<
@@ -687,6 +699,42 @@ function App() {
     const timer = setInterval(() => void fetchSync(), 5000);
     return () => { cancelled = true; clearInterval(timer); };
   }, [currentTab]);
+
+  useEffect(() => {
+    if (currentTab !== "files" || remoteBrowseDeviceId === "") {
+      setRemoteBrowseEntries([]);
+      setRemoteBrowseError(null);
+      return;
+    }
+    let cancelled = false;
+    setRemoteBrowseLoading(true);
+    setRemoteBrowseError(null);
+    const fetchDir = async () => {
+      try {
+        const entries = await listRemoteDirectory(
+          remoteBrowseDeviceId,
+          remoteBrowsePath,
+        );
+        if (!cancelled) {
+          setRemoteBrowseEntries(entries);
+        }
+      } catch (error) {
+        if (!cancelled) {
+          setRemoteBrowseEntries([]);
+          setRemoteBrowseError(String(error));
+        }
+      } finally {
+        if (!cancelled) {
+          setRemoteBrowseLoading(false);
+        }
+      }
+    };
+    void fetchDir();
+    return () => {
+      cancelled = true;
+    };
+  }, [currentTab, remoteBrowseDeviceId, remoteBrowsePath]);
+
   const localPlatform =
     runtime?.discovery.localPeer.platform.toLowerCase() ??
     navigator.platform.toLowerCase();
@@ -3211,6 +3259,189 @@ function App() {
             <span className="log-status">{ui.syncHistory.subtitle}</span>
           </div>
         </section>      ) : null}
+
+      {currentTab === "files" ? (
+        <section className="page-panel log-panel">
+          <div className="log-toolbar">
+            <div className="log-toolbar-left">
+              <h2>{ui.remoteFiles.title}</h2>
+              <span className="log-line-count">{remoteBrowseEntries.length}</span>
+            </div>
+            <div className="log-toolbar-right">
+              <div className="file-browse-toolbar">
+                <select
+                  className="file-browse-device-select"
+                  value={remoteBrowseDeviceId}
+                  onChange={(event) => {
+                    setRemoteBrowseDeviceId(event.target.value);
+                    setRemoteBrowsePath("");
+                    setRemotePullMessage(null);
+                  }}
+                  disabled={machineRole !== "server"}
+                >
+                  <option value="">
+                    {ui.remoteFiles.selectDevice}
+                  </option>
+                  {serverFileTransferTargets.map((device) => (
+                    <option key={device.id} value={device.id}>
+                      {device.name}
+                    </option>
+                  ))}
+                </select>
+                {remoteBrowseDeviceId !== "" ? (
+                  <button
+                    type="button"
+                    className="log-action-btn"
+                    onClick={() => {
+                      setRemoteBrowsePath("");
+                      setRemotePullMessage(null);
+                    }}
+                  >
+                    {"\u21BB"} {ui.remoteFiles.root}
+                  </button>
+                ) : null}
+              </div>
+            </div>
+          </div>
+          {remoteBrowseDeviceId === "" ? (
+            <div className="log-container">
+              <p className="log-empty">{ui.remoteFiles.noPairedDevices}</p>
+            </div>
+          ) : (
+            <>
+              <div className="file-browse-crumbs">
+                <button
+                  type="button"
+                  className={`file-crumb ${remoteBrowsePath === "" ? "active" : ""}`}
+                  onClick={() => {
+                    setRemoteBrowsePath("");
+                    setRemotePullMessage(null);
+                  }}
+                >
+                  {ui.remoteFiles.root}
+                </button>
+                {remoteBrowsePath !== ""
+                  ? remoteBrowsePath.split(/[\\/]+/).filter(Boolean).map((segment, i) => {
+                      const ancestor = remoteBrowsePath
+                        .split(/[\\/]+/)
+                        .filter(Boolean)
+                        .slice(0, i + 1)
+                        .join(
+                          remoteBrowsePath.includes("\\") ? "\\" : "/",
+                        );
+                      return (
+                        <button
+                          key={`${segment}-${i}`}
+                          type="button"
+                          className="file-crumb"
+                          onClick={() => {
+                            setRemoteBrowsePath(ancestor);
+                            setRemotePullMessage(null);
+                          }}
+                        >
+                          {segment}
+                        </button>
+                      );
+                    })
+                  : null}
+              </div>
+              {remoteBrowsePulling ? (
+                <div className="file-browse-status">
+                  {ui.remoteFiles.pulling}
+                </div>
+              ) : null}
+              {remotePullMessage ? (
+                <div className="file-browse-status success">
+                  {remotePullMessage}
+                </div>
+              ) : null}
+              <div className="file-browse-list log-container">
+                {remoteBrowseLoading ? (
+                  <p className="log-empty">{ui.remoteFiles.loading}</p>
+                ) : remoteBrowseError ? (
+                  <p className="log-empty file-browse-error">
+                    {ui.remoteFiles.listFailed} {remoteBrowseError}
+                  </p>
+                ) : remoteBrowseEntries.length === 0 ? (
+                  <p className="log-empty">{ui.remoteFiles.empty}</p>
+                ) : (
+                  remoteBrowseEntries.map((entry) => (
+                    <div key={entry.path} className="file-browse-row">
+                      <button
+                        type="button"
+                        className={`file-browse-main ${entry.isDir ? "is-dir" : ""}`}
+                        onClick={() => {
+                          if (!entry.isDir) return;
+                          setRemoteBrowsePath(entry.path);
+                          setRemotePullMessage(null);
+                        }}
+                        title={entry.isDir ? entry.path : ui.remoteFiles.selectHint}
+                      >
+                        <span className="file-browse-icon">
+                          {entry.isDir ? "\u{1F4C1}" : "\u{1F4C4}"}
+                        </span>
+                        <span className="file-browse-name">{entry.name}</span>
+                        <span className="file-browse-meta">
+                          {entry.isDir
+                            ? ui.remoteFiles.folder
+                            : formatFileTransferBytes(entry.size)}
+                        </span>
+                        <span className="file-browse-meta">
+                          {entry.modifiedMs > 0
+                            ? new Date(entry.modifiedMs).toLocaleString()
+                            : ui.remoteFiles.sizeUnknown}
+                        </span>
+                      </button>
+                      {!entry.isDir ? (
+                        <button
+                          type="button"
+                          className="log-action-btn file-browse-pull"
+                          onClick={() => {
+                            setRemotePullMessage(null);
+                            setRemoteBrowsePulling(true);
+                            void pullRemoteFiles(remoteBrowseDeviceId, [
+                              entry.path,
+                            ])
+                              .then((summary) => {
+                                const size = formatFileTransferBytes(
+                                  summary.byteCount,
+                                );
+                                setRemotePullMessage(
+                                  ui.remoteFiles.pullDone
+                                    .replace(
+                                      "{count}",
+                                      String(summary.fileCount),
+                                    )
+                                    .replace("{size}", size),
+                                );
+                              })
+                              .catch((error) => {
+                                setRemotePullMessage(
+                                  `${ui.remoteFiles.pullFailed} ${String(error)}`,
+                                );
+                              })
+                              .finally(() => {
+                                setRemoteBrowsePulling(false);
+                              });
+                          }}
+                          disabled={remoteBrowsePulling}
+                        >
+                          {ui.remoteFiles.pull}
+                        </button>
+                      ) : null}
+                    </div>
+                  ))
+                )}
+              </div>
+              <div className="log-bottom-bar">
+                <span className="log-status">
+                  {ui.remoteFiles.selectHint}
+                </span>
+              </div>
+            </>
+          )}
+        </section>
+      ) : null}
 
       {currentTab === "logs" ? (
         <section className="page-panel log-panel">

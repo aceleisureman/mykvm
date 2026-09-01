@@ -185,6 +185,7 @@ mod tests {
                     width: 1,
                     height: 1,
                     rgba_base64: "AAAAAA==".into(),
+                    compressed: false,
                 }))
             },
         );

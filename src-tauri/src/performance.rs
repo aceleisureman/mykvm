@@ -236,7 +236,14 @@ mod tests {
         let (cpu, memory_mb) = parse_process_metrics(" 2.5 115664\n").expect("metrics");
 
         assert_eq!(cpu, 2.5);
-        assert!((memory_mb - 112.953125).abs() < f64::EPSILON);
+        // The divisor depends on the platform: Windows returns the raw byte
+        // count (divide by 1.0), other platforms convert KB to MB (1024.0).
+        let expected_mb = if cfg!(target_os = "windows") {
+            115664.0
+        } else {
+            112.953125
+        };
+        assert!((memory_mb - expected_mb).abs() < f64::EPSILON);
     }
 
     #[cfg(target_os = "macos")]
