@@ -6574,6 +6574,7 @@ mod tests {
             ip: "10.0.0.1".into(),
             transport_public_key: "server-key".into(),
             protocol_version: quic_transport::PROTOCOL_VERSION,
+            quic_port: 0,
             cluster_id: layout.cluster_id.clone(),
             paired_at_ms: 1,
         }];
@@ -6615,6 +6616,7 @@ mod tests {
             ip: "10.0.0.1".into(),
             transport_public_key: "server-old-key".into(),
             protocol_version: quic_transport::PROTOCOL_VERSION,
+            quic_port: 0,
             cluster_id: layout.cluster_id.clone(),
             paired_at_ms: 1,
         }];
@@ -6643,6 +6645,7 @@ mod tests {
             ip: "10.0.0.3".into(),
             transport_public_key: "other-key".into(),
             protocol_version: quic_transport::PROTOCOL_VERSION,
+            quic_port: 0,
             cluster_id: layout.cluster_id.clone(),
             paired_at_ms: 2,
         });
@@ -6708,6 +6711,7 @@ mod tests {
             ip: "10.0.0.1".into(),
             transport_public_key: "server-key".into(),
             protocol_version: quic_transport::PROTOCOL_VERSION,
+            quic_port: 0,
             cluster_id: layout.cluster_id.clone(),
             paired_at_ms: 1,
         }];

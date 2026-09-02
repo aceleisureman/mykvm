@@ -280,6 +280,8 @@ struct PairedController {
     transport_public_key: String,
     #[serde(default = "default_protocol_version")]
     protocol_version: u16,
+    #[serde(default)]
+    quic_port: u16,
     cluster_id: String,
     paired_at_ms: u64,
 }
@@ -6793,12 +6795,57 @@ fn send_remote_file_packet(
 
 /// Resolves the target (the requester) and returns `(target, remote_transport)`
 /// used by the client-side `list`/`pull` handlers to reply back.
+///
+/// Prefers the discovery `peers` snapshot (fresh address/public key) but falls
+/// back to the persisted `paired_controllers` record. The remote-file request
+/// arrives over an already-established QUIC connection, so the client must be
+/// able to reply even when its own discovery broadcast has not refreshed the
+/// server peer (filtered broadcast, firewall, or peer aged out) — relying
+/// solely on `peers` would make every reply fail with a spurious "reject".
 fn remote_file_target_for_origin(
     layout: &LayoutState,
     peers: &[LanPeer],
     origin_id: &str,
 ) -> Result<FileTransferTarget, String> {
-    file_transfer_target_for_device(layout, peers, origin_id)
+    if let Ok(target) = file_transfer_target_for_device(layout, peers, origin_id) {
+        return Ok(target);
+    }
+
+    if layout.machine_role != "client" {
+        return Err("没有找到可传输的目标设备。".into());
+    }
+
+    let controller = layout
+        .paired_controllers
+        .iter()
+        .find(|controller| controller.id == origin_id)
+        .ok_or_else(|| "没有找到可传输的目标设备。".to_string())?;
+    if controller.protocol_version != quic_transport::PROTOCOL_VERSION
+        || controller.transport_public_key.trim().is_empty()
+    {
+        return Err("客户端暂不支持安全回复，请升级客户端后重试。".into());
+    }
+    let host = file_transfer_host(&controller.ip)
+        .or_else(|| file_transfer_host(&controller.host))
+        .ok_or_else(|| format!("{} 缺少可用地址。", controller.name))?;
+    let quic_port = if controller.quic_port != 0 {
+        controller.quic_port
+    } else {
+        preferred_quic_port(controller_default_discovery_port())
+    };
+    Ok(FileTransferTarget {
+        device_id: controller.id.clone(),
+        name: controller.name.clone(),
+        addr: format!("{host}:{quic_port}"),
+        transport_public_key: controller.transport_public_key.clone(),
+        protocol_version: controller.protocol_version,
+        cluster_id: layout.cluster_id.clone(),
+        pair_secret: layout.pair_secret.clone(),
+    })
+}
+
+fn controller_default_discovery_port() -> u16 {
+    DISCOVERY_PORT
 }
 
 fn resolve_remote_file_pending(
@@ -8180,6 +8227,7 @@ fn complete_pairing_from_confirm(
             ip: requester.ip.clone(),
             transport_public_key: requester.transport_public_key.clone(),
             protocol_version: requester.protocol_version,
+            quic_port: requester.quic_port,
             cluster_id: layout.cluster_id.clone(),
             paired_at_ms: now_ms(),
         }];
@@ -8811,6 +8859,7 @@ mod tests {
             ip: "10.0.0.1".into(),
             transport_public_key: "server-public-key".into(),
             protocol_version: quic_transport::PROTOCOL_VERSION,
+            quic_port: 0,
             cluster_id: layout.cluster_id.clone(),
             paired_at_ms: now_ms(),
         }];
@@ -8926,6 +8975,7 @@ mod tests {
             ip: "10.0.0.1".into(),
             transport_public_key: "server-old-key".into(),
             protocol_version: quic_transport::PROTOCOL_VERSION,
+            quic_port: 0,
             cluster_id: layout.cluster_id.clone(),
             paired_at_ms: now_ms(),
         }];
@@ -9020,6 +9070,7 @@ mod tests {
             ip: "10.0.0.1".into(),
             transport_public_key: "server-key".into(),
             protocol_version: quic_transport::PROTOCOL_VERSION,
+            quic_port: 0,
             cluster_id: layout.cluster_id.clone(),
             paired_at_ms: now_ms(),
         }];
@@ -9041,6 +9092,7 @@ mod tests {
             ip: "10.0.0.1".into(),
             transport_public_key: "server-key".into(),
             protocol_version: quic_transport::PROTOCOL_VERSION,
+            quic_port: 0,
             cluster_id: current.cluster_id.clone(),
             paired_at_ms: now_ms(),
         }];
@@ -9091,6 +9143,7 @@ mod tests {
             ip: "10.0.0.1".into(),
             transport_public_key: "server-key".into(),
             protocol_version: quic_transport::PROTOCOL_VERSION,
+            quic_port: 0,
             cluster_id: current.cluster_id.clone(),
             paired_at_ms: now_ms(),
         }];
@@ -9242,6 +9295,7 @@ mod tests {
             ip: "10.0.0.1".into(),
             transport_public_key: "server-key".into(),
             protocol_version: quic_transport::PROTOCOL_VERSION,
+            quic_port: 0,
             cluster_id: layout.cluster_id.clone(),
             paired_at_ms: now_ms(),
         }];
@@ -9598,6 +9652,7 @@ mod tests {
             ip: "10.0.0.1".into(),
             transport_public_key: "server-public-key".into(),
             protocol_version: quic_transport::PROTOCOL_VERSION,
+            quic_port: 0,
             cluster_id: layout.cluster_id.clone(),
             paired_at_ms: now_ms(),
         }];
@@ -9627,6 +9682,39 @@ mod tests {
 
         assert_eq!(target.addr, "10.0.0.1:52001");
         assert_eq!(target.transport_public_key, "server-public-key");
+    }
+
+    #[test]
+    fn remote_file_reply_target_falls_back_to_paired_controller_without_peers() {
+        let mut layout = test_layout();
+        layout.machine_role = "client".into();
+        layout.cluster_id = "cluster-test".into();
+        layout.pair_secret = "secret-test".into();
+        layout.paired_controllers = vec![PairedController {
+            id: "peer-server-10-0-0-1".into(),
+            name: "Server".into(),
+            host: "server.local".into(),
+            ip: "10.0.0.1".into(),
+            transport_public_key: "server-public-key".into(),
+            protocol_version: quic_transport::PROTOCOL_VERSION,
+            quic_port: 52001,
+            cluster_id: layout.cluster_id.clone(),
+            paired_at_ms: now_ms(),
+        }];
+
+        // No discovery peers at all — the old implementation would fail here and
+        // reject the remote-file list request. The reply target must be
+        // resolvable from the persisted pairing record instead.
+        let target =
+            remote_file_target_for_origin(&layout, &[], "peer-server-10-0-0-1").unwrap();
+        assert_eq!(target.device_id, "peer-server-10-0-0-1");
+        assert_eq!(target.addr, "10.0.0.1:52001");
+        assert_eq!(target.transport_public_key, "server-public-key");
+        assert_eq!(target.cluster_id, "cluster-test");
+        assert_eq!(target.pair_secret, "secret-test");
+
+        // Unknown origin still fails cleanly.
+        assert!(remote_file_target_for_origin(&layout, &[], "unknown-device").is_err());
     }
 
     #[test]
@@ -9962,6 +10050,7 @@ mod tests {
             ip: "10.0.0.1".into(),
             transport_public_key: "server-key".into(),
             protocol_version: quic_transport::PROTOCOL_VERSION,
+            quic_port: 0,
             cluster_id: layout.cluster_id.clone(),
             paired_at_ms: now_ms(),
         }];
