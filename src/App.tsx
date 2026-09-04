@@ -53,7 +53,7 @@ import {
   uninstallInputService,
   writeClipboardText,
 } from "./desktopApi";
-import type { AppUpdateInfo, RemoteDirEntry } from "./desktopApi";
+import type { AppUpdateInfo, FileTransferSummary, RemoteDirEntry } from "./desktopApi";
 import { APP_VERSION, REPOSITORY_URL } from "./constants";
 import { TEXT } from "./i18n";
 import type { AppText } from "./i18n";
@@ -749,9 +749,12 @@ function App() {
         if (!cancelled) {
           dispatchRemoteBrowse({ type: "success", entries });
         }
-      } catch (error) {
+      } catch (error: unknown) {
         if (!cancelled) {
-          dispatchRemoteBrowse({ type: "failure", error: String(error) });
+          dispatchRemoteBrowse({
+            type: "failure",
+            error: formatUnknownError(error, ui.remoteFiles.listFailed),
+          });
         }
       }
     };
@@ -1087,9 +1090,7 @@ function App() {
         const summary = await sendFilesToDevice(targetDeviceId, transferPaths);
         setFileTransferMessage(formatFileTransferSummary(summary, language));
       } catch (error: unknown) {
-        setErrorMessage(
-          error instanceof Error ? error.message : ui.errors.fileTransfer,
-        );
+        setErrorMessage(formatUnknownError(error, ui.errors.fileTransfer));
       } finally {
         setFileTransferPendingTargetId(null);
       }
@@ -3457,18 +3458,30 @@ function App() {
                                 const size = formatFileTransferBytes(
                                   summary.byteCount,
                                 );
-                                setRemotePullMessage(
-                                  ui.remoteFiles.pullDone
-                                    .replace(
-                                      "{count}",
-                                      String(summary.fileCount),
-                                    )
-                                    .replace("{size}", size),
-                                );
+                                const message = (
+                                  summary.failedCount > 0
+                                    ? ui.remoteFiles.pullPartial
+                                    : ui.remoteFiles.pullDone
+                                )
+                                  .replace(
+                                    "{count}",
+                                    String(summary.fileCount),
+                                  )
+                                  .replace("{size}", size)
+                                  .replace(
+                                    "{failed}",
+                                    String(summary.failedCount),
+                                  );
+                                setRemotePullMessage(message);
                               })
-                              .catch((error) => {
+                              .catch((error: unknown) => {
                                 setRemotePullMessage(
-                                  `${ui.remoteFiles.pullFailed} ${String(error)}`,
+                                  `${ui.remoteFiles.pullFailed} ${
+                                    formatUnknownError(
+                                      error,
+                                      ui.remoteFiles.pullFailed,
+                                    )
+                                  }`,
                                 );
                               })
                               .finally(() => {
@@ -4226,10 +4239,22 @@ function preferredPairedControllerId(
 }
 
 function formatFileTransferSummary(
-  summary: { targetName: string; fileCount: number; byteCount: number },
+  summary: FileTransferSummary,
   language: AppLanguage,
 ) {
   const size = formatFileTransferBytes(summary.byteCount);
+  if (summary.failedCount > 0) {
+    const template =
+      language === "en"
+        ? TEXT.en.devices.fileTransferPartial
+        : TEXT.cn.devices.fileTransferPartial;
+    return template
+      .replace("{count}", String(summary.fileCount))
+      .replace("{size}", size)
+      .replace("{failed}", String(summary.failedCount))
+      .replace("{target}", summary.targetName);
+  }
+
   if (language === "en") {
     return `${TEXT.en.devices.fileTransferSent} ${summary.fileCount} ${
       summary.fileCount === 1 ? "file" : "files"

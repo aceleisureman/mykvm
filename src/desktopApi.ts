@@ -27,6 +27,7 @@ export interface FileTransferSummary {
   targetName: string
   fileCount: number
   byteCount: number
+  failedCount: number
 }
 
 export interface RemoteDirEntry {
@@ -417,6 +418,7 @@ export async function sendFilesToDevice(deviceId: string, paths: string[]): Prom
       targetName: 'Desktop fallback',
       fileCount: paths.length,
       byteCount: 0,
+      failedCount: 0,
     }
   }
 
@@ -443,6 +445,7 @@ export async function pullRemoteFiles(
       targetName: 'Desktop fallback',
       fileCount: paths.length,
       byteCount: 0,
+      failedCount: 0,
     }
   }
 

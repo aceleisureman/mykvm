@@ -68,7 +68,15 @@ const CLIPBOARD_WRITE_RETRY_DELAY_BASE_MS: u64 = 50;
 const FILE_TRANSFER_PROTOCOL: &str = "mykvm.file-transfer.v1";
 const FILE_TRANSFER_CHUNK_BYTES: usize = 256 * 1024;
 const FILE_TRANSFER_MAX_FILE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const FILE_TRANSFER_MAX_ACTIVE_TRANSFERS: usize = 32;
+const FILE_TRANSFER_MAX_ACTIVE_TRANSFERS_PER_ORIGIN: usize = 8;
+const FILE_TRANSFER_MAX_COMPLETED_TRANSFERS: usize = 128;
 const REMOTE_FILE_PROTOCOL: &str = "mykvm.remote-file.v1";
+const REMOTE_FILE_MAX_IDENTIFIER_BYTES: usize = 512;
+const REMOTE_FILE_MAX_PATH_BYTES: usize = 4096;
+const REMOTE_FILE_MAX_PULL_FILES: usize = 256;
+const REMOTE_FILE_MAX_DIRECTORY_ENTRIES: usize = 2048;
+const REMOTE_FILE_MAX_ERROR_BYTES: usize = 8192;
 const FILE_TRANSFER_DESTINATION_POINTER: &str = "pointer";
 const EDGE_DROP_WINDOWS_ENABLED: bool = false;
 const EDGE_DROP_LABEL_PREFIX: &str = "mykvm-edge-drop-";
@@ -465,19 +473,45 @@ struct TransferFile {
 }
 
 #[derive(Debug)]
+struct CollectedTransferFiles {
+    files: Vec<TransferFile>,
+    failed_count: u64,
+}
+
+#[derive(Debug)]
+struct FileTransferSendError {
+    message: String,
+    packet_count: u64,
+}
+
+#[derive(Debug, Default)]
+struct FileTransferSendProgress {
+    packet_count: u64,
+    offset: u64,
+    next_chunk_index: u64,
+}
+
+#[derive(Debug)]
 struct IncomingFileTransfer {
     origin_id: String,
     target_id: String,
     file_name: String,
+    destination_hint: Option<String>,
     total_bytes: u64,
     received_bytes: u64,
     next_chunk_index: u64,
     temp_path: PathBuf,
     final_path: PathBuf,
-    started_at: Instant,
+    last_activity_at: Instant,
+    completed: bool,
 }
 
+type IncomingFileTransferKey = (String, String);
+type IncomingFileTransfers = HashMap<IncomingFileTransferKey, IncomingFileTransfer>;
+type IncomingFileTransferState = Arc<Mutex<IncomingFileTransfers>>;
+
 const FILE_TRANSFER_STALE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const FILE_TRANSFER_COMPLETED_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -485,6 +519,8 @@ struct FileTransferSummary {
     target_name: String,
     file_count: usize,
     byte_count: u64,
+    #[serde(default)]
+    failed_count: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -507,6 +543,8 @@ struct RemoteFilePacket {
     #[serde(default)]
     byte_count: u64,
     #[serde(default)]
+    failed_count: u64,
+    #[serde(default)]
     error: Option<String>,
 }
 
@@ -525,7 +563,253 @@ struct RemoteFileResponse {
     entries: Vec<RemoteDirEntry>,
     file_count: u64,
     byte_count: u64,
+    failed_count: u64,
     error: Option<String>,
+}
+
+struct RemoteFilePending {
+    expected_origin_id: String,
+    expected_kind: &'static str,
+    registration: Arc<()>,
+    sender: tokio::sync::oneshot::Sender<RemoteFileResponse>,
+}
+
+type RemoteFilePendingMap = Arc<Mutex<HashMap<String, RemoteFilePending>>>;
+
+const REMOTE_FILE_REQUEST_CACHE_TTL: Duration = Duration::from_secs(10 * 60);
+const REMOTE_FILE_REQUEST_CACHE_MAX: usize = 128;
+
+#[derive(Debug, Clone)]
+enum RemoteFileRequestCacheState {
+    InFlight,
+    Completed(RemoteFilePacket),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RemoteFileRequestFingerprint {
+    kind: String,
+    target_id: String,
+    cluster_id: String,
+    pair_secret: String,
+    path: String,
+    file_paths_digest: [u8; 32],
+}
+
+#[derive(Debug, Clone)]
+struct RemoteFileRequestCacheEntry {
+    fingerprint: RemoteFileRequestFingerprint,
+    state: RemoteFileRequestCacheState,
+    updated_at: Instant,
+}
+
+type RemoteFileRequestKey = (String, String);
+type RemoteFileRequestCache = Arc<Mutex<HashMap<RemoteFileRequestKey, RemoteFileRequestCacheEntry>>>;
+
+enum RemoteFileRequestDecision {
+    Start,
+    DuplicateInFlight,
+    Replay(RemoteFilePacket),
+    Conflict,
+    Unavailable,
+}
+
+fn remote_file_request_key(packet: &RemoteFilePacket) -> RemoteFileRequestKey {
+    (packet.origin_id.clone(), packet.request_id.clone())
+}
+
+fn remote_file_request_fingerprint(packet: &RemoteFilePacket) -> RemoteFileRequestFingerprint {
+    let mut file_paths_digest = ring::digest::Context::new(&ring::digest::SHA256);
+    file_paths_digest.update(&(packet.file_paths.len() as u64).to_le_bytes());
+    for path in &packet.file_paths {
+        file_paths_digest.update(&(path.len() as u64).to_le_bytes());
+        file_paths_digest.update(path.as_bytes());
+    }
+    let file_paths_digest = file_paths_digest.finish();
+    let mut file_paths_fingerprint = [0_u8; 32];
+    file_paths_fingerprint.copy_from_slice(file_paths_digest.as_ref());
+
+    RemoteFileRequestFingerprint {
+        kind: packet.kind.clone(),
+        target_id: packet.target_id.clone(),
+        cluster_id: packet.cluster_id.clone(),
+        pair_secret: packet.pair_secret.clone(),
+        path: packet.path.clone(),
+        file_paths_digest: file_paths_fingerprint,
+    }
+}
+
+fn prepare_remote_file_request_cache(
+    cache: &mut HashMap<RemoteFileRequestKey, RemoteFileRequestCacheEntry>,
+) -> bool {
+    cache.retain(|_, entry| entry.updated_at.elapsed() <= REMOTE_FILE_REQUEST_CACHE_TTL);
+    if REMOTE_FILE_REQUEST_CACHE_MAX == 0 {
+        cache.clear();
+        return false;
+    }
+    while cache.len() >= REMOTE_FILE_REQUEST_CACHE_MAX {
+        let Some(oldest_key) = cache
+            .iter()
+            .filter(|(_, entry)| {
+                matches!(&entry.state, RemoteFileRequestCacheState::Completed(_))
+            })
+            .min_by_key(|(_, entry)| entry.updated_at)
+            .map(|(key, _)| key.clone())
+        else {
+            return false;
+        };
+        cache.remove(&oldest_key);
+    }
+    true
+}
+
+fn begin_remote_file_request(
+    cache: &RemoteFileRequestCache,
+    packet: &RemoteFilePacket,
+) -> RemoteFileRequestDecision {
+    let key = remote_file_request_key(packet);
+    let fingerprint = remote_file_request_fingerprint(packet);
+    let now = Instant::now();
+    let Ok(mut cache) = cache.lock() else {
+        return RemoteFileRequestDecision::Unavailable;
+    };
+
+    cache.retain(|_, entry| entry.updated_at.elapsed() <= REMOTE_FILE_REQUEST_CACHE_TTL);
+    if let Some(entry) = cache.get_mut(&key) {
+        if entry.fingerprint != fingerprint {
+            return RemoteFileRequestDecision::Conflict;
+        }
+        entry.updated_at = now;
+        return match &entry.state {
+            RemoteFileRequestCacheState::InFlight => RemoteFileRequestDecision::DuplicateInFlight,
+            RemoteFileRequestCacheState::Completed(reply) => {
+                RemoteFileRequestDecision::Replay(reply.clone())
+            }
+        };
+    }
+
+    if !prepare_remote_file_request_cache(&mut cache) {
+        return RemoteFileRequestDecision::Unavailable;
+    }
+    cache.insert(
+        key,
+        RemoteFileRequestCacheEntry {
+            fingerprint,
+            state: RemoteFileRequestCacheState::InFlight,
+            updated_at: now,
+        },
+    );
+    RemoteFileRequestDecision::Start
+}
+
+fn forget_remote_file_request(cache: &RemoteFileRequestCache, packet: &RemoteFilePacket) {
+    let key = remote_file_request_key(packet);
+    let fingerprint = remote_file_request_fingerprint(packet);
+    let Ok(mut cache) = cache.lock() else {
+        return;
+    };
+    let should_remove = cache
+        .get(&key)
+        .map(|entry| {
+            entry.fingerprint == fingerprint
+                && matches!(&entry.state, RemoteFileRequestCacheState::InFlight)
+        })
+        .unwrap_or(false);
+    if should_remove {
+        cache.remove(&key);
+    }
+}
+
+fn complete_remote_file_request(
+    cache: &RemoteFileRequestCache,
+    request: &RemoteFilePacket,
+    reply: RemoteFilePacket,
+) {
+    let key = remote_file_request_key(request);
+    let fingerprint = remote_file_request_fingerprint(request);
+    let Ok(mut cache) = cache.lock() else {
+        return;
+    };
+    let Some(entry) = cache.get_mut(&key) else {
+        return;
+    };
+    if entry.fingerprint == fingerprint {
+        entry.state = RemoteFileRequestCacheState::Completed(reply);
+        entry.updated_at = Instant::now();
+    }
+}
+
+fn insert_remote_file_pending(
+    pending: &RemoteFilePendingMap,
+    request_id: &str,
+    expected_origin_id: String,
+    expected_kind: &'static str,
+    sender: tokio::sync::oneshot::Sender<RemoteFileResponse>,
+) -> Result<Arc<()>, String> {
+    if request_id.trim().is_empty() {
+        return Err("remote file request id is empty".into());
+    }
+    let mut pending = pending
+        .lock()
+        .map_err(|_| "remote file pending lock poisoned".to_string())?;
+    if pending.contains_key(request_id) {
+        return Err("remote file request id collision".into());
+    }
+    let registration = Arc::new(());
+    pending.insert(
+        request_id.to_string(),
+        RemoteFilePending {
+            expected_origin_id,
+            expected_kind,
+            registration: Arc::clone(&registration),
+            sender,
+        },
+    );
+    Ok(registration)
+}
+
+fn remove_remote_file_pending(
+    pending: &RemoteFilePendingMap,
+    request_id: &str,
+    registration: &Arc<()>,
+) {
+    if request_id.trim().is_empty() {
+        return;
+    }
+    if let Ok(mut pending) = pending.lock() {
+        let belongs_to_registration = pending
+            .get(request_id)
+            .map(|entry| Arc::ptr_eq(&entry.registration, registration))
+            .unwrap_or(false);
+        if belongs_to_registration {
+            pending.remove(request_id);
+        }
+    }
+}
+
+struct RemoteFilePendingGuard<'a> {
+    pending: &'a RemoteFilePendingMap,
+    request_id: String,
+    registration: Arc<()>,
+}
+
+impl<'a> RemoteFilePendingGuard<'a> {
+    fn new(
+        pending: &'a RemoteFilePendingMap,
+        request_id: String,
+        registration: Arc<()>,
+    ) -> Self {
+        Self {
+            pending,
+            request_id,
+            registration,
+        }
+    }
+}
+
+impl Drop for RemoteFilePendingGuard<'_> {
+    fn drop(&mut self) {
+        remove_remote_file_pending(self.pending, &self.request_id, &self.registration);
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -584,7 +868,7 @@ struct AppRuntime {
     runtime: Mutex<RuntimeStatus>,
     peers: Arc<Mutex<Vec<LanPeer>>>,
     pairing_challenge: Arc<Mutex<Option<PairingChallenge>>>,
-    file_transfers: Arc<Mutex<HashMap<String, IncomingFileTransfer>>>,
+    file_transfers: IncomingFileTransferState,
     edge_drop_targets: Arc<Mutex<HashMap<String, String>>>,
     edge_drop_stop: Arc<AtomicBool>,
     quic_transport: Mutex<Option<quic_transport::TransportHandle>>,
@@ -611,7 +895,8 @@ struct AppRuntime {
     screen_switch_shortcuts: Mutex<ScreenSwitchHotkeys>,
     config_path: PathBuf,
     remote_file_transport: Arc<Mutex<Option<quic_transport::TransportHandle>>>,
-    remote_file_pending: Arc<Mutex<HashMap<String, tokio::sync::oneshot::Sender<RemoteFileResponse>>>>,
+    remote_file_pending: RemoteFilePendingMap,
+    remote_file_request_cache: RemoteFileRequestCache,
 }
 
 impl AppRuntime {
@@ -654,6 +939,7 @@ impl AppRuntime {
             config_path,
             remote_file_transport: Arc::new(Mutex::new(None)),
             remote_file_pending: Arc::new(Mutex::new(HashMap::new())),
+            remote_file_request_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -823,6 +1109,7 @@ impl AppRuntime {
         let peers_for_pairing = Arc::clone(&self.peers);
         let remote_file_transport_for_stream = Arc::clone(&self.remote_file_transport);
         let remote_file_pending_for_stream = Arc::clone(&self.remote_file_pending);
+        let remote_file_request_cache_for_stream = Arc::clone(&self.remote_file_request_cache);
 
         let on_datagram = Arc::new(move |payload: Vec<u8>, source| {
             if !input_receive_enabled.load(Ordering::Relaxed) {
@@ -887,6 +1174,8 @@ impl AppRuntime {
                     &remote_file_transport_for_stream,
                     &peers_for_pairing,
                     &remote_file_pending_for_stream,
+                    &remote_file_request_cache_for_stream,
+                    &transport_packets_for_stream,
                 ) {
                     transport_packets_for_stream.fetch_add(1, Ordering::Relaxed);
                     return true;
@@ -1424,7 +1713,12 @@ fn parse_sync_line(line: &str) -> Option<SyncRecord> {
         let to = extract_kv(line, "to=");
         let files = extract_kv(line, "files=");
         let bytes = extract_kv(line, "bytes=");
-        let detail = format!("{} files, {} bytes", files, bytes);
+        let failed = extract_kv(line, "failed=");
+        let detail = if failed.is_empty() || failed == "0" {
+            format!("{} files, {} bytes", files, bytes)
+        } else {
+            format!("{} files, {} bytes, {} failed", files, bytes, failed)
+        };
         Some(SyncRecord {
             timestamp: ts,
             kind: "file".into(),
@@ -1466,6 +1760,7 @@ fn extract_kv(line: &str, key: &str) -> String {
         .find(" content=")
         .or_else(|| rest.find(" files="))
         .or_else(|| rest.find(" bytes="))
+        .or_else(|| rest.find(" failed="))
     {
         rest[..pos].to_string()
     } else {
@@ -2421,35 +2716,60 @@ fn send_files_to_device_with_destination(
 
     let peers = active_peer_snapshot(&state.peers);
     let target = file_transfer_target_for_device(&layout, &peers, device_id)?;
-    let files = collect_transfer_files(&paths)?;
+    let collected = collect_transfer_files(&paths)?;
     let mut file_count = 0_usize;
     let mut byte_count = 0_u64;
+    let mut failed_count = collected.failed_count;
+    let mut first_send_error: Option<String> = None;
 
-    for file in files {
-        let packet_count = send_transfer_file(
+    for file in collected.files {
+        match send_transfer_file(
             &quic_transport,
             &local_peer.id,
             &target,
             &file,
             destination_hint,
-        )?;
-        state
-            .transport_packets
-            .fetch_add(packet_count, Ordering::Relaxed);
-        file_count += 1;
-        byte_count = byte_count.saturating_add(file.total_bytes);
+        ) {
+            Ok(packet_count) => {
+                state
+                    .transport_packets
+                    .fetch_add(packet_count, Ordering::Relaxed);
+                file_count += 1;
+                byte_count = byte_count.saturating_add(file.total_bytes);
+            }
+            Err(error) => {
+                let FileTransferSendError {
+                    message,
+                    packet_count,
+                } = error;
+                state
+                    .transport_packets
+                    .fetch_add(packet_count, Ordering::Relaxed);
+                log::warn!("file transfer skipped {}: {message}", file.path.display());
+                failed_count = failed_count.saturating_add(1);
+                if first_send_error.is_none() {
+                    first_send_error = Some(message);
+                }
+            }
+        }
+    }
+
+    if file_count == 0 {
+        return Err(first_send_error.unwrap_or_else(|| "没有文件发送成功。".to_string()));
     }
 
     log::info!(
-        "sync:file:sent to={} files={} bytes={}",
+        "sync:file:sent to={} files={} bytes={} failed={}",
         target.name,
         file_count,
-        byte_count
+        byte_count,
+        failed_count
     );
     Ok(FileTransferSummary {
         target_name: target.name,
         file_count,
         byte_count,
+        failed_count,
     })
 }
 
@@ -2462,6 +2782,7 @@ async fn list_remote_directory(
     state: tauri::State<'_, AppRuntime>,
 ) -> Result<Vec<RemoteDirEntry>, String> {
     let state = state.inner();
+    validate_remote_file_path_length(&path)?;
     state.start_discovery()?;
     let layout = state.layout_snapshot();
     if !layout.file_transfer_enabled {
@@ -2477,13 +2798,20 @@ async fn list_remote_directory(
     let target = file_transfer_target_for_device(&layout, &peers, &device_id)?;
     let request_id = format!("remote-list-{}-{}", now_ms(), random_hex(6));
     let (sender, receiver) = tokio::sync::oneshot::channel::<RemoteFileResponse>();
-    {
-        let mut pending = state
-            .remote_file_pending
-            .lock()
-            .map_err(|_| "remote file pending lock poisoned".to_string())?;
-        pending.insert(request_id.clone(), sender);
-    }
+    let pending_registration = insert_remote_file_pending(
+        &state.remote_file_pending,
+        &request_id,
+        target.device_id.clone(),
+        "listResult",
+        sender,
+    )?;
+    // Remove the sender on every exit path, including cancellation of this
+    // async command while it is waiting for the remote response.
+    let _pending_guard = RemoteFilePendingGuard::new(
+        &state.remote_file_pending,
+        request_id.clone(),
+        pending_registration,
+    );
 
     let request = remote_file_packet(
         "list",
@@ -2498,6 +2826,7 @@ async fn list_remote_directory(
         None,
     );
     send_remote_file_packet(&quic_transport, &target, request)?;
+    state.transport_packets.fetch_add(1, Ordering::Relaxed);
 
     let response = tokio::time::timeout(Duration::from_secs(REMOTE_FILE_REQUEST_TIMEOUT_SECS), receiver)
         .await
@@ -2521,6 +2850,10 @@ async fn pull_remote_files(
     if paths.is_empty() {
         return Err("请选择要拉取的文件。".into());
     }
+    validate_remote_pull_file_count(&paths)?;
+    for path in &paths {
+        validate_remote_file_path_length(path)?;
+    }
     state.start_discovery()?;
     let layout = state.layout_snapshot();
     if !layout.file_transfer_enabled {
@@ -2536,13 +2869,18 @@ async fn pull_remote_files(
     let target = file_transfer_target_for_device(&layout, &peers, &device_id)?;
     let request_id = format!("remote-pull-{}-{}", now_ms(), random_hex(6));
     let (sender, receiver) = tokio::sync::oneshot::channel::<RemoteFileResponse>();
-    {
-        let mut pending = state
-            .remote_file_pending
-            .lock()
-            .map_err(|_| "remote file pending lock poisoned".to_string())?;
-        pending.insert(request_id.clone(), sender);
-    }
+    let pending_registration = insert_remote_file_pending(
+        &state.remote_file_pending,
+        &request_id,
+        target.device_id.clone(),
+        "pullResult",
+        sender,
+    )?;
+    let _pending_guard = RemoteFilePendingGuard::new(
+        &state.remote_file_pending,
+        request_id.clone(),
+        pending_registration,
+    );
 
     let request = remote_file_packet(
         "pull",
@@ -2557,6 +2895,7 @@ async fn pull_remote_files(
         None,
     );
     send_remote_file_packet(&quic_transport, &target, request)?;
+    state.transport_packets.fetch_add(1, Ordering::Relaxed);
 
     let response = tokio::time::timeout(Duration::from_secs(REMOTE_PULL_TIMEOUT_SECS), receiver)
         .await
@@ -2569,6 +2908,7 @@ async fn pull_remote_files(
         target_name: target.name,
         file_count: response.file_count as usize,
         byte_count: response.byte_count,
+        failed_count: response.failed_count,
     })
 }
 
@@ -2718,10 +3058,11 @@ fn handle_edge_drop_window_event(window: &tauri::Window, event: &WindowEvent) ->
                     Some(FILE_TRANSFER_DESTINATION_POINTER),
                 ) {
                     Ok(summary) => log::info!(
-                        "edge drop sent {} file(s) to {} bytes={}",
+                        "edge drop sent {} file(s) to {} bytes={} failed={}",
                         summary.file_count,
                         summary.target_name,
-                        summary.byte_count
+                        summary.byte_count,
+                        summary.failed_count
                     ),
                     Err(error) => log::warn!("edge drop transfer failed: {error}"),
                 }
@@ -5954,39 +6295,62 @@ fn file_transfer_host(host_value: &str) -> Option<String> {
         })
 }
 
-fn collect_transfer_files(paths: &[String]) -> Result<Vec<TransferFile>, String> {
+fn collect_transfer_files(paths: &[String]) -> Result<CollectedTransferFiles, String> {
     let mut files = Vec::new();
+    let mut failed_count = 0_u64;
+    let mut first_error: Option<String> = None;
+
     for path_value in paths {
         let path_value = path_value.trim();
         if path_value.is_empty() {
+            failed_count = failed_count.saturating_add(1);
+            if first_error.is_none() {
+                first_error = Some("文件路径不能为空。".to_string());
+            }
             continue;
         }
-        let path = PathBuf::from(path_value);
-        let metadata = fs::metadata(&path)
-            .map_err(|error| format!("无法读取文件 {}: {error}", path.display()))?;
-        if !metadata.is_file() {
-            return Err(format!("暂不支持传输文件夹或特殊文件：{}", path.display()));
+
+        match collect_transfer_file(PathBuf::from(path_value)) {
+            Ok(file) => files.push(file),
+            Err(error) => {
+                log::warn!("file transfer input skipped: {error}");
+                failed_count = failed_count.saturating_add(1);
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
         }
-        if metadata.len() > FILE_TRANSFER_MAX_FILE_BYTES {
-            return Err(format!(
-                "{} 超过单文件上限 {}。",
-                path.display(),
-                format_bytes(FILE_TRANSFER_MAX_FILE_BYTES)
-            ));
-        }
-        let name = transfer_file_name(&path)?;
-        files.push(TransferFile {
-            path,
-            name,
-            total_bytes: metadata.len(),
-        });
     }
 
     if files.is_empty() {
-        Err("请选择要传输的文件。".into())
+        Err(first_error.unwrap_or_else(|| "请选择要传输的文件。".to_string()))
     } else {
-        Ok(files)
+        Ok(CollectedTransferFiles {
+            files,
+            failed_count,
+        })
     }
+}
+
+fn collect_transfer_file(path: PathBuf) -> Result<TransferFile, String> {
+    let metadata = fs::metadata(&path)
+        .map_err(|error| format!("无法读取文件 {}: {error}", path.display()))?;
+    if !metadata.is_file() {
+        return Err(format!("暂不支持传输文件夹或特殊文件：{}", path.display()));
+    }
+    if metadata.len() > FILE_TRANSFER_MAX_FILE_BYTES {
+        return Err(format!(
+            "{} 超过单文件上限 {}。",
+            path.display(),
+            format_bytes(FILE_TRANSFER_MAX_FILE_BYTES)
+        ));
+    }
+    let name = transfer_file_name(&path)?;
+    Ok(TransferFile {
+        path,
+        name,
+        total_bytes: metadata.len(),
+    })
 }
 
 fn transfer_file_name(path: &Path) -> Result<String, String> {
@@ -6012,10 +6376,46 @@ fn send_transfer_file(
     target: &FileTransferTarget,
     file: &TransferFile,
     destination_hint: Option<&str>,
-) -> Result<u64, String> {
-    let transfer_id = format!("file-{}-{}", now_ms(), random_hex(8));
-    let mut packet_count = 0_u64;
+) -> Result<u64, FileTransferSendError> {
+    // Open and revalidate the file before creating receiver-side state. The path
+    // may have become unreadable, changed type, or changed size since collection.
+    let mut file_handle = fs::File::open(&file.path).map_err(|error| FileTransferSendError {
+        message: format!("无法打开文件 {}: {error}", file.path.display()),
+        packet_count: 0,
+    })?;
+    let metadata = file_handle
+        .metadata()
+        .map_err(|error| FileTransferSendError {
+            message: format!("无法读取文件属性 {}: {error}", file.path.display()),
+            packet_count: 0,
+        })?;
+    if !metadata.is_file() {
+        return Err(FileTransferSendError {
+            message: format!("暂不支持传输文件夹或特殊文件：{}", file.path.display()),
+            packet_count: 0,
+        });
+    }
+    if metadata.len() > FILE_TRANSFER_MAX_FILE_BYTES {
+        return Err(FileTransferSendError {
+            message: format!(
+                "{} 超过单文件上限 {}。",
+                file.path.display(),
+                format_bytes(FILE_TRANSFER_MAX_FILE_BYTES)
+            ),
+            packet_count: 0,
+        });
+    }
+    if metadata.len() != file.total_bytes {
+        return Err(FileTransferSendError {
+            message: format!(
+                "文件在发送前发生变化，请重新选择：{}",
+                file.path.display()
+            ),
+            packet_count: 0,
+        });
+    }
 
+    let transfer_id = format!("file-{}-{}", now_ms(), random_hex(8));
     send_file_transfer_packet(
         quic_transport,
         target,
@@ -6031,41 +6431,102 @@ fn send_transfer_file(
             destination_hint,
             Vec::new(),
         ),
-    )?;
-    packet_count += 1;
+    )
+    .map_err(|message| FileTransferSendError {
+        message,
+        packet_count: 0,
+    })?;
 
-    let mut file_handle = fs::File::open(&file.path)
-        .map_err(|error| format!("无法打开文件 {}: {error}", file.path.display()))?;
+    let mut progress = FileTransferSendProgress {
+        packet_count: 1,
+        ..FileTransferSendProgress::default()
+    };
+    if let Err(message) = send_transfer_file_contents(
+        quic_transport,
+        origin_id,
+        target,
+        file,
+        destination_hint,
+        &transfer_id,
+        &mut file_handle,
+        &mut progress,
+    ) {
+        let abort_packet_count = send_file_transfer_abort(
+            quic_transport,
+            origin_id,
+            target,
+            file,
+            destination_hint,
+            &transfer_id,
+            &progress,
+        );
+        progress.packet_count = progress.packet_count.saturating_add(abort_packet_count);
+        return Err(FileTransferSendError {
+            message,
+            packet_count: progress.packet_count,
+        });
+    }
+
+    Ok(progress.packet_count)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn send_transfer_file_contents(
+    quic_transport: &quic_transport::TransportHandle,
+    origin_id: &str,
+    target: &FileTransferTarget,
+    file: &TransferFile,
+    destination_hint: Option<&str>,
+    transfer_id: &str,
+    file_handle: &mut fs::File,
+    progress: &mut FileTransferSendProgress,
+) -> Result<(), String> {
     let mut buffer = vec![0_u8; FILE_TRANSFER_CHUNK_BYTES];
-    let mut offset = 0_u64;
-    let mut chunk_index = 0_u64;
-    loop {
+    while progress.offset < file.total_bytes {
+        let remaining = (file.total_bytes - progress.offset).min(buffer.len() as u64) as usize;
         let read = file_handle
-            .read(&mut buffer)
+            .read(&mut buffer[..remaining])
             .map_err(|error| format!("读取文件 {} 失败: {error}", file.path.display()))?;
         if read == 0 {
-            break;
+            return Err(format!(
+                "文件在发送过程中被截断，请重试：{}",
+                file.path.display()
+            ));
         }
-        let data = buffer[..read].to_vec();
+
         send_file_transfer_packet(
             quic_transport,
             target,
             file_transfer_packet(
                 "chunk",
-                &transfer_id,
+                transfer_id,
                 origin_id,
                 target,
                 &file.name,
                 file.total_bytes,
-                chunk_index,
-                offset,
+                progress.next_chunk_index,
+                progress.offset,
                 destination_hint,
-                data,
+                buffer[..read].to_vec(),
             ),
         )?;
-        packet_count += 1;
-        offset = offset.saturating_add(read as u64);
-        chunk_index = chunk_index.saturating_add(1);
+        progress.packet_count = progress.packet_count.saturating_add(1);
+        progress.offset = progress.offset.saturating_add(read as u64);
+        progress.next_chunk_index = progress.next_chunk_index.saturating_add(1);
+    }
+
+    // Detect growth after the preflight metadata check instead of silently
+    // publishing only the old prefix under a successful result.
+    let mut extra = [0_u8; 1];
+    if file_handle
+        .read(&mut extra)
+        .map_err(|error| format!("读取文件 {} 失败: {error}", file.path.display()))?
+        != 0
+    {
+        return Err(format!(
+            "文件在发送过程中变大，请重试：{}",
+            file.path.display()
+        ));
     }
 
     send_file_transfer_packet(
@@ -6073,20 +6534,58 @@ fn send_transfer_file(
         target,
         file_transfer_packet(
             "finish",
-            &transfer_id,
+            transfer_id,
             origin_id,
             target,
             &file.name,
             file.total_bytes,
-            chunk_index,
-            offset,
+            progress.next_chunk_index,
+            progress.offset,
             destination_hint,
             Vec::new(),
         ),
     )?;
-    packet_count += 1;
+    progress.packet_count = progress.packet_count.saturating_add(1);
+    Ok(())
+}
 
-    Ok(packet_count)
+#[allow(clippy::too_many_arguments)]
+fn send_file_transfer_abort(
+    quic_transport: &quic_transport::TransportHandle,
+    origin_id: &str,
+    target: &FileTransferTarget,
+    file: &TransferFile,
+    destination_hint: Option<&str>,
+    transfer_id: &str,
+    progress: &FileTransferSendProgress,
+) -> u64 {
+    let result = send_file_transfer_packet(
+        quic_transport,
+        target,
+        file_transfer_packet(
+            "abort",
+            transfer_id,
+            origin_id,
+            target,
+            &file.name,
+            file.total_bytes,
+            progress.next_chunk_index,
+            progress.offset,
+            destination_hint,
+            Vec::new(),
+        ),
+    );
+    match result {
+        Ok(()) => 1,
+        Err(error) => {
+            log::warn!(
+                "file transfer abort failed transfer_id={} path={}: {error}",
+                transfer_id,
+                file.path.display()
+            );
+            0
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6139,15 +6638,22 @@ fn handle_file_transfer_packet(
     payload: &[u8],
     layout: &LayoutState,
     local_peer_id: &str,
-    transfers: &Arc<Mutex<HashMap<String, IncomingFileTransfer>>>,
+    transfers: &IncomingFileTransferState,
     app: &AppHandle,
 ) -> bool {
     let Some(packet) = decode_wire_packet::<FileTransferPacket>(payload) else {
         return false;
     };
-    let Ok(receive_root) = file_transfer_receive_root(app) else {
-        log::warn!("file transfer receive failed: could not resolve receive directory");
-        return false;
+    let receive_root = if packet.kind == "start" {
+        match file_transfer_receive_root(app) {
+            Ok(receive_root) => Some(receive_root),
+            Err(error) => {
+                log::warn!("file transfer receive failed: {error}");
+                return false;
+            }
+        }
+    } else {
+        None
     };
     let pointer_receive_root = if packet.kind == "start"
         && packet.destination_hint.as_deref() == Some(FILE_TRANSFER_DESTINATION_POINTER)
@@ -6162,7 +6668,7 @@ fn handle_file_transfer_packet(
         layout,
         local_peer_id,
         transfers,
-        &receive_root,
+        receive_root.as_deref(),
         pointer_receive_root.as_deref(),
         Some(app),
     )
@@ -6241,7 +6747,7 @@ fn handle_file_transfer_packet_with_root(
     payload: &[u8],
     layout: &LayoutState,
     local_peer_id: &str,
-    transfers: &Arc<Mutex<HashMap<String, IncomingFileTransfer>>>,
+    transfers: &IncomingFileTransferState,
     receive_root: &Path,
 ) -> bool {
     handle_file_transfer_packet_with_destination_root(
@@ -6260,7 +6766,7 @@ fn handle_file_transfer_packet_with_destination_root(
     payload: &[u8],
     layout: &LayoutState,
     local_peer_id: &str,
-    transfers: &Arc<Mutex<HashMap<String, IncomingFileTransfer>>>,
+    transfers: &IncomingFileTransferState,
     receive_root: &Path,
     pointer_receive_root: Option<&Path>,
     landing_app: Option<&AppHandle>,
@@ -6268,6 +6774,7 @@ fn handle_file_transfer_packet_with_destination_root(
     let Some(packet) = decode_wire_packet::<FileTransferPacket>(payload) else {
         return false;
     };
+    let receive_root = (packet.kind == "start").then_some(receive_root);
 
     handle_decoded_file_transfer_packet(
         packet,
@@ -6284,8 +6791,8 @@ fn handle_decoded_file_transfer_packet(
     packet: FileTransferPacket,
     layout: &LayoutState,
     local_peer_id: &str,
-    transfers: &Arc<Mutex<HashMap<String, IncomingFileTransfer>>>,
-    receive_root: &Path,
+    transfers: &IncomingFileTransferState,
+    receive_root: Option<&Path>,
     pointer_receive_root: Option<&Path>,
     landing_app: Option<&AppHandle>,
 ) -> bool {
@@ -6305,10 +6812,18 @@ fn handle_decoded_file_transfer_packet(
         return true;
     }
 
-    let destination_root =
-        file_transfer_destination_root(&packet, receive_root, pointer_receive_root);
+    // Any incoming packet is an opportunity to discard abandoned transfers.
+    // This keeps stale `.part` files from accumulating even when a transfer
+    // never sends another `start` packet after becoming inactive.
+    purge_stale_file_transfers(transfers);
+
     match packet.kind.as_str() {
         "start" => {
+            let Some(receive_root) = receive_root else {
+                return false;
+            };
+            let destination_root =
+                file_transfer_destination_root(&packet, receive_root, pointer_receive_root);
             let show_landing =
                 packet.destination_hint.as_deref() == Some(FILE_TRANSFER_DESTINATION_POINTER);
             let file_name = packet.file_name.clone();
@@ -6322,6 +6837,7 @@ fn handle_decoded_file_transfer_packet(
         }
         "chunk" => append_incoming_file_transfer_chunk(packet, transfers),
         "finish" => finish_incoming_file_transfer(packet, transfers),
+        "abort" => abort_incoming_file_transfer(packet, transfers),
         _ => false,
     }
 }
@@ -6431,14 +6947,35 @@ fn platform_current_pointer_position() -> Option<(f64, f64)> {
     None
 }
 
+fn incoming_file_transfer_matches_packet(
+    transfer: &IncomingFileTransfer,
+    packet: &FileTransferPacket,
+) -> bool {
+    let Some(file_name) = sanitize_transfer_file_name(&packet.file_name) else {
+        return false;
+    };
+
+    transfer.origin_id == packet.origin_id
+        && transfer.target_id == packet.target_id
+        && transfer.file_name == file_name
+        && transfer.destination_hint == packet.destination_hint
+        && transfer.total_bytes == packet.total_bytes
+}
+
+fn incoming_file_transfer_key(packet: &FileTransferPacket) -> IncomingFileTransferKey {
+    (packet.origin_id.clone(), packet.transfer_id.clone())
+}
+
 fn start_incoming_file_transfer(
     packet: FileTransferPacket,
-    transfers: &Arc<Mutex<HashMap<String, IncomingFileTransfer>>>,
+    transfers: &IncomingFileTransferState,
     receive_root: &Path,
 ) -> bool {
     if packet.transfer_id.trim().is_empty()
         || packet.origin_id.trim().is_empty()
         || packet.total_bytes > FILE_TRANSFER_MAX_FILE_BYTES
+        || packet.chunk_index != 0
+        || packet.offset != 0
         || !packet.data.is_empty()
     {
         return false;
@@ -6448,7 +6985,45 @@ fn start_incoming_file_transfer(
         return false;
     };
 
-    purge_stale_file_transfers(transfers);
+    let Ok(mut transfers) = transfers.lock() else {
+        return false;
+    };
+    let transfer_key = incoming_file_transfer_key(&packet);
+
+    // `start` is retried when its QUIC acknowledgement is lost. Never reset an
+    // existing transfer in that case: doing so would truncate the `.part` file
+    // and make a perfectly recoverable transfer fail from the beginning.
+    if let Some(existing) = transfers.get_mut(&transfer_key) {
+        if !incoming_file_transfer_matches_packet(existing, &packet) {
+            return false;
+        }
+        existing.last_activity_at = Instant::now();
+        return true;
+    }
+
+    let active_transfer_count = transfers
+        .values()
+        .filter(|transfer| !transfer.completed)
+        .count();
+    if active_transfer_count >= FILE_TRANSFER_MAX_ACTIVE_TRANSFERS {
+        log::warn!(
+            "file transfer start rejected: active transfer limit reached ({})",
+            FILE_TRANSFER_MAX_ACTIVE_TRANSFERS
+        );
+        return false;
+    }
+    let origin_active_transfer_count = transfers
+        .values()
+        .filter(|transfer| !transfer.completed && transfer.origin_id == packet.origin_id)
+        .count();
+    if origin_active_transfer_count >= FILE_TRANSFER_MAX_ACTIVE_TRANSFERS_PER_ORIGIN {
+        log::warn!(
+            "file transfer start rejected: active transfer limit reached for origin={} ({})",
+            packet.origin_id,
+            FILE_TRANSFER_MAX_ACTIVE_TRANSFERS_PER_ORIGIN
+        );
+        return false;
+    }
 
     if let Err(error) = fs::create_dir_all(receive_root) {
         log::warn!(
@@ -6458,66 +7033,129 @@ fn start_incoming_file_transfer(
         return false;
     }
 
-    let final_path = unique_transfer_destination(receive_root, &file_name);
-    let temp_path = receive_root.join(format!(
-        ".mykvm-{}-{}.part",
-        sanitize_transfer_id(&packet.transfer_id),
-        file_name
-    ));
-
-    if let Ok(mut transfers) = transfers.lock() {
-        if let Some(previous) = transfers.remove(&packet.transfer_id) {
-            let _ = fs::remove_file(previous.temp_path);
+    let Some(final_path) = unique_transfer_destination(receive_root, &file_name, &*transfers)
+    else {
+        log::warn!(
+            "file transfer receive failed: could not reserve destination for {}",
+            file_name
+        );
+        return false;
+    };
+    let temp_path = match create_incoming_transfer_temp_file(receive_root, &packet.transfer_id) {
+        Ok(path) => path,
+        Err(error) => {
+            log::warn!(
+                "file transfer receive failed: could not create temporary file in {}: {error}",
+                receive_root.display()
+            );
+            return false;
         }
-    } else {
-        return false;
-    }
-
-    if fs::File::create(&temp_path).is_err() {
-        return false;
-    }
+    };
 
     let transfer = IncomingFileTransfer {
         origin_id: packet.origin_id.clone(),
         target_id: packet.target_id.clone(),
         file_name,
+        destination_hint: packet.destination_hint.clone(),
         total_bytes: packet.total_bytes,
         received_bytes: 0,
         next_chunk_index: 0,
         temp_path,
         final_path,
-        started_at: Instant::now(),
+        last_activity_at: Instant::now(),
+        completed: false,
     };
 
-    transfers
-        .lock()
-        .map(|mut transfers| {
-            transfers.insert(packet.transfer_id, transfer);
-            true
-        })
-        .unwrap_or(false)
+    transfers.insert(transfer_key, transfer);
+    true
 }
 
-fn purge_stale_file_transfers(transfers: &Arc<Mutex<HashMap<String, IncomingFileTransfer>>>) {
+fn prune_completed_file_transfers(
+    transfers: &mut IncomingFileTransfers,
+    max_completed_transfers: usize,
+    preserved_key: Option<&IncomingFileTransferKey>,
+) {
+    let completed_count = transfers
+        .values()
+        .filter(|transfer| transfer.completed)
+        .count();
+    let remove_count = completed_count.saturating_sub(max_completed_transfers);
+    if remove_count == 0 {
+        return;
+    }
+
+    let preserved_key = if max_completed_transfers == 0 {
+        None
+    } else {
+        preserved_key
+    };
+    let mut completed_transfers = transfers
+        .iter()
+        .filter_map(|(key, transfer)| {
+            (transfer.completed && preserved_key != Some(key))
+                .then_some((key.clone(), transfer.last_activity_at))
+        })
+        .collect::<Vec<_>>();
+    completed_transfers.sort_by(|left, right| left.1.cmp(&right.1));
+
+    for (key, _) in completed_transfers.into_iter().take(remove_count) {
+        let Some(transfer) = transfers.remove(&key) else {
+            continue;
+        };
+        match fs::remove_file(&transfer.temp_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => log::warn!(
+                "completed file transfer temporary cleanup failed path={}: {error}",
+                transfer.temp_path.display()
+            ),
+        }
+        log::info!(
+            "pruned completed file transfer state {} (origin={} transfer_id={})",
+            transfer.file_name,
+            key.0,
+            key.1
+        );
+    }
+}
+
+fn purge_stale_file_transfers(transfers: &IncomingFileTransferState) {
     let Ok(mut map) = transfers.lock() else {
         return;
     };
-    let stale_ids: Vec<String> = map
+    let stale_keys: Vec<IncomingFileTransferKey> = map
         .iter()
-        .filter(|(_, t)| t.started_at.elapsed() > FILE_TRANSFER_STALE_TIMEOUT)
-        .map(|(id, _)| id.clone())
+        .filter(|(_, transfer)| {
+            let timeout = if transfer.completed {
+                FILE_TRANSFER_COMPLETED_TIMEOUT
+            } else {
+                FILE_TRANSFER_STALE_TIMEOUT
+            };
+            transfer.last_activity_at.elapsed() > timeout
+        })
+        .map(|(key, _)| key.clone())
         .collect();
-    for id in stale_ids {
-        if let Some(transfer) = map.remove(&id) {
+    for key in stale_keys {
+        if let Some(transfer) = map.remove(&key) {
             let _ = fs::remove_file(&transfer.temp_path);
-            log::info!("purged stale file transfer {} ({})", transfer.file_name, id);
+            log::info!(
+                "purged stale file transfer {} (origin={} transfer_id={})",
+                transfer.file_name,
+                key.0,
+                key.1
+            );
         }
     }
+    prune_completed_file_transfers(
+        &mut map,
+        FILE_TRANSFER_MAX_COMPLETED_TRANSFERS,
+        None,
+    );
 }
 
 fn append_incoming_file_transfer_chunk(
     packet: FileTransferPacket,
-    transfers: &Arc<Mutex<HashMap<String, IncomingFileTransfer>>>,
+    transfers: &IncomingFileTransferState,
 ) -> bool {
     if packet.data.is_empty() || packet.data.len() > FILE_TRANSFER_CHUNK_BYTES {
         return false;
@@ -6525,20 +7163,19 @@ fn append_incoming_file_transfer_chunk(
     let Ok(mut transfers) = transfers.lock() else {
         return false;
     };
-    let Some(transfer) = transfers.get_mut(&packet.transfer_id) else {
+    let transfer_key = incoming_file_transfer_key(&packet);
+    let Some(transfer) = transfers.get_mut(&transfer_key) else {
         return false;
     };
-    if packet.origin_id != transfer.origin_id
-        || packet.target_id != transfer.target_id
-        || packet.file_name != transfer.file_name
-        || packet.total_bytes != transfer.total_bytes
-    {
+    if transfer.completed || !incoming_file_transfer_matches_packet(transfer, &packet) {
         return false;
     }
 
-    let duplicate_end = packet.offset.saturating_add(packet.data.len() as u64);
+    let Some(packet_end) = packet.offset.checked_add(packet.data.len() as u64) else {
+        return false;
+    };
     if packet.chunk_index.saturating_add(1) == transfer.next_chunk_index
-        && duplicate_end == transfer.received_bytes
+        && packet_end == transfer.received_bytes
     {
         let existing_matches = fs::File::open(&transfer.temp_path)
             .and_then(|mut file| {
@@ -6548,59 +7185,192 @@ fn append_incoming_file_transfer_chunk(
                 Ok(existing == packet.data)
             })
             .unwrap_or(false);
+        if existing_matches {
+            transfer.last_activity_at = Instant::now();
+        }
         return existing_matches;
     }
 
     if packet.chunk_index != transfer.next_chunk_index
         || packet.offset != transfer.received_bytes
-        || transfer
-            .received_bytes
-            .saturating_add(packet.data.len() as u64)
-            > transfer.total_bytes
+        || packet_end > transfer.total_bytes
     {
         return false;
     }
 
     let write_result = fs::OpenOptions::new()
-        .append(true)
+        .write(true)
         .open(&transfer.temp_path)
-        .and_then(|mut file| file.write_all(&packet.data));
+        .and_then(|mut file| {
+            file.seek(SeekFrom::Start(packet.offset))?;
+            file.write_all(&packet.data)
+        });
     if let Err(error) = write_result {
         log::warn!("file transfer chunk write failed: {error}");
         return false;
     }
 
-    transfer.received_bytes = transfer
-        .received_bytes
-        .saturating_add(packet.data.len() as u64);
+    transfer.received_bytes = packet_end;
     transfer.next_chunk_index = transfer.next_chunk_index.saturating_add(1);
+    transfer.last_activity_at = Instant::now();
     true
+}
+
+fn abort_incoming_file_transfer(
+    packet: FileTransferPacket,
+    transfers: &IncomingFileTransferState,
+) -> bool {
+    if packet.transfer_id.trim().is_empty()
+        || packet.origin_id.trim().is_empty()
+        || !packet.data.is_empty()
+    {
+        return false;
+    }
+
+    let Ok(mut transfers) = transfers.lock() else {
+        return false;
+    };
+    let transfer_key = incoming_file_transfer_key(&packet);
+    let temp_path = {
+        let Some(transfer) = transfers.get_mut(&transfer_key) else {
+            // `abort` is idempotent. The transfer may already have been purged or
+            // an earlier abort may have removed it.
+            return true;
+        };
+        if !incoming_file_transfer_matches_packet(transfer, &packet) {
+            return false;
+        }
+        if transfer.completed {
+            // A finish acknowledgement may be lost after the destination file was
+            // already published. Never remove a completed file in that case.
+            transfer.last_activity_at = Instant::now();
+            return true;
+        }
+        transfer.temp_path.clone()
+    };
+
+    match fs::remove_file(&temp_path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            log::warn!(
+                "file transfer abort cleanup failed path={}: {error}",
+                temp_path.display()
+            );
+            return false;
+        }
+    }
+
+    let Some(transfer) = transfers.remove(&transfer_key) else {
+        return true;
+    };
+    log::info!(
+        "aborted file transfer {} origin={} transfer_id={}",
+        transfer.file_name,
+        transfer_key.0,
+        transfer_key.1
+    );
+    true
+}
+
+#[cfg(target_os = "windows")]
+fn persist_incoming_transfer_file(temp_path: &Path, final_path: &Path) -> std::io::Result<()> {
+    // Windows rename fails when the destination already exists, so it provides
+    // the no-clobber behavior required here without publishing a partial file.
+    fs::rename(temp_path, final_path)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn persist_incoming_transfer_file(temp_path: &Path, final_path: &Path) -> std::io::Result<()> {
+    // Unix rename replaces an existing destination. A hard link is atomic and
+    // fails instead, after which the private temporary name can be removed.
+    fs::hard_link(temp_path, final_path)?;
+    if let Err(error) = fs::remove_file(temp_path) {
+        log::warn!(
+            "file transfer finalized but temporary link cleanup failed path={}: {error}",
+            temp_path.display()
+        );
+    }
+    Ok(())
+}
+
+fn finalize_incoming_transfer_file(
+    temp_path: &Path,
+    preferred_final_path: &Path,
+    file_name: &str,
+    transfers: &IncomingFileTransfers,
+) -> std::io::Result<PathBuf> {
+    let directory = preferred_final_path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "file transfer destination has no parent directory",
+        )
+    })?;
+    let mut candidate = preferred_final_path.to_path_buf();
+
+    for _ in 0..32 {
+        match persist_incoming_transfer_file(temp_path, &candidate) {
+            Ok(()) => return Ok(candidate),
+            Err(error)
+                if error.kind() == std::io::ErrorKind::AlreadyExists
+                    || transfer_destination_is_occupied(&candidate) =>
+            {
+                candidate = unique_transfer_destination(directory, file_name, transfers)
+                    .ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::AlreadyExists,
+                            "could not allocate a collision-free file transfer destination",
+                        )
+                    })?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "file transfer destination kept colliding during finalization",
+    ))
 }
 
 fn finish_incoming_file_transfer(
     packet: FileTransferPacket,
-    transfers: &Arc<Mutex<HashMap<String, IncomingFileTransfer>>>,
+    transfers: &IncomingFileTransferState,
 ) -> bool {
     if !packet.data.is_empty() {
         return false;
     }
-    let (temp_path, final_path, file_name, total_bytes) = {
-        let Ok(transfers) = transfers.lock() else {
+    let Ok(mut transfers) = transfers.lock() else {
+        return false;
+    };
+    let transfer_key = incoming_file_transfer_key(&packet);
+    let (temp_path, preferred_final_path, file_name, total_bytes) = {
+        let Some(transfer) = transfers.get_mut(&transfer_key) else {
             return false;
         };
-        let Some(transfer) = transfers.get(&packet.transfer_id) else {
+        if !incoming_file_transfer_matches_packet(transfer, &packet) {
             return false;
-        };
-        if packet.origin_id != transfer.origin_id
-            || packet.target_id != transfer.target_id
-            || packet.file_name != transfer.file_name
-            || packet.total_bytes != transfer.total_bytes
-            || packet.offset != transfer.received_bytes
+        }
+
+        // Keep completed state for a short period so a lost finish acknowledgement
+        // can be answered idempotently without creating a second destination file.
+        if transfer.completed {
+            if packet.offset == transfer.received_bytes
+                && packet.chunk_index == transfer.next_chunk_index
+            {
+                transfer.last_activity_at = Instant::now();
+                return true;
+            }
+            return false;
+        }
+
+        if packet.offset != transfer.received_bytes
             || packet.chunk_index != transfer.next_chunk_index
             || transfer.received_bytes != transfer.total_bytes
         {
             return false;
         }
+
         (
             transfer.temp_path.clone(),
             transfer.final_path.clone(),
@@ -6609,24 +7379,59 @@ fn finish_incoming_file_transfer(
         )
     };
 
-    match fs::rename(&temp_path, &final_path) {
-        Ok(()) => {
-            if let Ok(mut transfers) = transfers.lock() {
-                transfers.remove(&packet.transfer_id);
-            }
-            log::info!(
-                "received file transfer {} bytes={} path={}",
-                file_name,
-                total_bytes,
-                final_path.display()
+    let temp_metadata = match fs::symlink_metadata(&temp_path) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            log::warn!(
+                "file transfer finalize failed: temporary file metadata unavailable path={}: {error}",
+                temp_path.display()
             );
-            true
+            return false;
         }
+    };
+    if !temp_metadata.file_type().is_file() || temp_metadata.len() != total_bytes {
+        log::warn!(
+            "file transfer finalize rejected: temporary file changed path={} expected_bytes={} actual_bytes={} is_file={}",
+            temp_path.display(),
+            total_bytes,
+            temp_metadata.len(),
+            temp_metadata.file_type().is_file()
+        );
+        return false;
+    }
+
+    let final_path = match finalize_incoming_transfer_file(
+        &temp_path,
+        &preferred_final_path,
+        &file_name,
+        &*transfers,
+    ) {
+        Ok(path) => path,
         Err(error) => {
             log::warn!("file transfer finalize failed: {error}");
-            false
+            return false;
         }
-    }
+    };
+
+    let Some(transfer) = transfers.get_mut(&transfer_key) else {
+        log::error!("file transfer state disappeared after finalization");
+        return true;
+    };
+    transfer.final_path = final_path.clone();
+    transfer.completed = true;
+    transfer.last_activity_at = Instant::now();
+    prune_completed_file_transfers(
+        &mut transfers,
+        FILE_TRANSFER_MAX_COMPLETED_TRANSFERS,
+        Some(&transfer_key),
+    );
+    log::info!(
+        "received file transfer {} bytes={} path={}",
+        file_name,
+        total_bytes,
+        final_path.display()
+    );
+    true
 }
 
 fn file_transfer_packet_authorized(layout: &LayoutState, packet: &FileTransferPacket) -> bool {
@@ -6709,25 +7514,254 @@ fn home_directory() -> Option<PathBuf> {
     #[cfg(not(target_os = "windows"))]
     let candidate = std::env::var_os("HOME");
 
-    candidate.map(PathBuf::from).filter(|path| path.is_dir())
+    candidate
+        .map(PathBuf::from)
+        .filter(|path| path.is_dir())
+        .and_then(|path| fs::canonicalize(path).ok())
+}
+
+fn canonical_remote_file_root(allowed_root: &Path) -> Result<PathBuf, String> {
+    let root = fs::canonicalize(allowed_root)
+        .map_err(|error| format!("无法解析远程文件允许目录: {error}"))?;
+    if !root.is_dir() {
+        return Err("远程文件允许目录不是有效文件夹。".into());
+    }
+    Ok(root)
+}
+
+fn validate_remote_file_path_length(path: &str) -> Result<(), String> {
+    if path.len() > REMOTE_FILE_MAX_PATH_BYTES {
+        return Err(format!(
+            "远程路径长度超过上限（{} 字节）。",
+            REMOTE_FILE_MAX_PATH_BYTES
+        ));
+    }
+    Ok(())
+}
+
+fn validate_remote_pull_file_count(paths: &[String]) -> Result<(), String> {
+    if paths.len() > REMOTE_FILE_MAX_PULL_FILES {
+        return Err(format!(
+            "单次最多拉取 {} 个文件。",
+            REMOTE_FILE_MAX_PULL_FILES
+        ));
+    }
+    Ok(())
+}
+
+fn validate_remote_file_identifier(
+    value: &str,
+    field_name: &str,
+    required: bool,
+) -> Result<(), String> {
+    if required && value.trim().is_empty() {
+        return Err(format!("{field_name} 不能为空。"));
+    }
+    if value.len() > REMOTE_FILE_MAX_IDENTIFIER_BYTES {
+        return Err(format!(
+            "{field_name} 长度超过上限（{} 字节）。",
+            REMOTE_FILE_MAX_IDENTIFIER_BYTES
+        ));
+    }
+    Ok(())
+}
+
+fn validate_remote_file_request_shape(packet: &RemoteFilePacket) -> Result<(), String> {
+    validate_remote_file_identifier(&packet.request_id, "远程文件请求 ID", true)?;
+    validate_remote_file_identifier(&packet.origin_id, "远程文件来源 ID", true)?;
+    validate_remote_file_identifier(&packet.target_id, "远程文件目标 ID", false)?;
+
+    if !packet.entries.is_empty()
+        || packet.file_count != 0
+        || packet.byte_count != 0
+        || packet.failed_count != 0
+        || packet.error.is_some()
+    {
+        return Err("远程文件请求包含不应出现的结果字段。".into());
+    }
+
+    match packet.kind.as_str() {
+        "list" => {
+            validate_remote_file_path_length(&packet.path)?;
+            if !packet.file_paths.is_empty() {
+                return Err("远程目录请求不应包含文件路径列表。".into());
+            }
+        }
+        "pull" => {
+            if !packet.path.is_empty() {
+                return Err("远程拉取请求不应包含目录路径。".into());
+            }
+            validate_remote_pull_file_count(&packet.file_paths)?;
+            for path in &packet.file_paths {
+                validate_remote_file_path_length(path)?;
+            }
+        }
+        _ => return Err("不支持的远程文件请求类型。".into()),
+    }
+
+    Ok(())
+}
+
+fn validate_remote_file_response_shape(packet: &RemoteFilePacket) -> Result<(), String> {
+    validate_remote_file_identifier(&packet.request_id, "远程文件请求 ID", true)?;
+    validate_remote_file_identifier(&packet.origin_id, "远程文件来源 ID", true)?;
+    validate_remote_file_identifier(&packet.target_id, "远程文件目标 ID", false)?;
+
+    if !packet.file_paths.is_empty() {
+        return Err("远程文件结果不应包含请求路径列表。".into());
+    }
+    if packet
+        .error
+        .as_ref()
+        .is_some_and(|error| error.len() > REMOTE_FILE_MAX_ERROR_BYTES)
+    {
+        return Err(format!(
+            "远程文件错误信息超过上限（{} 字节）。",
+            REMOTE_FILE_MAX_ERROR_BYTES
+        ));
+    }
+
+    match packet.kind.as_str() {
+        "listResult" => {
+            validate_remote_file_path_length(&packet.path)?;
+            if packet.file_count != 0 || packet.byte_count != 0 || packet.failed_count != 0 {
+                return Err("远程目录结果包含不应出现的传输统计。".into());
+            }
+            if packet.entries.len() > REMOTE_FILE_MAX_DIRECTORY_ENTRIES {
+                return Err(format!(
+                    "远程目录结果超过上限（{} 项）。",
+                    REMOTE_FILE_MAX_DIRECTORY_ENTRIES
+                ));
+            }
+            for entry in &packet.entries {
+                validate_remote_file_path_length(&entry.name)?;
+                validate_remote_file_path_length(&entry.path)?;
+            }
+        }
+        "pullResult" => {
+            if !packet.path.is_empty() || !packet.entries.is_empty() {
+                return Err("远程拉取结果包含不应出现的目录字段。".into());
+            }
+            if packet.file_count.saturating_add(packet.failed_count)
+                > REMOTE_FILE_MAX_PULL_FILES as u64
+            {
+                return Err(format!(
+                    "远程拉取结果文件数超过上限（{} 项）。",
+                    REMOTE_FILE_MAX_PULL_FILES
+                ));
+            }
+        }
+        _ => return Err("不支持的远程文件结果类型。".into()),
+    }
+
+    Ok(())
+}
+
+fn resolve_remote_path_against_root(path: &Path, root: &Path) -> Result<PathBuf, String> {
+    let resolved = fs::canonicalize(path)
+        .map_err(|error| format!("无法访问远程路径 {}: {error}", path.display()))?;
+    // Canonicalization is intentional: it prevents `..` components and
+    // symlinks from escaping the paired device's user-directory sandbox.
+    if resolved.strip_prefix(root).is_err() {
+        return Err("远程路径必须位于用户主目录内。".into());
+    }
+    Ok(resolved)
+}
+
+fn remote_path_candidate(path: &str, root: &Path) -> PathBuf {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return root.to_path_buf();
+    }
+
+    let requested = Path::new(trimmed);
+    if requested.is_absolute() {
+        requested.to_path_buf()
+    } else {
+        root.join(requested)
+    }
+}
+
+fn resolve_remote_file_path_from_root(path: &str, root: &Path) -> Result<PathBuf, String> {
+    validate_remote_file_path_length(path)?;
+    let candidate = remote_path_candidate(path, root);
+    resolve_remote_path_against_root(&candidate, root)
+}
+
+fn resolve_remote_file_path(path: &str) -> Result<PathBuf, String> {
+    let root = home_directory()
+        .ok_or_else(|| "无法解析用户主目录，暂时无法访问远程文件。".to_string())?;
+    resolve_remote_file_path_from_root(path, &root)
+}
+
+fn resolve_remote_file_path_with_root(
+    path: &str,
+    allowed_root: &Path,
+) -> Result<PathBuf, String> {
+    let root = canonical_remote_file_root(allowed_root)?;
+    resolve_remote_file_path_from_root(path, &root)
 }
 
 fn enumerate_remote_directory(path: &str) -> Result<Vec<RemoteDirEntry>, String> {
-    let trimmed = path.trim();
-    let directory = if trimmed.is_empty() {
-        home_directory()
-            .ok_or_else(|| "无法解析用户主目录，请直接输入路径。".to_string())?
-    } else {
-        PathBuf::from(trimmed)
-    };
+    let root = home_directory()
+        .ok_or_else(|| "无法解析用户主目录，暂时无法访问远程文件。".to_string())?;
+    let directory = resolve_remote_file_path_from_root(path, &root)?;
+    enumerate_remote_directory_from_root(&directory, &root)
+}
+
+fn enumerate_remote_directory_with_root(
+    path: &str,
+    allowed_root: &Path,
+) -> Result<Vec<RemoteDirEntry>, String> {
+    let root = canonical_remote_file_root(allowed_root)?;
+    let directory = resolve_remote_file_path_from_root(path, &root)?;
+    enumerate_remote_directory_from_root(&directory, &root)
+}
+
+fn enumerate_remote_directory_from_root(
+    directory: &Path,
+    root: &Path,
+) -> Result<Vec<RemoteDirEntry>, String> {
+    enumerate_remote_directory_from_root_with_limit(
+        directory,
+        root,
+        REMOTE_FILE_MAX_DIRECTORY_ENTRIES,
+    )
+}
+
+fn enumerate_remote_directory_from_root_with_limit(
+    directory: &Path,
+    root: &Path,
+    max_entries: usize,
+) -> Result<Vec<RemoteDirEntry>, String> {
     let read_dir = fs::read_dir(&directory)
         .map_err(|error| format!("无法读取目录 {}: {error}", directory.display()))?;
     let mut entries = Vec::new();
     for entry in read_dir {
         let entry = entry.map_err(|error| format!("读取目录条目失败: {error}"))?;
-        let metadata = entry
-            .metadata()
-            .map_err(|error| format!("读取目录条目元数据失败: {error}"))?;
+        let entry_path = entry.path();
+        let canonical_entry = match resolve_remote_path_against_root(&entry_path, &root) {
+            Ok(path) => path,
+            Err(error) => {
+                log::debug!(
+                    "remote directory entry skipped outside or inaccessible path {}: {}",
+                    entry_path.display(),
+                    error
+                );
+                continue;
+            }
+        };
+        let metadata = match fs::metadata(&canonical_entry) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                log::debug!(
+                    "remote directory entry metadata unavailable {}: {}",
+                    canonical_entry.display(),
+                    error
+                );
+                continue;
+            }
+        };
         let is_dir = metadata.is_dir();
         let size = if is_dir { 0 } else { metadata.len() };
         let modified_ms = metadata
@@ -6736,9 +7770,27 @@ fn enumerate_remote_directory(path: &str) -> Result<Vec<RemoteDirEntry>, String>
             .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
             .map(|duration| duration.as_millis() as u64)
             .unwrap_or(0);
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let path = canonical_entry.to_string_lossy().into_owned();
+        if let Err(error) = validate_remote_file_path_length(&name)
+            .and_then(|_| validate_remote_file_path_length(&path))
+        {
+            log::debug!(
+                "remote directory entry skipped because its metadata is too long {}: {}",
+                canonical_entry.display(),
+                error
+            );
+            continue;
+        }
+        if entries.len() >= max_entries {
+            return Err(format!(
+                "目录条目超过上限（{} 项），请缩小浏览范围。",
+                max_entries
+            ));
+        }
         entries.push(RemoteDirEntry {
-            name: entry.file_name().to_string_lossy().into_owned(),
-            path: entry.path().to_string_lossy().into_owned(),
+            name,
+            path,
             is_dir,
             size,
             modified_ms,
@@ -6773,6 +7825,7 @@ fn remote_file_packet(
         entries,
         file_count,
         byte_count,
+        failed_count: 0,
         error,
     }
 }
@@ -6848,24 +7901,43 @@ fn controller_default_discovery_port() -> u16 {
     DISCOVERY_PORT
 }
 
-fn resolve_remote_file_pending(
-    packet: RemoteFilePacket,
-    pending: &Arc<Mutex<HashMap<String, tokio::sync::oneshot::Sender<RemoteFileResponse>>>>,
-) -> bool {
+fn resolve_remote_file_pending(packet: RemoteFilePacket, pending: &RemoteFilePendingMap) -> bool {
     if packet.request_id.trim().is_empty() {
         return false;
     }
-    let Some(sender) = pending
-        .lock()
-        .ok()
-        .and_then(|mut map| map.remove(&packet.request_id))
-    else {
-        return false;
+    let sender = match pending.lock() {
+        Ok(mut map) => {
+            let Some(expected) = map.get(&packet.request_id) else {
+                // A timed-out or already-resolved request can legitimately receive a
+                // retransmitted result. It has passed the packet validation in the
+                // caller, so treat it as handled and avoid triggering another retry.
+                return true;
+            };
+            if expected.expected_origin_id != packet.origin_id
+                || expected.expected_kind != packet.kind
+            {
+                log::warn!(
+                    "remote file result rejected: request correlation mismatch request_id={} expected_origin={} actual_origin={} expected_kind={} actual_kind={}",
+                    packet.request_id,
+                    expected.expected_origin_id,
+                    packet.origin_id,
+                    expected.expected_kind,
+                    packet.kind
+                );
+                return false;
+            }
+            let Some(pending) = map.remove(&packet.request_id) else {
+                return true;
+            };
+            pending.sender
+        }
+        Err(_) => return false,
     };
     let _ = sender.send(RemoteFileResponse {
         entries: packet.entries,
         file_count: packet.file_count,
         byte_count: packet.byte_count,
+        failed_count: packet.failed_count,
         error: packet.error,
     });
     true
@@ -6879,6 +7951,8 @@ fn handle_remote_list_request(
     local_peer_id: &str,
     remote_file_transport: &Arc<Mutex<Option<quic_transport::TransportHandle>>>,
     peers: &Arc<Mutex<Vec<LanPeer>>>,
+    request_cache: &RemoteFileRequestCache,
+    transport_packets: &Arc<AtomicU64>,
 ) -> bool {
     let peers_snapshot = active_peer_snapshot(peers);
     let Ok(target) = remote_file_target_for_origin(layout, &peers_snapshot, &packet.origin_id) else {
@@ -6886,6 +7960,7 @@ fn handle_remote_list_request(
             "remote file list request rejected: cannot resolve reply target for origin={}",
             packet.origin_id
         );
+        forget_remote_file_request(request_cache, &packet);
         return false;
     };
     let Some(transport) = remote_file_transport
@@ -6894,13 +7969,17 @@ fn handle_remote_list_request(
         .and_then(|transport| transport.clone())
     else {
         log::warn!("remote file list request rejected: no local QUIC transport available");
+        forget_remote_file_request(request_cache, &packet);
         return false;
     };
+    let request = packet.clone();
     let request_id = packet.request_id.clone();
     let path = packet.path.clone();
     let origin_id = packet.origin_id.clone();
     let target_for_reply = target.clone();
     let local_peer_id_owned = local_peer_id.to_string();
+    let request_cache = Arc::clone(request_cache);
+    let transport_packets = Arc::clone(transport_packets);
     tauri::async_runtime::spawn_blocking(move || {
         let (entries, error) = match enumerate_remote_directory(&path) {
             Ok(entries) => (entries, None),
@@ -6918,11 +7997,20 @@ fn handle_remote_list_request(
             0,
             error,
         );
+        complete_remote_file_request(&request_cache, &request, reply.clone());
         if let Err(send_error) = send_remote_file_packet(&transport, &target_for_reply, reply) {
             log::warn!("remote file list reply failed to={origin_id}: {send_error}");
+        } else {
+            transport_packets.fetch_add(1, Ordering::Relaxed);
         }
     });
     true
+}
+
+fn remember_first_remote_pull_error(first_error: &mut Option<String>, error: String) {
+    if first_error.is_none() {
+        *first_error = Some(error);
+    }
 }
 
 /// Client-side handler for a `pull` request: read each requested file on a
@@ -6934,9 +8022,246 @@ fn handle_remote_pull_request(
     local_peer_id: &str,
     remote_file_transport: &Arc<Mutex<Option<quic_transport::TransportHandle>>>,
     peers: &Arc<Mutex<Vec<LanPeer>>>,
+    request_cache: &RemoteFileRequestCache,
+    transport_packets: &Arc<AtomicU64>,
 ) -> bool {
     let peers_snapshot = active_peer_snapshot(peers);
     let Ok(target) = remote_file_target_for_origin(layout, &peers_snapshot, &packet.origin_id) else {
+        forget_remote_file_request(request_cache, &packet);
+        return false;
+    };
+    let Some(transport) = remote_file_transport
+        .lock()
+        .ok()
+        .and_then(|transport| transport.clone())
+    else {
+        forget_remote_file_request(request_cache, &packet);
+        return false;
+    };
+    let request = packet.clone();
+    let request_id = packet.request_id.clone();
+    let origin_id = packet.origin_id.clone();
+    let file_paths = packet.file_paths;
+    let allowed_root = home_directory();
+    let target_for_reply = target.clone();
+    let local_peer_id_owned = local_peer_id.to_string();
+    let request_cache = Arc::clone(request_cache);
+    let transport_packets = Arc::clone(transport_packets);
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut file_count = 0_u64;
+        let mut byte_count = 0_u64;
+        let mut failed_count = 0_u64;
+        let mut first_error: Option<String> = None;
+        if let Err(error) = validate_remote_pull_file_count(&file_paths) {
+            failed_count = file_paths.len() as u64;
+            remember_first_remote_pull_error(&mut first_error, error);
+        }
+        let allowed_root = allowed_root.and_then(|root| {
+            match canonical_remote_file_root(&root) {
+                Ok(root) => Some(root),
+                Err(error) => {
+                    log::warn!("remote pull rejected: invalid local user directory: {error}");
+                    failed_count = file_paths.len() as u64;
+                    remember_first_remote_pull_error(
+                        &mut first_error,
+                        format!("无法解析远程文件允许目录：{error}"),
+                    );
+                    None
+                }
+            }
+        });
+        if first_error.is_none() {
+            let Some(allowed_root) = allowed_root.as_deref() else {
+                let error = "无法解析本地用户目录，暂时无法拉取远程文件。".to_string();
+                log::warn!("remote pull rejected: {error}");
+                failed_count = file_paths.len() as u64;
+                remember_first_remote_pull_error(&mut first_error, error);
+                return send_remote_pull_result(
+                    &transport,
+                    &target_for_reply,
+                    &request_cache,
+                    transport_packets.as_ref(),
+                    &request,
+                    &request_id,
+                    &local_peer_id_owned,
+                    &origin_id,
+                    file_count,
+                    byte_count,
+                    failed_count,
+                    first_error,
+                );
+            };
+            for path_value in &file_paths {
+                let path_value = path_value.trim();
+                if path_value.is_empty() {
+                    failed_count = failed_count.saturating_add(1);
+                    remember_first_remote_pull_error(
+                        &mut first_error,
+                        "远程文件路径不能为空。".to_string(),
+                    );
+                    continue;
+                }
+                let path = match resolve_remote_file_path_from_root(path_value, allowed_root) {
+                    Ok(path) => path,
+                    Err(error) => {
+                        log::warn!(
+                            "remote pull rejected path {}: {}",
+                            path_value,
+                            error
+                        );
+                        failed_count = failed_count.saturating_add(1);
+                        remember_first_remote_pull_error(&mut first_error, error);
+                        continue;
+                    }
+                };
+                let metadata = match fs::metadata(&path) {
+                    Ok(metadata) => metadata,
+                    Err(error) => {
+                        let message = format!(
+                            "无法读取远程文件 {}: {error}",
+                            path.display()
+                        );
+                        log::warn!("{message}");
+                        failed_count = failed_count.saturating_add(1);
+                        remember_first_remote_pull_error(&mut first_error, message);
+                        continue;
+                    }
+                };
+                if !metadata.is_file() {
+                    failed_count = failed_count.saturating_add(1);
+                    remember_first_remote_pull_error(
+                        &mut first_error,
+                        format!("远程路径不是文件：{}", path.display()),
+                    );
+                    continue;
+                }
+                if metadata.len() > FILE_TRANSFER_MAX_FILE_BYTES {
+                    log::warn!(
+                        "remote pull skipped oversized file {} ({} bytes)",
+                        path.display(),
+                        metadata.len()
+                    );
+                    failed_count = failed_count.saturating_add(1);
+                    remember_first_remote_pull_error(
+                        &mut first_error,
+                        format!(
+                            "文件超过大小限制（{} 字节）：{}",
+                            FILE_TRANSFER_MAX_FILE_BYTES,
+                            path.display()
+                        ),
+                    );
+                    continue;
+                }
+                let name = match transfer_file_name(&path) {
+                    Ok(name) => name,
+                    Err(error) => {
+                        failed_count = failed_count.saturating_add(1);
+                        remember_first_remote_pull_error(&mut first_error, error);
+                        continue;
+                    }
+                };
+                let file = TransferFile {
+                    path,
+                    name,
+                    total_bytes: metadata.len(),
+                };
+                match send_transfer_file(
+                    &transport,
+                    &local_peer_id_owned,
+                    &target_for_reply,
+                    &file,
+                    None,
+                ) {
+                    Ok(packet_count) => {
+                        transport_packets.fetch_add(packet_count, Ordering::Relaxed);
+                        file_count += 1;
+                        byte_count = byte_count.saturating_add(file.total_bytes);
+                    }
+                    Err(error) => {
+                        let FileTransferSendError {
+                            message,
+                            packet_count,
+                        } = error;
+                        transport_packets.fetch_add(packet_count, Ordering::Relaxed);
+                        log::warn!(
+                            "remote pull file {} failed: {message}",
+                            file.path.display()
+                        );
+                        failed_count = failed_count.saturating_add(1);
+                        remember_first_remote_pull_error(&mut first_error, message);
+                    }
+                }
+            }
+        }
+        send_remote_pull_result(
+            &transport,
+            &target_for_reply,
+            &request_cache,
+            transport_packets.as_ref(),
+            &request,
+            &request_id,
+            &local_peer_id_owned,
+            &origin_id,
+            file_count,
+            byte_count,
+            failed_count,
+            first_error,
+        );
+    });
+    true
+}
+
+#[allow(clippy::too_many_arguments)]
+fn send_remote_pull_result(
+    transport: &quic_transport::TransportHandle,
+    target: &FileTransferTarget,
+    request_cache: &RemoteFileRequestCache,
+    transport_packets: &AtomicU64,
+    request: &RemoteFilePacket,
+    request_id: &str,
+    local_peer_id: &str,
+    origin_id: &str,
+    file_count: u64,
+    byte_count: u64,
+    failed_count: u64,
+    first_error: Option<String>,
+) {
+    let error = if file_count == 0 {
+        Some(first_error.unwrap_or_else(|| "没有找到可拉取的文件。".to_string()))
+    } else {
+        None
+    };
+    let mut reply = remote_file_packet(
+        "pullResult",
+        request_id,
+        local_peer_id,
+        target,
+        String::new(),
+        Vec::new(),
+        Vec::new(),
+        file_count,
+        byte_count,
+        error,
+    );
+    reply.failed_count = failed_count;
+    complete_remote_file_request(request_cache, request, reply.clone());
+    if let Err(send_error) = send_remote_file_packet(transport, target, reply) {
+        log::warn!("remote file pull reply failed to={origin_id}: {send_error}");
+    } else {
+        transport_packets.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+fn replay_remote_file_request(
+    request: &RemoteFilePacket,
+    reply: RemoteFilePacket,
+    layout: &LayoutState,
+    remote_file_transport: &Arc<Mutex<Option<quic_transport::TransportHandle>>>,
+    peers: &Arc<Mutex<Vec<LanPeer>>>,
+    transport_packets: &AtomicU64,
+) -> bool {
+    let peers_snapshot = active_peer_snapshot(peers);
+    let Ok(target) = remote_file_target_for_origin(layout, &peers_snapshot, &request.origin_id) else {
         return false;
     };
     let Some(transport) = remote_file_transport
@@ -6946,70 +8271,15 @@ fn handle_remote_pull_request(
     else {
         return false;
     };
-    let request_id = packet.request_id.clone();
-    let origin_id = packet.origin_id.clone();
-    let file_paths = packet.file_paths.clone();
-    let target_for_reply = target.clone();
-    let local_peer_id_owned = local_peer_id.to_string();
-    tauri::async_runtime::spawn_blocking(move || {
-        let mut file_count = 0_u64;
-        let mut byte_count = 0_u64;
-        for path_value in &file_paths {
-            let path_value = path_value.trim();
-            if path_value.is_empty() {
-                continue;
-            }
-            let path = PathBuf::from(path_value);
-            let metadata = match fs::metadata(&path) {
-                Ok(metadata) => metadata,
-                Err(_) => continue,
-            };
-            if !metadata.is_file() {
-                continue;
-            }
-            if metadata.len() > FILE_TRANSFER_MAX_FILE_BYTES {
-                log::warn!(
-                    "remote pull skipped oversized file {} ({} bytes)",
-                    path.display(),
-                    metadata.len()
-                );
-                continue;
-            }
-            let name = match transfer_file_name(&path) {
-                Ok(name) => name,
-                Err(_) => continue,
-            };
-            let file = TransferFile {
-                path,
-                name,
-                total_bytes: metadata.len(),
-            };
-            match send_transfer_file(&transport, &local_peer_id_owned, &target_for_reply, &file, None) {
-                Ok(_) => {
-                    file_count += 1;
-                    byte_count = byte_count.saturating_add(file.total_bytes);
-                }
-                Err(error) => {
-                    log::warn!("remote pull file {} failed: {error}", file.path.display());
-                }
-            }
-        }
-        let reply = remote_file_packet(
-            "pullResult",
-            &request_id,
-            &local_peer_id_owned,
-            &target_for_reply,
-            String::new(),
-            Vec::new(),
-            Vec::new(),
-            file_count,
-            byte_count,
-            None,
+    if let Err(error) = send_remote_file_packet(&transport, &target, reply) {
+        log::warn!(
+            "remote file request replay failed to={} request_id={}: {error}",
+            request.origin_id,
+            request.request_id
         );
-        if let Err(send_error) = send_remote_file_packet(&transport, &target_for_reply, reply) {
-            log::warn!("remote file pull reply failed to={origin_id}: {send_error}");
-        }
-    });
+        return false;
+    }
+    transport_packets.fetch_add(1, Ordering::Relaxed);
     true
 }
 
@@ -7019,7 +8289,9 @@ fn handle_remote_file_packet(
     local_peer_id: &str,
     remote_file_transport: &Arc<Mutex<Option<quic_transport::TransportHandle>>>,
     peers: &Arc<Mutex<Vec<LanPeer>>>,
-    pending: &Arc<Mutex<HashMap<String, tokio::sync::oneshot::Sender<RemoteFileResponse>>>>,
+    pending: &RemoteFilePendingMap,
+    request_cache: &RemoteFileRequestCache,
+    transport_packets: &Arc<AtomicU64>,
 ) -> bool {
     let Some(packet) = decode_wire_packet::<RemoteFilePacket>(payload) else {
         log::debug!("remote file packet ignored: not a decodable remote-file payload");
@@ -7059,15 +8331,57 @@ fn handle_remote_file_packet(
         log::debug!("remote file packet ignored: origin is the local device");
         return true;
     }
+    if matches!(packet.kind.as_str(), "list" | "pull") {
+        if let Err(error) = validate_remote_file_request_shape(&packet) {
+            log::warn!(
+                "remote file request rejected before caching kind={}: {}",
+                packet.kind,
+                error
+            );
+            return false;
+        }
+    }
 
     match packet.kind.as_str() {
         "list" => {
+            if packet.request_id.trim().is_empty() {
+                log::warn!("remote file list request rejected: empty request id");
+                return false;
+            }
+            match begin_remote_file_request(request_cache, &packet) {
+                RemoteFileRequestDecision::Start => {}
+                RemoteFileRequestDecision::DuplicateInFlight => return true,
+                RemoteFileRequestDecision::Replay(reply) => {
+                    return replay_remote_file_request(
+                        &packet,
+                        reply,
+                        layout,
+                        remote_file_transport,
+                        peers,
+                        transport_packets.as_ref(),
+                    );
+                }
+                RemoteFileRequestDecision::Conflict => {
+                    log::warn!(
+                        "remote file list request rejected: request id reused with different payload origin={} request_id={}",
+                        packet.origin_id,
+                        packet.request_id
+                    );
+                    return false;
+                }
+                RemoteFileRequestDecision::Unavailable => {
+                    log::warn!("remote file list request rejected: request cache unavailable");
+                    return false;
+                }
+            }
             let handled = handle_remote_list_request(
                 packet,
                 layout,
                 local_peer_id,
                 remote_file_transport,
                 peers,
+                request_cache,
+                transport_packets,
             );
             if !handled {
                 log::warn!("remote file list request could not be handled on this device");
@@ -7075,19 +8389,61 @@ fn handle_remote_file_packet(
             handled
         }
         "pull" => {
+            if packet.request_id.trim().is_empty() {
+                log::warn!("remote file pull request rejected: empty request id");
+                return false;
+            }
+            match begin_remote_file_request(request_cache, &packet) {
+                RemoteFileRequestDecision::Start => {}
+                RemoteFileRequestDecision::DuplicateInFlight => return true,
+                RemoteFileRequestDecision::Replay(reply) => {
+                    return replay_remote_file_request(
+                        &packet,
+                        reply,
+                        layout,
+                        remote_file_transport,
+                        peers,
+                        transport_packets.as_ref(),
+                    );
+                }
+                RemoteFileRequestDecision::Conflict => {
+                    log::warn!(
+                        "remote file pull request rejected: request id reused with different payload origin={} request_id={}",
+                        packet.origin_id,
+                        packet.request_id
+                    );
+                    return false;
+                }
+                RemoteFileRequestDecision::Unavailable => {
+                    log::warn!("remote file pull request rejected: request cache unavailable");
+                    return false;
+                }
+            }
             let handled = handle_remote_pull_request(
                 packet,
                 layout,
                 local_peer_id,
                 remote_file_transport,
                 peers,
+                request_cache,
+                transport_packets,
             );
             if !handled {
                 log::warn!("remote file pull request could not be handled on this device");
             }
             handled
         }
-        "listResult" | "pullResult" => resolve_remote_file_pending(packet, pending),
+        "listResult" | "pullResult" => {
+            if let Err(error) = validate_remote_file_response_shape(&packet) {
+                log::warn!(
+                    "remote file response rejected kind={}: {}",
+                    packet.kind,
+                    error
+                );
+                return false;
+            }
+            resolve_remote_file_pending(packet, pending)
+        }
         _ => {
             log::debug!("remote file packet ignored: unknown kind {}", packet.kind);
             false
@@ -7111,9 +8467,34 @@ fn sanitize_transfer_file_name(name: &str) -> Option<String> {
     let output = output.trim().trim_matches('.').trim().to_string();
     if output.is_empty() || output == "." || output == ".." {
         None
+    } else if is_windows_reserved_transfer_file_name(&output) {
+        Some(format!("_{output}"))
     } else {
         Some(output)
     }
+}
+
+#[cfg(target_os = "windows")]
+fn is_windows_reserved_transfer_file_name(name: &str) -> bool {
+    let stem = name
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .trim_end_matches(|character| character == ' ' || character == '.');
+    let stem = stem.to_ascii_uppercase();
+    matches!(
+        stem.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL"
+            | "COM1" | "COM2" | "COM3" | "COM4" | "COM5" | "COM6" | "COM7" | "COM8"
+            | "COM9"
+            | "LPT1" | "LPT2" | "LPT3" | "LPT4" | "LPT5" | "LPT6" | "LPT7" | "LPT8"
+            | "LPT9"
+    )
+}
+
+#[cfg(not(target_os = "windows"))]
+fn is_windows_reserved_transfer_file_name(_name: &str) -> bool {
+    false
 }
 
 fn sanitize_transfer_id(transfer_id: &str) -> String {
@@ -7129,10 +8510,71 @@ fn sanitize_transfer_id(transfer_id: &str) -> String {
     }
 }
 
-fn unique_transfer_destination(directory: &Path, file_name: &str) -> PathBuf {
+fn create_incoming_transfer_temp_file(
+    directory: &Path,
+    transfer_id: &str,
+) -> std::io::Result<PathBuf> {
+    let safe_transfer_id = sanitize_transfer_id(transfer_id);
+    for attempt in 0..32 {
+        let candidate = directory.join(format!(
+            ".mykvm-{}-{}-{attempt}.part",
+            safe_transfer_id,
+            random_hex(8)
+        ));
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(_) => return Ok(candidate),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "could not allocate a unique temporary transfer file",
+    ))
+}
+
+#[cfg(target_os = "windows")]
+fn transfer_paths_equal(left: &Path, right: &Path) -> bool {
+    left.to_string_lossy()
+        .as_ref()
+        .eq_ignore_ascii_case(right.to_string_lossy().as_ref())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn transfer_paths_equal(left: &Path, right: &Path) -> bool {
+    left == right
+}
+
+fn transfer_destination_is_occupied(candidate: &Path) -> bool {
+    match fs::symlink_metadata(candidate) {
+        Ok(_) => true,
+        Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+    }
+}
+
+fn transfer_destination_is_available(
+    candidate: &Path,
+    transfers: &IncomingFileTransfers,
+) -> bool {
+    !transfer_destination_is_occupied(candidate)
+        && transfers
+            .values()
+            .all(|transfer| !transfer_paths_equal(&transfer.final_path, candidate))
+}
+
+fn unique_transfer_destination(
+    directory: &Path,
+    file_name: &str,
+    transfers: &IncomingFileTransfers,
+) -> Option<PathBuf> {
     let first = directory.join(file_name);
-    if !first.exists() {
-        return first;
+    if transfer_destination_is_available(&first, transfers) {
+        return Some(first);
     }
 
     let path = Path::new(file_name);
@@ -7148,12 +8590,22 @@ fn unique_transfer_destination(directory: &Path, file_name: &str) -> PathBuf {
 
     for index in 1..10_000 {
         let candidate = directory.join(format!("{stem} ({index}){extension}"));
-        if !candidate.exists() {
-            return candidate;
+        if transfer_destination_is_available(&candidate, transfers) {
+            return Some(candidate);
         }
     }
 
-    directory.join(format!("{stem}-{}{extension}", random_hex(4)))
+    for attempt in 0..32 {
+        let candidate = directory.join(format!(
+            "{stem}-{}-{attempt}{extension}",
+            random_hex(4)
+        ));
+        if transfer_destination_is_available(&candidate, transfers) {
+            return Some(candidate);
+        }
+    }
+
+    None
 }
 
 fn format_bytes(bytes: u64) -> String {
@@ -9685,6 +11137,75 @@ mod tests {
     }
 
     #[test]
+    fn file_transfer_collection_keeps_valid_files_when_other_paths_fail() {
+        let root = temp_test_dir("file-transfer-collection-partial");
+        let valid_path = root.join("valid.txt");
+        let missing_path = root.join("missing.txt");
+        let directory_path = root.join("folder");
+        fs::write(&valid_path, b"ok").expect("valid file");
+        fs::create_dir_all(&directory_path).expect("directory input");
+
+        let paths = vec![
+            valid_path.to_string_lossy().into_owned(),
+            missing_path.to_string_lossy().into_owned(),
+            directory_path.to_string_lossy().into_owned(),
+        ];
+        let collected = collect_transfer_files(&paths).expect("valid file should be retained");
+
+        assert_eq!(collected.files.len(), 1);
+        assert_eq!(collected.files[0].path, valid_path);
+        assert_eq!(collected.files[0].total_bytes, 2);
+        assert_eq!(collected.failed_count, 2);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn file_transfer_collection_counts_empty_paths_as_failures() {
+        let root = temp_test_dir("file-transfer-collection-empty-path");
+        let valid_path = root.join("valid.txt");
+        fs::write(&valid_path, b"ok").expect("valid file");
+        let paths = vec![
+            valid_path.to_string_lossy().into_owned(),
+            "   ".to_string(),
+        ];
+
+        let collected = collect_transfer_files(&paths).expect("valid file should be retained");
+
+        assert_eq!(collected.files.len(), 1);
+        assert_eq!(collected.files[0].path, valid_path);
+        assert_eq!(collected.failed_count, 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn file_transfer_collection_errors_when_all_paths_fail() {
+        let root = temp_test_dir("file-transfer-collection-all-failed");
+        let missing_path = root.join("missing.txt");
+        let paths = vec![missing_path.to_string_lossy().into_owned()];
+
+        let error = collect_transfer_files(&paths).expect_err("all invalid inputs should fail");
+
+        assert!(error.contains("无法读取文件"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn sync_history_parses_file_failures_without_polluting_byte_count() {
+        let success = parse_sync_line(
+            "[2026-09-04 12:00:00] sync:file:sent to=Client files=2 bytes=10 failed=0",
+        )
+        .expect("successful transfer history");
+        assert_eq!(success.target, "Client");
+        assert_eq!(success.detail, "2 files, 10 bytes");
+
+        let partial = parse_sync_line(
+            "[2026-09-04 12:00:01] sync:file:sent to=Client files=2 bytes=10 failed=1",
+        )
+        .expect("partial transfer history");
+        assert_eq!(partial.detail, "2 files, 10 bytes, 1 failed");
+    }
+
+    #[test]
     fn remote_file_reply_target_falls_back_to_paired_controller_without_peers() {
         let mut layout = test_layout();
         layout.machine_role = "client".into();
@@ -9892,6 +11413,608 @@ mod tests {
     }
 
     #[test]
+    fn file_transfer_retries_start_and_finish_idempotently() {
+        let layout = test_layout();
+        let root = temp_test_dir("file-transfer-idempotent");
+        let transfers = Arc::new(Mutex::new(HashMap::new()));
+
+        let start = test_file_transfer_packet(
+            "start",
+            "transfer-idempotent",
+            "note.txt",
+            5,
+            0,
+            0,
+            b"",
+        );
+        let start_payload = encode_wire_packet(&start).expect("start should encode");
+        assert!(handle_file_transfer_packet_with_root(
+            &start_payload,
+            &layout,
+            "local-device",
+            &transfers,
+            &root,
+        ));
+
+        let chunk = test_file_transfer_packet(
+            "chunk",
+            "transfer-idempotent",
+            "note.txt",
+            5,
+            0,
+            0,
+            b"hello",
+        );
+        let chunk_payload = encode_wire_packet(&chunk).expect("chunk should encode");
+        assert!(handle_file_transfer_packet_with_root(
+            &chunk_payload,
+            &layout,
+            "local-device",
+            &transfers,
+            &root,
+        ));
+
+        // A lost start acknowledgement must not truncate the partial file.
+        assert!(handle_file_transfer_packet_with_root(
+            &start_payload,
+            &layout,
+            "local-device",
+            &transfers,
+            &root,
+        ));
+
+        let mismatched_start =
+            test_file_transfer_packet("start", "transfer-idempotent", "note.txt", 6, 0, 0, b"");
+        let mismatched_payload =
+            encode_wire_packet(&mismatched_start).expect("mismatched start should encode");
+        assert!(!handle_file_transfer_packet_with_root(
+            &mismatched_payload,
+            &layout,
+            "local-device",
+            &transfers,
+            &root,
+        ));
+
+        {
+            let transfers = transfers.lock().expect("transfer lock");
+            let transfer = transfers
+                .get(&incoming_file_transfer_key(&start))
+                .expect("transfer should remain active");
+            assert_eq!(transfer.received_bytes, 5);
+            assert_eq!(fs::read(&transfer.temp_path).expect("partial file"), b"hello");
+        }
+
+        let finish =
+            test_file_transfer_packet("finish", "transfer-idempotent", "note.txt", 5, 1, 5, b"");
+        let finish_payload = encode_wire_packet(&finish).expect("finish should encode");
+        assert!(handle_file_transfer_packet_with_root(
+            &finish_payload,
+            &layout,
+            "local-device",
+            &transfers,
+            &root,
+        ));
+        // A lost finish acknowledgement must not create a second destination file.
+        assert!(handle_file_transfer_packet_with_root(
+            &finish_payload,
+            &layout,
+            "local-device",
+            &transfers,
+            &root,
+        ));
+
+        assert_eq!(fs::read(root.join("note.txt")).expect("received file"), b"hello");
+        let mut names = fs::read_dir(&root)
+            .expect("read receive root")
+            .map(|entry| {
+                entry
+                    .expect("receive entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect::<Vec<_>>();
+        names.sort_unstable();
+        assert_eq!(names, vec!["note.txt"]);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn file_transfer_rejects_changed_temporary_file_on_finish() {
+        let layout = test_layout();
+        let root = temp_test_dir("file-transfer-temp-changed");
+        let transfers = Arc::new(Mutex::new(HashMap::new()));
+        let start =
+            test_file_transfer_packet("start", "transfer-temp-changed", "note.txt", 5, 0, 0, b"");
+
+        for packet in [
+            start.clone(),
+            test_file_transfer_packet(
+                "chunk",
+                "transfer-temp-changed",
+                "note.txt",
+                5,
+                0,
+                0,
+                b"hello",
+            ),
+        ] {
+            let payload = encode_wire_packet(&packet).expect("file packet should encode");
+            assert!(handle_file_transfer_packet_with_root(
+                &payload,
+                &layout,
+                "local-device",
+                &transfers,
+                &root,
+            ));
+        }
+
+        let transfer_key = incoming_file_transfer_key(&start);
+        let temp_path = transfers
+            .lock()
+            .expect("transfer lock")
+            .get(&transfer_key)
+            .expect("active transfer")
+            .temp_path
+            .clone();
+        fs::write(&temp_path, b"he").expect("truncate temporary file");
+
+        let finish = test_file_transfer_packet(
+            "finish",
+            "transfer-temp-changed",
+            "note.txt",
+            5,
+            1,
+            5,
+            b"",
+        );
+        let finish_payload = encode_wire_packet(&finish).expect("finish should encode");
+        assert!(!handle_file_transfer_packet_with_root(
+            &finish_payload,
+            &layout,
+            "local-device",
+            &transfers,
+            &root,
+        ));
+        assert!(!root.join("note.txt").exists());
+        assert!(!transfers
+            .lock()
+            .expect("transfer lock")
+            .get(&transfer_key)
+            .expect("active transfer")
+            .completed);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn file_transfer_abort_removes_partial_state_and_is_idempotent() {
+        let layout = test_layout();
+        let root = temp_test_dir("file-transfer-abort-active");
+        let transfers = Arc::new(Mutex::new(HashMap::new()));
+        let start =
+            test_file_transfer_packet("start", "transfer-abort", "note.txt", 5, 0, 0, b"");
+
+        for packet in [
+            start.clone(),
+            test_file_transfer_packet("chunk", "transfer-abort", "note.txt", 5, 0, 0, b"hel"),
+        ] {
+            let payload = encode_wire_packet(&packet).expect("file packet should encode");
+            assert!(handle_file_transfer_packet_with_root(
+                &payload,
+                &layout,
+                "local-device",
+                &transfers,
+                &root,
+            ));
+        }
+
+        let transfer_key = incoming_file_transfer_key(&start);
+        let temp_path = transfers
+            .lock()
+            .expect("transfer lock")
+            .get(&transfer_key)
+            .expect("active transfer")
+            .temp_path
+            .clone();
+        assert!(temp_path.exists());
+
+        let abort =
+            test_file_transfer_packet("abort", "transfer-abort", "note.txt", 5, 1, 3, b"");
+        let abort_payload = encode_wire_packet(&abort).expect("abort should encode");
+        assert!(handle_file_transfer_packet_with_root(
+            &abort_payload,
+            &layout,
+            "local-device",
+            &transfers,
+            &root,
+        ));
+        assert!(!temp_path.exists());
+        assert!(!transfers
+            .lock()
+            .expect("transfer lock")
+            .contains_key(&transfer_key));
+
+        // Replayed abort packets must remain successful after cleanup.
+        assert!(handle_file_transfer_packet_with_root(
+            &abort_payload,
+            &layout,
+            "local-device",
+            &transfers,
+            &root,
+        ));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn file_transfer_abort_does_not_remove_completed_file() {
+        let layout = test_layout();
+        let root = temp_test_dir("file-transfer-abort-completed");
+        let transfers = Arc::new(Mutex::new(HashMap::new()));
+        let start = test_file_transfer_packet(
+            "start",
+            "transfer-abort-completed",
+            "note.txt",
+            5,
+            0,
+            0,
+            b"",
+        );
+
+        for packet in [
+            start.clone(),
+            test_file_transfer_packet(
+                "chunk",
+                "transfer-abort-completed",
+                "note.txt",
+                5,
+                0,
+                0,
+                b"hello",
+            ),
+            test_file_transfer_packet(
+                "finish",
+                "transfer-abort-completed",
+                "note.txt",
+                5,
+                1,
+                5,
+                b"",
+            ),
+        ] {
+            let payload = encode_wire_packet(&packet).expect("file packet should encode");
+            assert!(handle_file_transfer_packet_with_root(
+                &payload,
+                &layout,
+                "local-device",
+                &transfers,
+                &root,
+            ));
+        }
+
+        let abort = test_file_transfer_packet(
+            "abort",
+            "transfer-abort-completed",
+            "note.txt",
+            5,
+            1,
+            5,
+            b"",
+        );
+        let abort_payload = encode_wire_packet(&abort).expect("abort should encode");
+        assert!(handle_file_transfer_packet_with_root(
+            &abort_payload,
+            &layout,
+            "local-device",
+            &transfers,
+            &root,
+        ));
+        assert!(handle_file_transfer_packet_with_root(
+            &abort_payload,
+            &layout,
+            "local-device",
+            &transfers,
+            &root,
+        ));
+
+        let final_path = root.join("note.txt");
+        assert_eq!(fs::read(&final_path).expect("completed file"), b"hello");
+        let transfer_key = incoming_file_transfer_key(&start);
+        let map = transfers.lock().expect("transfer lock");
+        let transfer = map.get(&transfer_key).expect("completed transfer state");
+        assert!(transfer.completed);
+        assert_eq!(transfer.final_path, final_path);
+        drop(map);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn file_transfer_rejects_start_when_global_active_limit_is_reached() {
+        let root = temp_test_dir("file-transfer-global-active-limit");
+        let transfers = Arc::new(Mutex::new(HashMap::new()));
+        {
+            let mut map = transfers.lock().expect("transfer lock");
+            for index in 0..FILE_TRANSFER_MAX_ACTIVE_TRANSFERS {
+                let origin_id = format!("origin-{index}");
+                let transfer_id = format!("active-{index}");
+                map.insert(
+                    (origin_id.clone(), transfer_id.clone()),
+                    test_incoming_file_transfer(
+                        &root,
+                        &origin_id,
+                        &transfer_id,
+                        false,
+                        Instant::now(),
+                    ),
+                );
+            }
+        }
+
+        let mut start =
+            test_file_transfer_packet("start", "active-overflow", "overflow.txt", 1, 0, 0, b"");
+        start.origin_id = "new-origin".into();
+        assert!(!start_incoming_file_transfer(start, &transfers, &root));
+        assert_eq!(
+            transfers.lock().expect("transfer lock").len(),
+            FILE_TRANSFER_MAX_ACTIVE_TRANSFERS
+        );
+        assert_eq!(fs::read_dir(&root).expect("receive root").count(), 0);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn file_transfer_rejects_start_when_origin_active_limit_is_reached() {
+        assert!(
+            FILE_TRANSFER_MAX_ACTIVE_TRANSFERS_PER_ORIGIN
+                < FILE_TRANSFER_MAX_ACTIVE_TRANSFERS
+        );
+        let root = temp_test_dir("file-transfer-origin-active-limit");
+        let transfers = Arc::new(Mutex::new(HashMap::new()));
+        let origin_id = "peer-client-10-0-0-2";
+        {
+            let mut map = transfers.lock().expect("transfer lock");
+            for index in 0..FILE_TRANSFER_MAX_ACTIVE_TRANSFERS_PER_ORIGIN {
+                let transfer_id = format!("origin-active-{index}");
+                map.insert(
+                    (origin_id.to_string(), transfer_id.clone()),
+                    test_incoming_file_transfer(
+                        &root,
+                        origin_id,
+                        &transfer_id,
+                        false,
+                        Instant::now(),
+                    ),
+                );
+            }
+        }
+
+        let start = test_file_transfer_packet(
+            "start",
+            "origin-active-overflow",
+            "overflow.txt",
+            1,
+            0,
+            0,
+            b"",
+        );
+        assert!(!start_incoming_file_transfer(start, &transfers, &root));
+        assert_eq!(
+            transfers.lock().expect("transfer lock").len(),
+            FILE_TRANSFER_MAX_ACTIVE_TRANSFERS_PER_ORIGIN
+        );
+        assert_eq!(fs::read_dir(&root).expect("receive root").count(), 0);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn file_transfer_prunes_oldest_completed_state_only() {
+        let root = temp_test_dir("file-transfer-completed-limit");
+        let now = Instant::now();
+        let mut transfers = HashMap::new();
+        let mut keys = Vec::new();
+
+        for index in 0..3_u64 {
+            let transfer_id = format!("completed-{index}");
+            let key = ("origin".to_string(), transfer_id.clone());
+            let transfer = test_incoming_file_transfer(
+                &root,
+                "origin",
+                &transfer_id,
+                true,
+                now.checked_sub(Duration::from_secs(3 - index))
+                    .unwrap_or(now),
+            );
+            fs::write(&transfer.temp_path, b"temporary link").expect("temporary transfer file");
+            fs::write(&transfer.final_path, format!("final-{index}"))
+                .expect("completed destination file");
+            transfers.insert(key.clone(), transfer);
+            keys.push(key);
+        }
+
+        prune_completed_file_transfers(&mut transfers, 2, Some(&keys[2]));
+
+        assert_eq!(transfers.len(), 2);
+        assert!(!transfers.contains_key(&keys[0]));
+        assert!(transfers.contains_key(&keys[1]));
+        assert!(transfers.contains_key(&keys[2]));
+        assert!(!root.join(".completed-0.part").exists());
+        assert_eq!(
+            fs::read(root.join("completed-0.txt")).expect("old destination retained"),
+            b"final-0"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn file_transfer_reserves_paths_for_parallel_same_name() {
+        let layout = test_layout();
+        let root = temp_test_dir("file-transfer-parallel-name");
+        let transfers = Arc::new(Mutex::new(HashMap::new()));
+
+        for packet in [
+            test_file_transfer_packet("start", "transfer/a", "note.txt", 1, 0, 0, b""),
+            test_file_transfer_packet("start", "transfera", "note.txt", 1, 0, 0, b""),
+        ] {
+            let payload = encode_wire_packet(&packet).expect("start should encode");
+            assert!(handle_file_transfer_packet_with_root(
+                &payload,
+                &layout,
+                "local-device",
+                &transfers,
+                &root,
+            ));
+        }
+
+        let (first_final, second_final, first_temp, second_temp) = {
+            let transfers = transfers.lock().expect("transfer lock");
+            let first = transfers
+                .get(&(
+                    "peer-client-10-0-0-2".to_string(),
+                    "transfer/a".to_string(),
+                ))
+                .expect("first transfer");
+            let second = transfers
+                .get(&(
+                    "peer-client-10-0-0-2".to_string(),
+                    "transfera".to_string(),
+                ))
+                .expect("second transfer");
+            (
+                first.final_path.clone(),
+                second.final_path.clone(),
+                first.temp_path.clone(),
+                second.temp_path.clone(),
+            )
+        };
+        assert_eq!(first_final, root.join("note.txt"));
+        assert_eq!(second_final, root.join("note (1).txt"));
+        assert_ne!(first_temp, second_temp);
+        assert!(first_temp.exists());
+        assert!(second_temp.exists());
+
+        for packet in [
+            test_file_transfer_packet("chunk", "transfer/a", "note.txt", 1, 0, 0, b"a"),
+            test_file_transfer_packet("finish", "transfer/a", "note.txt", 1, 1, 1, b""),
+            test_file_transfer_packet("chunk", "transfera", "note.txt", 1, 0, 0, b"b"),
+            test_file_transfer_packet("finish", "transfera", "note.txt", 1, 1, 1, b""),
+        ] {
+            let payload = encode_wire_packet(&packet).expect("file packet should encode");
+            assert!(handle_file_transfer_packet_with_root(
+                &payload,
+                &layout,
+                "local-device",
+                &transfers,
+                &root,
+            ));
+        }
+
+        assert_eq!(fs::read(first_final).expect("first file"), b"a");
+        assert_eq!(fs::read(second_final).expect("second file"), b"b");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn file_transfer_isolates_same_transfer_id_by_origin() {
+        let layout = test_layout();
+        let root = temp_test_dir("file-transfer-origin-key");
+        let transfers = Arc::new(Mutex::new(HashMap::new()));
+
+        let first_start =
+            test_file_transfer_packet("start", "shared-transfer", "first.txt", 1, 0, 0, b"");
+        let mut second_start =
+            test_file_transfer_packet("start", "shared-transfer", "second.txt", 1, 0, 0, b"");
+        second_start.origin_id = "peer-client-10-0-0-3".into();
+        let first_chunk =
+            test_file_transfer_packet("chunk", "shared-transfer", "first.txt", 1, 0, 0, b"a");
+        let mut second_chunk =
+            test_file_transfer_packet("chunk", "shared-transfer", "second.txt", 1, 0, 0, b"b");
+        second_chunk.origin_id = "peer-client-10-0-0-3".into();
+        let first_finish =
+            test_file_transfer_packet("finish", "shared-transfer", "first.txt", 1, 1, 1, b"");
+        let mut second_finish =
+            test_file_transfer_packet("finish", "shared-transfer", "second.txt", 1, 1, 1, b"");
+        second_finish.origin_id = "peer-client-10-0-0-3".into();
+
+        for packet in [
+            first_start,
+            second_start,
+            first_chunk,
+            second_chunk,
+            first_finish,
+            second_finish,
+        ] {
+            let payload = encode_wire_packet(&packet).expect("file packet should encode");
+            assert!(handle_file_transfer_packet_with_root(
+                &payload,
+                &layout,
+                "local-device",
+                &transfers,
+                &root,
+            ));
+        }
+
+        assert_eq!(transfers.lock().expect("transfer lock").len(), 2);
+        assert_eq!(fs::read(root.join("first.txt")).expect("first file"), b"a");
+        assert_eq!(fs::read(root.join("second.txt")).expect("second file"), b"b");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn file_transfer_does_not_overwrite_destination_created_during_transfer() {
+        let layout = test_layout();
+        let root = temp_test_dir("file-transfer-finalize-collision");
+        let transfers = Arc::new(Mutex::new(HashMap::new()));
+        let start =
+            test_file_transfer_packet("start", "transfer-race", "note.txt", 5, 0, 0, b"");
+        let start_payload = encode_wire_packet(&start).expect("start should encode");
+        assert!(handle_file_transfer_packet_with_root(
+            &start_payload,
+            &layout,
+            "local-device",
+            &transfers,
+            &root,
+        ));
+
+        fs::write(root.join("note.txt"), b"external").expect("external destination file");
+        for packet in [
+            test_file_transfer_packet("chunk", "transfer-race", "note.txt", 5, 0, 0, b"hello"),
+            test_file_transfer_packet("finish", "transfer-race", "note.txt", 5, 1, 5, b""),
+        ] {
+            let payload = encode_wire_packet(&packet).expect("file packet should encode");
+            assert!(handle_file_transfer_packet_with_root(
+                &payload,
+                &layout,
+                "local-device",
+                &transfers,
+                &root,
+            ));
+        }
+
+        assert_eq!(
+            fs::read(root.join("note.txt")).expect("external file remains"),
+            b"external"
+        );
+        let received_path = root.join("note (1).txt");
+        assert_eq!(fs::read(&received_path).expect("received file"), b"hello");
+        assert_eq!(
+            transfers
+                .lock()
+                .expect("transfer lock")
+                .get(&incoming_file_transfer_key(&start))
+                .expect("completed transfer")
+                .final_path
+                .clone(),
+            received_path
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn file_transfer_sanitizes_received_file_names() {
         assert_eq!(
             sanitize_transfer_file_name("../bad:name?.txt").as_deref(),
@@ -9901,10 +12024,63 @@ mod tests {
         assert!(sanitize_transfer_file_name("  ").is_none());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn file_transfer_treats_dangling_symlink_destination_as_occupied() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_test_dir("file-transfer-dangling-symlink");
+        let occupied_path = root.join("note.txt");
+        symlink(root.join("missing-target"), &occupied_path).expect("dangling symlink");
+        let transfers = HashMap::new();
+
+        assert!(transfer_destination_is_occupied(&occupied_path));
+        assert_eq!(
+            unique_transfer_destination(&root, "note.txt", &transfers),
+            Some(root.join("note (1).txt")),
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn file_transfer_handles_windows_reserved_names_and_case_insensitive_paths() {
+        assert_eq!(sanitize_transfer_file_name("CON.txt").as_deref(), Some("_CON.txt"));
+        assert_eq!(sanitize_transfer_file_name("AUX").as_deref(), Some("_AUX"));
+        assert_eq!(sanitize_transfer_file_name("COM1.log").as_deref(), Some("_COM1.log"));
+        assert_eq!(sanitize_transfer_file_name("LPT9").as_deref(), Some("_LPT9"));
+        assert!(transfer_paths_equal(
+            Path::new(r"C:\Temp\Report.txt"),
+            Path::new(r"c:\temp\report.TXT"),
+        ));
+    }
+
     fn temp_test_dir(name: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!("{name}-{}", random_hex(4)));
         fs::create_dir_all(&path).expect("temp test dir");
         path
+    }
+
+    fn test_incoming_file_transfer(
+        root: &Path,
+        origin_id: &str,
+        transfer_id: &str,
+        completed: bool,
+        last_activity_at: Instant,
+    ) -> IncomingFileTransfer {
+        IncomingFileTransfer {
+            origin_id: origin_id.to_string(),
+            target_id: "local-device".into(),
+            file_name: format!("{transfer_id}.txt"),
+            destination_hint: None,
+            total_bytes: 1,
+            received_bytes: if completed { 1 } else { 0 },
+            next_chunk_index: if completed { 1 } else { 0 },
+            temp_path: root.join(format!(".{transfer_id}.part")),
+            final_path: root.join(format!("{transfer_id}.txt")),
+            last_activity_at,
+            completed,
+        }
     }
 
     fn test_file_transfer_packet(
@@ -10093,6 +12269,7 @@ mod tests {
             entries: Vec::new(),
             file_count: 0,
             byte_count: 0,
+            failed_count: 0,
             error: None,
         }
     }
@@ -10110,6 +12287,63 @@ mod tests {
         assert_eq!(decoded.target_id, "local-device");
         assert_eq!(decoded.cluster_id, "cluster-test");
         assert_eq!(decoded.pair_secret, "secret-test");
+    }
+
+    #[test]
+    fn remote_file_request_cache_deduplicates_and_replays() {
+        let cache = Arc::new(Mutex::new(HashMap::new()));
+        let request = test_remote_file_packet("list", "request-cache-1");
+
+        assert!(matches!(
+            begin_remote_file_request(&cache, &request),
+            RemoteFileRequestDecision::Start
+        ));
+        assert!(matches!(
+            begin_remote_file_request(&cache, &request),
+            RemoteFileRequestDecision::DuplicateInFlight
+        ));
+
+        let mut reply = test_remote_file_packet("listResult", "request-cache-1");
+        reply.entries.push(RemoteDirEntry {
+            name: "cached.txt".into(),
+            path: "/tmp/cached.txt".into(),
+            is_dir: false,
+            size: 6,
+            modified_ms: 1,
+        });
+        complete_remote_file_request(&cache, &request, reply);
+
+        let RemoteFileRequestDecision::Replay(cached) =
+            begin_remote_file_request(&cache, &request)
+        else {
+            panic!("completed request should replay its cached response");
+        };
+        assert_eq!(cached.kind, "listResult");
+        assert_eq!(cached.entries.len(), 1);
+        assert_eq!(cached.entries[0].name, "cached.txt");
+
+        let mut conflicting = request.clone();
+        conflicting.path = "/different".into();
+        assert!(matches!(
+            begin_remote_file_request(&cache, &conflicting),
+            RemoteFileRequestDecision::Conflict
+        ));
+    }
+
+    #[test]
+    fn remote_file_request_cache_can_restart_after_inflight_failure() {
+        let cache = Arc::new(Mutex::new(HashMap::new()));
+        let request = test_remote_file_packet("pull", "request-cache-2");
+
+        assert!(matches!(
+            begin_remote_file_request(&cache, &request),
+            RemoteFileRequestDecision::Start
+        ));
+        forget_remote_file_request(&cache, &request);
+        assert!(matches!(
+            begin_remote_file_request(&cache, &request),
+            RemoteFileRequestDecision::Start
+        ));
     }
 
     #[test]
@@ -10140,8 +12374,11 @@ mod tests {
         fs::write(root.join("a.txt"), "hello").expect("write file");
         fs::create_dir(root.join("sub")).expect("create subdir");
 
-        let entries = enumerate_remote_directory(&root.display().to_string())
-            .expect("enumerate should succeed");
+        let entries = enumerate_remote_directory_with_root(
+            &root.display().to_string(),
+            &root,
+        )
+        .expect("enumerate should succeed");
         let mut names: Vec<&str> = entries.iter().map(|entry| entry.name.as_str()).collect();
         names.sort_unstable();
         assert_eq!(names, vec!["a.txt", "sub"]);
@@ -10165,11 +12402,168 @@ mod tests {
 
     #[test]
     fn enumerate_remote_directory_reports_missing_path() {
-        let missing = env::temp_dir()
-            .join(format!("mykvm-remote-missing-{}", now_ms()))
-            .display()
-            .to_string();
-        assert!(enumerate_remote_directory(&missing).is_err());
+        let root = temp_test_dir("mykvm-remote-missing-root");
+        let missing = root.join("missing");
+        assert!(
+            enumerate_remote_directory_with_root(&missing.display().to_string(), &root).is_err()
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn enumerate_remote_directory_rejects_results_over_entry_limit() {
+        let root = temp_test_dir("mykvm-remote-entry-limit");
+        fs::write(root.join("first.txt"), b"first").expect("first entry");
+        fs::write(root.join("second.txt"), b"second").expect("second entry");
+        let canonical_root = fs::canonicalize(&root).expect("canonical root");
+
+        let error = enumerate_remote_directory_from_root_with_limit(
+            &canonical_root,
+            &canonical_root,
+            1,
+        )
+        .expect_err("directory result should be bounded");
+
+        assert!(error.contains("目录条目超过上限"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn remote_file_request_limits_paths_and_pull_file_count() {
+        let oversized_path = "a".repeat(REMOTE_FILE_MAX_PATH_BYTES + 1);
+        assert!(validate_remote_file_path_length(&oversized_path).is_err());
+        assert!(validate_remote_file_path_length("").is_ok());
+        assert!(validate_remote_file_path_length("Documents/note.txt").is_ok());
+
+        let maximum = vec![String::new(); REMOTE_FILE_MAX_PULL_FILES];
+        assert!(validate_remote_pull_file_count(&maximum).is_ok());
+        let oversized = vec![String::new(); REMOTE_FILE_MAX_PULL_FILES + 1];
+        assert!(validate_remote_pull_file_count(&oversized).is_err());
+    }
+
+    #[test]
+    fn remote_file_request_shape_rejects_oversized_or_response_only_fields() {
+        let list = test_remote_file_packet("list", "request-shape-list");
+        assert!(validate_remote_file_request_shape(&list).is_ok());
+
+        let mut oversized_id = list.clone();
+        oversized_id.request_id = "r".repeat(REMOTE_FILE_MAX_IDENTIFIER_BYTES + 1);
+        assert!(validate_remote_file_request_shape(&oversized_id).is_err());
+
+        let mut unexpected_paths = list.clone();
+        unexpected_paths.file_paths.push("Documents/note.txt".into());
+        assert!(validate_remote_file_request_shape(&unexpected_paths).is_err());
+
+        let mut unexpected_entries = list;
+        unexpected_entries.entries.push(RemoteDirEntry {
+            name: "note.txt".into(),
+            path: "/tmp/note.txt".into(),
+            is_dir: false,
+            size: 1,
+            modified_ms: 1,
+        });
+        assert!(validate_remote_file_request_shape(&unexpected_entries).is_err());
+
+        let mut pull = test_remote_file_packet("pull", "request-shape-pull");
+        pull.path.clear();
+        pull.file_paths = vec!["Documents/note.txt".into()];
+        assert!(validate_remote_file_request_shape(&pull).is_ok());
+
+        pull.file_paths[0] = "p".repeat(REMOTE_FILE_MAX_PATH_BYTES + 1);
+        assert!(validate_remote_file_request_shape(&pull).is_err());
+    }
+
+    #[test]
+    fn remote_file_response_shape_bounds_entries_and_counts() {
+        let mut list_result =
+            test_remote_file_packet("listResult", "response-shape-list");
+        list_result.entries.push(RemoteDirEntry {
+            name: "note.txt".into(),
+            path: "/tmp/note.txt".into(),
+            is_dir: false,
+            size: 1,
+            modified_ms: 1,
+        });
+        assert!(validate_remote_file_response_shape(&list_result).is_ok());
+
+        list_result.entries[0].path = "p".repeat(REMOTE_FILE_MAX_PATH_BYTES + 1);
+        assert!(validate_remote_file_response_shape(&list_result).is_err());
+
+        let mut pull_result =
+            test_remote_file_packet("pullResult", "response-shape-pull");
+        pull_result.path.clear();
+        pull_result.file_count = REMOTE_FILE_MAX_PULL_FILES as u64;
+        assert!(validate_remote_file_response_shape(&pull_result).is_ok());
+
+        pull_result.failed_count = 1;
+        assert!(validate_remote_file_response_shape(&pull_result).is_err());
+    }
+
+    #[test]
+    fn remote_file_request_cache_fingerprint_detects_changed_pull_paths() {
+        let cache = Arc::new(Mutex::new(HashMap::new()));
+        let mut request = test_remote_file_packet("pull", "request-cache-paths");
+        request.path.clear();
+        request.file_paths = vec!["Documents/first.txt".into()];
+
+        assert!(matches!(
+            begin_remote_file_request(&cache, &request),
+            RemoteFileRequestDecision::Start
+        ));
+
+        request.file_paths[0] = "Documents/second.txt".into();
+        assert!(matches!(
+            begin_remote_file_request(&cache, &request),
+            RemoteFileRequestDecision::Conflict
+        ));
+    }
+
+    #[test]
+    fn remote_file_path_resolution_is_sandboxed() {
+        let root = temp_test_dir("mykvm-remote-path-root");
+        let nested = root.join("nested");
+        fs::create_dir_all(&nested).expect("create nested directory");
+        let inside = nested.join("inside.txt");
+        fs::write(&inside, "inside").expect("write inside file");
+
+        let outside_root = temp_test_dir("mykvm-remote-path-outside");
+        let outside = outside_root.join("outside.txt");
+        fs::write(&outside, "outside").expect("write outside file");
+
+        let canonical_root = fs::canonicalize(&root).expect("canonical root");
+        assert_eq!(
+            resolve_remote_file_path_with_root("", &root).expect("empty path"),
+            canonical_root
+        );
+        assert_eq!(
+            resolve_remote_file_path_with_root("nested/inside.txt", &root)
+                .expect("relative inside path"),
+            fs::canonicalize(&inside).expect("canonical inside path")
+        );
+
+        let inside_with_parent = nested.join("..").join("nested").join("inside.txt");
+        assert_eq!(
+            resolve_remote_file_path_with_root(
+                &inside_with_parent.display().to_string(),
+                &root,
+            )
+            .expect("normalized inside path"),
+            fs::canonicalize(&inside).expect("canonical inside path")
+        );
+
+        let relative_outside = Path::new("..")
+            .join(outside_root.file_name().expect("outside directory name"))
+            .join("outside.txt");
+        assert!(
+            resolve_remote_file_path_with_root(&relative_outside.display().to_string(), &root)
+                .is_err()
+        );
+        assert!(
+            resolve_remote_file_path_with_root(&outside.display().to_string(), &root).is_err()
+        );
+
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(outside_root);
     }
 
     #[test]
@@ -10205,14 +12599,102 @@ mod tests {
     }
 
     #[test]
+    fn remote_file_pending_rejects_mismatched_response_without_consuming_request() {
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let (sender, receiver) = tokio::sync::oneshot::channel::<RemoteFileResponse>();
+        insert_remote_file_pending(
+            &pending,
+            "request-pending-1",
+            "peer-client-10-0-0-2".into(),
+            "listResult",
+            sender,
+        )
+        .expect("pending request should register");
+
+        let mut wrong_origin = test_remote_file_packet("listResult", "request-pending-1");
+        wrong_origin.origin_id = "other-peer".into();
+        assert!(!resolve_remote_file_pending(wrong_origin, &pending));
+        assert!(pending
+            .lock()
+            .expect("pending lock")
+            .contains_key("request-pending-1"));
+
+        let wrong_kind = test_remote_file_packet("pullResult", "request-pending-1");
+        assert!(!resolve_remote_file_pending(wrong_kind, &pending));
+        assert!(pending
+            .lock()
+            .expect("pending lock")
+            .contains_key("request-pending-1"));
+
+        let valid = test_remote_file_packet("listResult", "request-pending-1");
+        assert!(resolve_remote_file_pending(valid, &pending));
+        let response = receiver.blocking_recv().expect("pending resolved");
+        assert_eq!(response.error, None);
+        assert!(!pending
+            .lock()
+            .expect("pending lock")
+            .contains_key("request-pending-1"));
+    }
+
+    #[test]
+    fn remote_file_pending_guard_does_not_remove_reused_request_id() {
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let (first_sender, _first_receiver) =
+            tokio::sync::oneshot::channel::<RemoteFileResponse>();
+        let first_registration = insert_remote_file_pending(
+            &pending,
+            "request-pending-reused",
+            "peer-client-10-0-0-2".into(),
+            "listResult",
+            first_sender,
+        )
+        .expect("first pending request should register");
+        let first_guard = RemoteFilePendingGuard::new(
+            &pending,
+            "request-pending-reused".into(),
+            first_registration,
+        );
+
+        assert!(resolve_remote_file_pending(
+            test_remote_file_packet("listResult", "request-pending-reused"),
+            &pending,
+        ));
+
+        let (second_sender, _second_receiver) =
+            tokio::sync::oneshot::channel::<RemoteFileResponse>();
+        let second_registration = insert_remote_file_pending(
+            &pending,
+            "request-pending-reused",
+            "peer-client-10-0-0-2".into(),
+            "listResult",
+            second_sender,
+        )
+        .expect("reused pending request should register after resolution");
+
+        drop(first_guard);
+        let pending = pending.lock().expect("pending lock");
+        let replacement = pending
+            .get("request-pending-reused")
+            .expect("replacement pending request must remain registered");
+        assert!(Arc::ptr_eq(
+            &replacement.registration,
+            &second_registration
+        ));
+    }
+
+    #[test]
     fn remote_file_packet_dispatch_resolves_pending_from_list_result() {
         let layout = test_layout();
         let pending = Arc::new(Mutex::new(HashMap::new()));
         let (sender, receiver) = tokio::sync::oneshot::channel::<RemoteFileResponse>();
-        pending
-            .lock()
-            .unwrap()
-            .insert("request-6".to_string(), sender);
+        insert_remote_file_pending(
+            &pending,
+            "request-6",
+            "peer-client-10-0-0-2".into(),
+            "listResult",
+            sender,
+        )
+        .expect("pending request should register");
 
         let mut packet = test_remote_file_packet("listResult", "request-6");
         packet.entries = vec![RemoteDirEntry {
@@ -10225,6 +12707,8 @@ mod tests {
         let payload = encode_wire_packet(&packet).expect("list result should encode");
         let transport = Arc::new(Mutex::new(None::<quic_transport::TransportHandle>));
         let peers = Arc::new(Mutex::new(Vec::<LanPeer>::new()));
+        let request_cache = Arc::new(Mutex::new(HashMap::new()));
+        let transport_packets = Arc::new(AtomicU64::new(0));
         assert!(handle_remote_file_packet(
             &payload,
             &layout,
@@ -10232,6 +12716,8 @@ mod tests {
             &transport,
             &peers,
             &pending,
+            &request_cache,
+            &transport_packets,
         ));
         let response = receiver.blocking_recv().expect("pending resolved");
         assert_eq!(response.error, None);
@@ -10247,6 +12733,8 @@ mod tests {
         let transport = Arc::new(Mutex::new(None::<quic_transport::TransportHandle>));
         let peers = Arc::new(Mutex::new(Vec::<LanPeer>::new()));
         let pending = Arc::new(Mutex::new(HashMap::new()));
+        let request_cache = Arc::new(Mutex::new(HashMap::new()));
+        let transport_packets = Arc::new(AtomicU64::new(0));
         // No transport: the handler returns false instead of panicking.
         assert!(!handle_remote_file_packet(
             &payload,
@@ -10255,6 +12743,8 @@ mod tests {
             &transport,
             &peers,
             &pending,
+            &request_cache,
+            &transport_packets,
         ));
     }
 }
