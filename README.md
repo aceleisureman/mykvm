@@ -34,6 +34,7 @@ Move your cursor off the edge of one screen and it lands on the next machine. Yo
 - **macOS first launch.** Builds are free self-signed (not Apple-notarized), so Gatekeeper warns the first time. Right-click the app → **Open** → **Open** to allow it once.
 - **Windows.** No special permission for normal use. Run as Administrator only if you need to control elevated/admin windows.
 - **Linux.** If you use the AppImage, mark it executable (`chmod +x`).
+- **Ubuntu / Linux client.** Input injection uses the X11 XTEST extension. Run MyKVM as the desktop user inside a logged-in Xorg session. Wayland input injection is not supported yet; select **Ubuntu on Xorg** after logging out if your login screen offers it. Missing display access or XTEST support appears in the input status and diagnostics. Global input capture on Linux is not implemented; configure the Linux device as a client.
 
 ## Limitations
 

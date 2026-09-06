@@ -797,6 +797,14 @@ pub fn input_runtime_status(
 fn input_receive_status(layout: &LayoutState, request_permission: bool) -> NativeStageStatus {
     let _ = request_permission;
 
+    #[cfg(target_os = "linux")]
+    if let Err(detail) = crate::linux_input::ready() {
+        return NativeStageStatus {
+            state: "error".into(),
+            detail,
+        };
+    }
+
     #[cfg(target_os = "macos")]
     if !macos_accessibility_trusted(request_permission) {
         return NativeStageStatus {
@@ -2087,7 +2095,7 @@ fn map_relative_to_native_axis(
     (native_start as f64 + ratio * native_size.max(1) as f64).round() as i32
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "linux"))]
 fn platform_native_screen(screen: &Screen) -> Screen {
     let scale = if screen.scale.is_finite() && screen.scale > 0.0 {
         screen.scale
@@ -2104,19 +2112,19 @@ fn platform_native_screen(screen: &Screen) -> Screen {
     }
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
 fn platform_native_screen(screen: &Screen) -> Screen {
     screen.clone()
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "linux"))]
 fn scale_position(value: i32, scale: f64) -> i32 {
     (value as f64 * scale)
         .round()
         .clamp(i32::MIN as f64, i32::MAX as f64) as i32
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "linux"))]
 fn scale_size(value: i32, scale: f64) -> i32 {
     (value.max(1) as f64 * scale)
         .round()
@@ -2285,7 +2293,37 @@ fn inject_input_event(
         return true;
     }
 
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "linux")]
+    {
+        let (absolute_x, absolute_y) = command_coordinates(&command);
+        let outcome = crate::linux_input::inject(&command);
+        let injected = outcome.is_ok();
+        let result = if injected { "injected" } else { "failed" };
+        let timestamp_ms = now_input_debug_ms();
+        record_input_debug_event_lazy(debug_event.event_type, result, timestamp_ms, || {
+            InputDebugEvent {
+                timestamp_ms,
+                controller_id: controller_id.to_string(),
+                event_type: debug_event.event_type.into(),
+                screen_id: debug_event.screen_id.to_string(),
+                relative_x: debug_event.relative_x,
+                relative_y: debug_event.relative_y,
+                absolute_x,
+                absolute_y,
+                desktop: "linux".into(),
+                route: "x11-xtest".into(),
+                pipe_available: None,
+                result: result.into(),
+                detail: match outcome {
+                    Ok(()) => "injected through X11 XTEST".into(),
+                    Err(error) => error,
+                },
+            }
+        });
+        injected
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
     {
         let (absolute_x, absolute_y) = command_coordinates(&command);
         inject_input_command(command);
@@ -2452,6 +2490,7 @@ fn command_coordinates(command: &InputCommand) -> (Option<i32>, Option<i32>) {
     }
 }
 
+#[cfg(not(target_os = "linux"))]
 fn inject_input_command(command: InputCommand) {
     match command {
         InputCommand::MouseMove { x, y, drag_button } => inject_mouse_move(x, y, drag_button),
@@ -5703,7 +5742,12 @@ pub fn reset_injected_modifiers() {
     MAC_INJECT_FLAGS.store(0, Ordering::Relaxed);
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
+pub fn reset_injected_modifiers() {
+    crate::linux_input::release_all();
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 pub fn reset_injected_modifiers() {}
 
 /// Maps a Windows virtual-key modifier (the wire format) to its macOS event
@@ -5779,16 +5823,16 @@ fn inject_key(key_code: u16, down: bool) {
     crate::windows_input::inject_key(key_code, down);
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
 fn inject_mouse_move(_x: i32, _y: i32, _drag_button: Option<MouseButton>) {}
 
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
 fn inject_mouse_button(_button: MouseButton, _down: bool, _x: i32, _y: i32) {}
 
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
 fn inject_scroll(_delta_x: i32, _delta_y: i32) {}
 
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
 fn inject_key(_key_code: u16, _down: bool) {}
 
 #[cfg(test)]
@@ -5950,6 +5994,24 @@ mod tests {
             MACOS_HIDDEN_REMOTE_CAPTURE_LOOP_MS
         );
         assert!(MACOS_HIDDEN_REMOTE_CAPTURE_LOOP_MS > MACOS_VISIBLE_REMOTE_CAPTURE_LOOP_MS);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_native_screen_uses_physical_pixels_for_x11() {
+        let mut logical = screen("local", "display", 960, 0, 1280, 720);
+        logical.scale = 2.0;
+        let native = platform_native_screen(&logical);
+        assert_eq!((native.x, native.y), (1920, 0));
+        assert_eq!((native.width, native.height), (2560, 1440));
+        assert_eq!(
+            map_relative_to_native_axis(640, logical.width, native.x, native.width),
+            3200
+        );
+
+        logical.scale = f64::NAN;
+        let native = platform_native_screen(&logical);
+        assert_eq!((native.x, native.width), (960, 1280));
     }
 
     fn screen(device_id: &str, id: &str, x: i32, y: i32, width: i32, height: i32) -> Screen {

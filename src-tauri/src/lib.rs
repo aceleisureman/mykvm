@@ -26,6 +26,8 @@ use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
 
 mod clipboard;
 mod input;
+#[cfg(target_os = "linux")]
+mod linux_input;
 mod performance;
 mod quic_transport;
 pub mod shared_input;
