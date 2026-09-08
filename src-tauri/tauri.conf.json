@@ -52,7 +52,7 @@
     "updater": {
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDNFOTk3ODREMUEwRjM2RDkKUldUWk5nOGFUWGlaUHF0YVhLa1NKL1RPaUhINzdheUhKNkdCWHRSNWZpMlBnbnA3MUY3a2NoYVEK",
       "endpoints": [
-        "https://github.com/aceleisureman/mykvm/releases/latest/download/latest.json"
+        "https://github.com/aceleisureman/mykvm/releases/download/beta/latest.json"
       ],
       "windows": {
         "installMode": "passive"

@@ -164,6 +164,7 @@ macOS input capture and injection require Accessibility and Input Monitoring per
 Run these before opening a pull request or cutting a release:
 
 ```bash
+npm run test:release
 npm run build
 npm run lint
 cargo check --manifest-path src-tauri/Cargo.toml
@@ -173,23 +174,25 @@ cargo check --manifest-path src-tauri/Cargo.toml
 
 Git itself only stores and pushes source history. GitHub Actions does the actual packaging on GitHub-hosted runners.
 
-The release workflow watches pushes to `main`:
+The release workflow watches pushes to `dev` and publishes beta builds. Use **Actions → Release → Run workflow** with the `stable` channel and a patch/minor/major bump for a stable release; pushing `main` does not publish a release.
 
-- `feat:` publishes the next minor version, such as `v0.1.0` to `v0.2.0`.
-- `fix:` publishes the next patch version, such as `v0.1.0` to `v0.1.1`.
-- Other prefixes run normal checks but do not publish a release.
-- If no release tag exists yet, the first `feat:` or `fix:` push publishes `v0.1.0`.
+- Version numbers start from the greater of the source version and the latest stable tag. For example, a `0.9.8` checkout with no stable tags publishes `0.9.9-beta.<run>`, not `0.1.0-beta.<run>`.
+- Local builds from this `dev` checkout and CI beta builds check `releases/download/beta/latest.json`. Stable CI builds explicitly use `releases/latest/download/latest.json`; stable clients do not silently switch to beta.
+- Linux manifests include signed `.deb`, `.rpm`, and AppImage targets separately. Ubuntu `.deb` installations receive a `.deb` update, with normal system authorization for installation.
+- All platform artifacts and signatures are required before publication. The beta manifest advances only after the tagged release is public, so it never points to draft-only downloads.
 
 Release notes come from the `## [Unreleased]` section of [CHANGELOG.md](./CHANGELOG.md) (user-facing wording), falling back to filtered commit subjects. Keep that section up to date as you land changes.
 
 Example:
 
 ```bash
-git commit -m "feat: initial desktop release"
-git push origin main
+git commit -m "fix: improve desktop updates"
+git push origin dev
 ```
 
 The workflow creates the git tag, builds macOS, Windows, and Linux bundles, then publishes a GitHub Release with the generated installers.
+
+If an older local Ubuntu build reports `Could not fetch a valid release JSON from the remote`, its embedded stable endpoint may point to an old release without `latest.json`. Install a corrected `.deb` manually once from the [Releases list](https://github.com/aceleisureman/mykvm/releases), or rebuild this checkout. Correcting the channel is not a reason to disable signature verification or allow downgrades; releases must also have a version higher than the installed build. Update-check failures do not affect input sharing.
 
 ## Project Layout
 

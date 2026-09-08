@@ -164,6 +164,7 @@ macOS 的输入捕获和注入需要在系统设置中授权 Accessibility 和 I
 提交 PR 或发布版本前建议运行：
 
 ```bash
+npm run test:release
 npm run build
 npm run lint
 cargo check --manifest-path src-tauri/Cargo.toml
@@ -173,23 +174,25 @@ cargo check --manifest-path src-tauri/Cargo.toml
 
 Git 本身只负责保存源码历史和推送提交。真正的打包、编译和生成安装包由 GitHub Actions 在 GitHub runner 上完成。
 
-Release 工作流会监听 `main` 分支推送：
+Release 工作流监听 `dev` 分支推送并发布 beta 版本。稳定版请在 **Actions → Release → Run workflow** 中选择 `stable` 通道和 patch/minor/major 版本增量；推送 `main` 不会发布版本。
 
-- `feat:` 发布下一个 minor 版本，例如 `v0.1.0` 到 `v0.2.0`。
-- `fix:` 发布下一个 patch 版本，例如 `v0.1.0` 到 `v0.1.1`。
-- 其他前缀只运行常规检查，不发布版本。
-- 如果仓库还没有任何 release tag，第一个 `feat:` 或 `fix:` 推送会发布 `v0.1.0`。
+- 版本基线取源码版本和最新稳定 tag 中较大者。例如源码是 `0.9.8`、仓库没有稳定 tag 时，发布 `0.9.9-beta.<run>`，不会重置为 `0.1.0-beta.<run>`。
+- 当前 `dev` 源码的本地构建和 CI beta 包检查 `releases/download/beta/latest.json`。CI 稳定包显式使用 `releases/latest/download/latest.json`，不会在稳定通道失败时偷偷切换到 beta。
+- Linux 清单分别包含签名的 `.deb`、`.rpm` 和 AppImage 更新目标。Ubuntu 的 `.deb` 安装版会获取 `.deb` 更新，安装时仍需正常的系统授权。
+- 所有平台安装包和签名齐全后才发布；先公开版本 Release，再更新 beta 清单，避免清单指向尚未公开的草稿下载地址。
 
 Release 说明取自 [CHANGELOG.md](./CHANGELOG.md) 的 `## [Unreleased]` 段落（面向用户的措辞），没有则回退到过滤后的提交标题。改动落地时记得同步更新该段落。
 
 示例：
 
 ```bash
-git commit -m "feat: initial desktop release"
-git push origin main
+git commit -m "fix: improve desktop updates"
+git push origin dev
 ```
 
 工作流会自动创建 git tag，构建 macOS、Windows 和 Linux 安装包，然后发布到 GitHub Release。
+
+旧的本地 Ubuntu 包如果提示 `Could not fetch a valid release JSON from the remote`，可能是内置稳定通道地址指向缺少 `latest.json` 的旧 Release。需要从 [Releases 列表](https://github.com/aceleisureman/mykvm/releases)手动安装一次修正后的 `.deb`，或重新构建当前源码。不要为此关闭签名校验或允许降级；远端版本号也必须高于已安装版本。检查更新失败不影响键鼠共享。
 
 ## 项目结构
 

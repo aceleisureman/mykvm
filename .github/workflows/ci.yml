@@ -38,6 +38,9 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Test release metadata
+        run: npm run test:release
+
       - name: Build web app
         run: npm run build
 

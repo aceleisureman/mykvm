@@ -19,7 +19,8 @@
     "tauri:build:mac-signed": "tauri build --target aarch64-apple-darwin --bundles app,dmg",
     "mac:sign-local": "scripts/sign-mac-app.sh /Applications/mykvm.app",
     "mac:install-local": "scripts/install-mac-app.sh",
-    "mac:build-install": "npm run tauri:build:mac-arm && npm run mac:install-local"
+    "mac:build-install": "npm run tauri:build:mac-arm && npm run mac:install-local",
+    "test:release": "node --test scripts/release-metadata.test.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.11.0",
