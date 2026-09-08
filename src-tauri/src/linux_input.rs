@@ -16,7 +16,12 @@ use x11rb::{
     CURRENT_TIME,
 };
 
-use crate::shared_input::{InputCommand, MouseButton};
+use crate::{
+    shared_input::{InputCommand, MouseButton},
+    NativeStageStatus, Screen,
+};
+
+mod wayland;
 
 static BACKEND: OnceLock<Mutex<Option<X11Input>>> = OnceLock::new();
 
@@ -27,30 +32,67 @@ struct X11Input {
     pressed_buttons: HashSet<u8>,
 }
 
-fn validate_session(
-    session: Option<&str>,
-    wayland: Option<&str>,
-    display: Option<&str>,
-) -> Result<(), String> {
-    if session.is_some_and(|value| value.eq_ignore_ascii_case("wayland"))
-        || wayland.is_some_and(|value| !value.is_empty())
-    {
-        return Err("Wayland input injection is not supported yet. Log out and select 'Ubuntu on Xorg' at the login screen, then restart MyKVM.".into());
+fn is_wayland(session: Option<&str>, display: Option<&str>) -> bool {
+    session.is_some_and(|value| value.eq_ignore_ascii_case("wayland"))
+        || display.is_some_and(|value| !value.is_empty())
+}
+
+pub fn wayland_session() -> bool {
+    is_wayland(
+        std::env::var("XDG_SESSION_TYPE").ok().as_deref(),
+        std::env::var("WAYLAND_DISPLAY").ok().as_deref(),
+    )
+}
+
+/// Only explicit runtime startup may request desktop permissions. Status polls
+/// and incoming network packets must never open a consent dialog.
+pub fn start(screens: Vec<Screen>) {
+    if wayland_session() {
+        wayland::start(screens);
     }
-    if display.map_or(true, |value| value.is_empty()) {
-        return Err("No X11 DISPLAY is available. Start MyKVM inside the logged-in Ubuntu Xorg desktop session.".into());
+}
+
+pub fn status() -> NativeStageStatus {
+    if wayland_session() {
+        return wayland::status();
     }
-    Ok(())
+    match with_backend(|backend| backend.check_connection()) {
+        Ok(()) => NativeStageStatus {
+            state: "ready".into(),
+            detail: "Receiving shared input through X11 XTEST.".into(),
+        },
+        Err(detail) => NativeStageStatus {
+            state: "error".into(),
+            detail,
+        },
+    }
+}
+
+/// Cheap, non-interactive readiness check for discovery and the packet path.
+pub fn receiving_ready() -> bool {
+    if wayland_session() {
+        return wayland::receiving_ready();
+    }
+    BACKEND
+        .get()
+        .and_then(|backend| backend.lock().ok())
+        .is_some_and(|backend| backend.is_some())
+}
+
+pub fn route() -> &'static str {
+    if wayland_session() {
+        "wayland-portal-eis"
+    } else {
+        "x11-xtest"
+    }
 }
 
 fn with_backend<T>(
     operation: impl FnOnce(&mut X11Input) -> Result<T, String>,
 ) -> Result<T, String> {
-    validate_session(
-        std::env::var("XDG_SESSION_TYPE").ok().as_deref(),
-        std::env::var("WAYLAND_DISPLAY").ok().as_deref(),
-        std::env::var("DISPLAY").ok().as_deref(),
-    )?;
+    if std::env::var("DISPLAY").map_or(true, |value| value.is_empty()) {
+        return Err("No X11 DISPLAY is available. Run MyKVM as the logged-in desktop user inside an X11 session.".into());
+    }
     let mut backend = BACKEND
         .get_or_init(|| Mutex::new(None))
         .lock()
@@ -68,15 +110,28 @@ fn with_backend<T>(
     result
 }
 
-pub fn ready() -> Result<(), String> {
-    with_backend(|backend| backend.check_connection())
+pub fn inject(command: &InputCommand, connection: u64) -> Result<(), String> {
+    if wayland_session() {
+        wayland::inject(command, connection)
+    } else {
+        with_backend(|backend| backend.inject(command))
+    }
 }
 
-pub fn inject(command: &InputCommand) -> Result<(), String> {
-    with_backend(|backend| backend.inject(command))
+pub fn controller_disconnected(connection: u64) {
+    if wayland_session() {
+        wayland::disconnected(connection);
+    } else {
+        release_x11();
+    }
 }
 
 pub fn release_all() {
+    wayland::stop();
+    release_x11();
+}
+
+fn release_x11() {
     // Stopping sharing must not create a new display connection.
     if let Some(backend) = BACKEND.get() {
         if let Ok(mut backend) = backend.lock() {
@@ -322,11 +377,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn wayland_is_rejected_even_when_xwayland_has_a_display() {
-        assert!(validate_session(Some("wayland"), Some("wayland-0"), Some(":0")).is_err());
-        assert!(validate_session(None, Some("wayland-0"), Some(":0")).is_err());
-        assert!(validate_session(Some("x11"), None, Some(":0")).is_ok());
-        assert!(validate_session(Some("x11"), None, None).is_err());
+    fn wayland_uses_its_own_backend_even_with_xwayland() {
+        assert!(is_wayland(Some("wayland"), Some("wayland-0")));
+        assert!(is_wayland(Some("WAYLAND"), None));
+        assert!(is_wayland(None, Some("wayland-0")));
+        assert!(!is_wayland(Some("x11"), None));
+        assert!(!is_wayland(None, Some("")));
     }
 
     #[test]

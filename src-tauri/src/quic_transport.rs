@@ -37,7 +37,11 @@ pub(crate) const MAX_STREAM_BYTES: usize = 48 * 1024 * 1024;
 const PORT_SCAN_COUNT: u16 = 64;
 const QUIC_WORKER_THREADS: usize = 2;
 
-type DatagramHandler = Arc<dyn Fn(Vec<u8>, SocketAddr) + Send + Sync + 'static>;
+type DatagramHandler = Arc<dyn Fn(Vec<u8>, SocketAddr, u64) + Send + Sync + 'static>;
+type DisconnectHandler = Arc<dyn Fn(u64) + Send + Sync + 'static>;
+// Not a socket address or Quinn's recyclable stable_id: delayed closure from an
+// old connection must not release a new controller connection's held inputs.
+static NEXT_INCOMING_CONNECTION: AtomicU64 = AtomicU64::new(1);
 type StreamHandler = Arc<dyn Fn(Vec<u8>, SocketAddr) -> bool + Send + Sync + 'static>;
 
 #[derive(Clone, Debug)]
@@ -300,6 +304,7 @@ pub fn start(
     identity_dir: PathBuf,
     on_datagram: DatagramHandler,
     on_stream: StreamHandler,
+    on_disconnect: DisconnectHandler,
 ) -> Result<TransportHandle, String> {
     // Load (or create-and-persist) this machine's transport identity *before*
     // spawning the runtime thread so a stable public key is reused across
@@ -337,6 +342,7 @@ pub fn start(
                 command_rx,
                 on_datagram,
                 on_stream,
+                on_disconnect,
                 ready_tx,
                 datagram_health_inner,
                 datagram_pending_inner,
@@ -370,6 +376,7 @@ async fn run_transport(
     mut commands: tokio_mpsc::UnboundedReceiver<TransportCommand>,
     on_datagram: DatagramHandler,
     on_stream: StreamHandler,
+    on_disconnect: DisconnectHandler,
     ready_tx: mpsc::Sender<Result<ReadyTransport, String>>,
     datagram_health: Arc<Mutex<DatagramHealth>>,
     datagram_pending: Arc<AtomicU64>,
@@ -392,7 +399,7 @@ async fn run_transport(
     };
 
     let _ = ready_tx.send(Ok(ReadyTransport { port, public_key }));
-    spawn_accept_loop(endpoint.clone(), on_datagram, on_stream);
+    spawn_accept_loop(endpoint.clone(), on_datagram, on_stream, on_disconnect);
 
     let connections: SharedConnections = Arc::new(TokioMutex::new(HashMap::new()));
     let mut last_datagram_fail_log: Option<Instant> = None;
@@ -745,13 +752,19 @@ fn client_config(peer: &PeerEndpoint) -> Result<ClientConfig, String> {
     Ok(config)
 }
 
-fn spawn_accept_loop(endpoint: Endpoint, on_datagram: DatagramHandler, on_stream: StreamHandler) {
+fn spawn_accept_loop(
+    endpoint: Endpoint,
+    on_datagram: DatagramHandler,
+    on_stream: StreamHandler,
+    on_disconnect: DisconnectHandler,
+) {
     tokio::spawn(async move {
         let mut last_fail_log: HashMap<SocketAddr, Instant> = HashMap::new();
         while let Some(incoming) = endpoint.accept().await {
             let remote = incoming.remote_address();
             let on_datagram = Arc::clone(&on_datagram);
             let on_stream = Arc::clone(&on_stream);
+            let on_disconnect = Arc::clone(&on_disconnect);
 
             let should_log = last_fail_log
                 .get(&remote)
@@ -761,7 +774,14 @@ fn spawn_accept_loop(endpoint: Endpoint, on_datagram: DatagramHandler, on_stream
             tokio::spawn(async move {
                 match incoming.await {
                     Ok(connection) => {
-                        spawn_datagram_reader(connection.clone(), remote, on_datagram);
+                        let connection_id = NEXT_INCOMING_CONNECTION.fetch_add(1, Ordering::Relaxed);
+                        spawn_datagram_reader(
+                            connection.clone(),
+                            remote,
+                            connection_id,
+                            on_datagram,
+                            on_disconnect,
+                        );
                         spawn_stream_reader(connection, remote, on_stream);
                     }
                     Err(error) => {
@@ -785,15 +805,33 @@ fn spawn_accept_loop(endpoint: Endpoint, on_datagram: DatagramHandler, on_stream
     });
 }
 
+// Also notify on transport/task shutdown, not only read_datagram errors.
+struct InputConnectionLifetime {
+    connection_id: u64,
+    on_disconnect: DisconnectHandler,
+}
+
+impl Drop for InputConnectionLifetime {
+    fn drop(&mut self) {
+        (self.on_disconnect)(self.connection_id);
+    }
+}
+
 fn spawn_datagram_reader(
     connection: quinn::Connection,
     remote: SocketAddr,
+    connection_id: u64,
     on_datagram: DatagramHandler,
+    on_disconnect: DisconnectHandler,
 ) {
     tokio::spawn(async move {
+        let _lifetime = InputConnectionLifetime {
+            connection_id,
+            on_disconnect,
+        };
         loop {
             match connection.read_datagram().await {
-                Ok(payload) => on_datagram(payload.to_vec(), remote),
+                Ok(payload) => on_datagram(payload.to_vec(), remote, connection_id),
                 Err(error) => {
                     log::debug!("QUIC datagram reader stopped for {remote}: {error}");
                     break;
@@ -956,6 +994,19 @@ fn resolve_peer_addr(addr: &str) -> Result<SocketAddr, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn input_connection_closure_reports_its_generation_exactly_once() {
+        let closed = Arc::new(Mutex::new(Vec::new()));
+        let observed = Arc::clone(&closed);
+        let lifetime = InputConnectionLifetime {
+            connection_id: 42,
+            on_disconnect: Arc::new(move |id| observed.lock().unwrap().push(id)),
+        };
+        assert!(closed.lock().unwrap().is_empty());
+        drop(lifetime);
+        assert_eq!(*closed.lock().unwrap(), vec![42]);
+    }
 
     fn make_cert() -> CertificateDer<'static> {
         rcgen::generate_simple_self_signed(vec!["mykvm.local".to_string()])

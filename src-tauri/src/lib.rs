@@ -102,6 +102,7 @@ const ACTIVATE_INSTANCE_EVENT_NAME: &str = "Local\\MyKVM_ActivateWindow";
 const QUIT_INSTANCE_EVENT_NAME: &str = "Local\\MyKVM_QuitExisting";
 
 static HOSTNAME_CACHE: OnceLock<Option<String>> = OnceLock::new();
+static LOCAL_PEER_ID_CACHE: LocalPeerIdCache = LocalPeerIdCache::new();
 
 #[cfg(target_os = "windows")]
 static WINDOWS_FIREWALL_ENSURED: AtomicBool = AtomicBool::new(false);
@@ -989,6 +990,10 @@ impl AppRuntime {
         runtime.clipboard = self.clipboard_status(layout);
         runtime.pairing = self.pairing_status_for_layout(layout);
         runtime.privilege = current_privilege_status();
+        #[cfg(target_os = "linux")]
+        if runtime.started && layout.input_mode == "receive" {
+            runtime.inject = input::current_inject_status();
+        }
 
         runtime
     }
@@ -1003,8 +1008,10 @@ impl AppRuntime {
         if let Some(transport) = self.quic_transport_handle() {
             apply_transport_to_peer(&mut local_peer, &transport);
         }
-        local_peer.input_ready =
-            advertised_input_ready(layout, self.input_receive_enabled.load(Ordering::Relaxed));
+        local_peer.input_ready = advertised_input_ready(
+            layout,
+            input::receiving_enabled(self.input_receive_enabled.load(Ordering::Relaxed)),
+        );
         let peers = active_peers(&self.peers, &local_peer.id);
         let state = if self
             .discovery_stop
@@ -1089,6 +1096,9 @@ impl AppRuntime {
             return Ok(transport);
         }
 
+        // Prime the input identity before a transport callback can run. Later
+        // discovery/status snapshots refresh it when the host route changes.
+        let _ = local_input_peer_id();
         let layout_for_input = Arc::clone(&self.layout);
         let layout_for_clipboard = Arc::clone(&self.layout);
         let layout_for_file_transfer = Arc::clone(&self.layout);
@@ -1113,19 +1123,19 @@ impl AppRuntime {
         let remote_file_pending_for_stream = Arc::clone(&self.remote_file_pending);
         let remote_file_request_cache_for_stream = Arc::clone(&self.remote_file_request_cache);
 
-        let on_datagram = Arc::new(move |payload: Vec<u8>, source| {
-            if !input_receive_enabled.load(Ordering::Relaxed) {
+        let on_datagram = Arc::new(move |payload: Vec<u8>, source, connection_id| {
+            if !input::receiving_enabled(input_receive_enabled.load(Ordering::Relaxed)) {
                 return;
             }
             let Ok(layout) = layout_for_input.lock() else {
                 return;
             };
-            let current_peer = local_peer_from_layout(&layout);
+            let current_peer_id = local_input_peer_id();
             if input::try_handle_control_packet_from_source(
                 &layout,
                 &payload,
                 source,
-                &current_peer.id,
+                &current_peer_id,
             ) {
                 transport_packets_for_input.fetch_add(1, Ordering::Relaxed);
                 return;
@@ -1135,8 +1145,9 @@ impl AppRuntime {
                 &native_layout_for_input,
                 &payload,
                 source,
+                connection_id,
                 &input_events,
-                &current_peer.id,
+                &current_peer_id,
                 &clipboard_target,
             ) {
                 transport_packets_for_input.fetch_add(1, Ordering::Relaxed);
@@ -1211,8 +1222,13 @@ impl AppRuntime {
             .parent()
             .map(|parent| parent.to_path_buf())
             .unwrap_or_else(|| PathBuf::from("."));
-        let transport =
-            quic_transport::start(preferred_port, identity_dir, on_datagram, on_stream)?;
+        let transport = quic_transport::start(
+            preferred_port,
+            identity_dir,
+            on_datagram,
+            on_stream,
+            Arc::new(input::input_connection_closed),
+        )?;
         let mut stored = self
             .quic_transport
             .lock()
@@ -1269,8 +1285,10 @@ impl AppRuntime {
 
         let mut local_peer = local_peer_from_layout(&layout);
         apply_transport_to_peer(&mut local_peer, &quic_transport);
-        local_peer.input_ready =
-            advertised_input_ready(&layout, self.input_receive_enabled.load(Ordering::Relaxed));
+        local_peer.input_ready = advertised_input_ready(
+            &layout,
+            input::receiving_enabled(self.input_receive_enabled.load(Ordering::Relaxed)),
+        );
         let peers = Arc::clone(&self.peers);
         let layout_state = Arc::clone(&self.layout);
         let pairing_challenge = Arc::clone(&self.pairing_challenge);
@@ -1304,11 +1322,13 @@ impl AppRuntime {
         thread::spawn(move || {
             let mut buffer = [0_u8; 4096];
             let mut last_announce = Instant::now() - Duration::from_secs(10);
-            let mut last_input_ready = input_receive_enabled.load(Ordering::Relaxed);
+            let mut last_input_ready =
+                input::receiving_enabled(input_receive_enabled.load(Ordering::Relaxed));
             let mut last_upgrading = upgrading.load(Ordering::Relaxed);
 
             while !thread_stop.load(Ordering::Relaxed) {
-                let current_input_ready = input_receive_enabled.load(Ordering::Relaxed);
+                let current_input_ready =
+                    input::receiving_enabled(input_receive_enabled.load(Ordering::Relaxed));
                 let current_upgrading = upgrading.load(Ordering::Relaxed);
                 if last_announce.elapsed() >= Duration::from_secs(3)
                     || current_input_ready != last_input_ready
@@ -1364,7 +1384,9 @@ impl AppRuntime {
                                 apply_transport_to_peer(&mut peer, &quic_transport);
                                 peer.input_ready = advertised_input_ready(
                                     &layout,
-                                    input_receive_enabled.load(Ordering::Relaxed),
+                                    input::receiving_enabled(
+                                        input_receive_enabled.load(Ordering::Relaxed),
+                                    ),
                                 );
                                 peer.upgrading = upgrading.load(Ordering::Relaxed);
                                 (layout.clone(), peer)
@@ -8929,6 +8951,48 @@ struct IncomingDiscovery {
     pair_secret: Option<String>,
 }
 
+// Peer IDs are based on host + route-selected IP, not the layout's local
+// device ID. Resolve/refresh that identity on discovery/status paths, not for
+// every input packet (which otherwise opens a UDP socket and clones a LanPeer).
+struct LocalPeerIdCache {
+    id: OnceLock<Mutex<String>>,
+}
+
+impl LocalPeerIdCache {
+    const fn new() -> Self {
+        Self {
+            id: OnceLock::new(),
+        }
+    }
+
+    fn get_or_init(&self, resolve: impl FnOnce() -> String) -> String {
+        self.id
+            .get_or_init(|| Mutex::new(resolve()))
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
+
+    fn refresh(&self, id: &str) {
+        let mut cached = self
+            .id
+            .get_or_init(|| Mutex::new(id.to_string()))
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if *cached != id {
+            id.clone_into(&mut cached);
+        }
+    }
+}
+
+fn local_input_peer_id() -> String {
+    LOCAL_PEER_ID_CACHE.get_or_init(|| {
+        let host = hostname().unwrap_or_else(|| "localhost".into());
+        let ip = local_ip_address().unwrap_or_else(|| "127.0.0.1".into());
+        local_peer_id(&host, &ip)
+    })
+}
+
 fn local_peer_from_layout(layout: &LayoutState) -> LanPeer {
     let local_device = layout
         .devices
@@ -8938,9 +9002,11 @@ fn local_peer_from_layout(layout: &LayoutState) -> LanPeer {
     let fallback_name = local_device_name();
     let host = hostname().unwrap_or_else(|| "localhost".into());
     let ip = local_ip_address().unwrap_or_else(|| "127.0.0.1".into());
+    let id = local_peer_id(&host, &ip);
+    LOCAL_PEER_ID_CACHE.refresh(&id);
 
     LanPeer {
-        id: local_peer_id(&host, &ip),
+        id,
         name: local_device
             .map(|device| device.name.clone())
             .filter(|name| !name.trim().is_empty())
@@ -10492,6 +10558,43 @@ mod tests {
         let stored = stored.as_ref().expect("challenge");
         assert_eq!(stored.attempts, 0);
         assert_ne!(stored.expires_at_ms, 42);
+    }
+
+    #[test]
+    fn local_peer_identity_cache_does_not_resolve_on_each_input_packet() {
+        let cache = LocalPeerIdCache::new();
+        let resolutions = std::cell::Cell::new(0);
+        let expected = local_peer_id("test-host", "192.0.2.1");
+        for _ in 0..1_000 {
+            let id = cache.get_or_init(|| {
+                resolutions.set(resolutions.get() + 1);
+                expected.clone()
+            });
+            assert_eq!(id, expected);
+        }
+        assert_eq!(resolutions.get(), 1);
+
+        // A route change observed by discovery must replace the input identity
+        // without changing host/IP normalization or resolving on the hot path.
+        let updated = local_peer_id("test-host", "192.0.2.2");
+        cache.refresh(&updated);
+        assert_eq!(
+            cache.get_or_init(|| panic!("input must use the refreshed identity")),
+            updated,
+        );
+    }
+
+    #[test]
+    fn local_peer_identity_cache_can_be_primed_by_discovery() {
+        let cache = LocalPeerIdCache::new();
+        let advertised = local_peer_id("test-host", "192.0.2.1");
+        cache.refresh(&advertised);
+        cache.refresh(&advertised);
+        assert_eq!(
+            cache.get_or_init(|| panic!("discovery already resolved the identity")),
+            advertised,
+        );
+        assert_ne!(advertised, "local-device");
     }
 
     #[test]

@@ -43,8 +43,13 @@ const RETURN_EDGE_INSET: f64 = 0.0;
 // After returning to local, refuse to cross back into the remote for this long.
 // Lets a fast back-flick settle at the edge without bouncing into the remote.
 const RETURN_COOLDOWN_MS: u64 = 150;
-const MOUSE_MOVE_SEND_INTERVAL_MS: u64 = 16;
+// Match ordinary motion to the existing drag cadence (~125 Hz). A 16 ms
+// ceiling undersamples 120/144 Hz displays even on a low-latency LAN.
+const MOUSE_MOVE_SEND_INTERVAL_MS: u64 = 8;
 const DRAG_MOVE_SEND_INTERVAL_MS: u64 = 8;
+// Keep the 8 ms phase when a hardware callback arrives slightly early/late.
+// This is a scheduling tolerance, not a sleep or an input buffer.
+const MOUSE_MOVE_PACING_TOLERANCE: Duration = Duration::from_micros(500);
 #[cfg(target_os = "macos")]
 const MACOS_IDLE_CAPTURE_LOOP_MS: u64 = 100;
 #[cfg(target_os = "macos")]
@@ -100,6 +105,10 @@ const MACOS_RAW_GESTURE_EVENT_TYPES: &[u32] = &[
 const WINDOWS_DESKTOP_CHECK_INTERVAL_MS: u64 = 250;
 
 static REMOTE_MOUSE_STATE: OnceLock<Mutex<RemoteMouseState>> = OnceLock::new();
+// Serialize authorized Linux input and transport closure. Connection IDs are
+// process-local generations, not peer IPs (an old connection may close late).
+#[cfg(target_os = "linux")]
+static LINUX_INPUT_CONNECTION: Mutex<Option<u64>> = Mutex::new(None);
 static INPUT_DEBUG_EVENTS: OnceLock<Mutex<Vec<InputDebugEvent>>> = OnceLock::new();
 static LAST_SUCCESSFUL_MOUSE_DEBUG_MS: AtomicU64 = AtomicU64::new(0);
 #[cfg(target_os = "macos")]
@@ -744,6 +753,13 @@ pub fn start_input_runtime(
     input_events: Arc<AtomicU64>,
     switch_request: Arc<Mutex<Option<SwitchDirection>>>,
 ) -> (NativeStageStatus, NativeStageStatus) {
+    #[cfg(target_os = "linux")]
+    if layout.input_mode == "receive" {
+        let screens = local_device(&native_layout)
+            .map(|device| device.screens.clone())
+            .unwrap_or_default();
+        crate::linux_input::start(screens);
+    }
     let inject_status = input_receive_status(&layout, true);
     if layout.input_mode == "receive" {
         remote_active.store(false, Ordering::Relaxed);
@@ -795,15 +811,10 @@ pub fn input_runtime_status(
 }
 
 fn input_receive_status(layout: &LayoutState, request_permission: bool) -> NativeStageStatus {
-    let _ = request_permission;
+    let _ = (layout, request_permission);
 
     #[cfg(target_os = "linux")]
-    if let Err(detail) = crate::linux_input::ready() {
-        return NativeStageStatus {
-            state: "error".into(),
-            detail,
-        };
-    }
+    return crate::linux_input::status();
 
     #[cfg(target_os = "macos")]
     if !macos_accessibility_trusted(request_permission) {
@@ -825,6 +836,7 @@ fn input_receive_status(layout: &LayoutState, request_permission: bool) -> Nativ
         };
     }
 
+    #[cfg(not(target_os = "linux"))]
     NativeStageStatus {
         state: "ready".into(),
         detail: format!(
@@ -832,6 +844,24 @@ fn input_receive_status(layout: &LayoutState, request_permission: bool) -> Nativ
             normalize_quic_port(layout.transport_port, layout.quic_port)
         ),
     }
+}
+
+/// Desired receive mode is separate from backend readiness (notably while a
+/// Wayland permission prompt is open or after the user revokes its session).
+pub fn receiving_enabled(requested: bool) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        requested && crate::linux_input::receiving_ready()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        requested
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub fn current_inject_status() -> NativeStageStatus {
+    crate::linux_input::status()
 }
 
 #[cfg(target_os = "macos")]
@@ -942,7 +972,7 @@ fn start_platform_capture(
             cursor_hidden: Mutex::new(false),
             cursor_hide_depth: Mutex::new(0),
             last_cursor_hide_reassert: Mutex::new(None),
-            last_mouse_move_sent: Mutex::new(None),
+            last_mouse_move_tick: Mutex::new(None),
             last_cursor_repin: Mutex::new(None),
             last_return: Mutex::new(None),
             remote_button_mask: AtomicU64::new(0),
@@ -1141,7 +1171,7 @@ fn start_platform_capture(
             switch_request,
             anchor: Mutex::new(None),
             last_point: Mutex::new(None),
-            last_mouse_move_sent: Mutex::new(None),
+            last_mouse_move_tick: Mutex::new(None),
             remote_button_mask: AtomicU64::new(0),
             pressed_keys: Mutex::new(Vec::new()),
             cursor_hide_calls: Mutex::new(0),
@@ -1315,7 +1345,7 @@ fn build_input_targets(layout: &LayoutState, native_layout: &LayoutState) -> Vec
         .or_else(|| native_layout.devices.first());
 
     let local_screens = &local_device.screens;
-    let origin_device_id = crate::local_peer_from_layout(layout).id;
+    let origin_device_id = crate::local_input_peer_id();
     let mut targets = Vec::new();
 
     for device in layout.devices.iter().filter(|device| {
@@ -1526,7 +1556,7 @@ pub fn send_secure_attention_control(
         return Err("this device is not paired with the target".into());
     }
 
-    let origin_device_id = origin_peer_id(layout);
+    let origin_device_id = crate::local_input_peer_id();
     let packet = InputControlPacket {
         protocol: INPUT_CONTROL_PROTOCOL.into(),
         target_device_id: target.id.clone(),
@@ -1585,7 +1615,7 @@ fn input_packet_context(
         Err(TryLockError::Poisoned(_)) => return fallback_context(event),
     };
 
-    let origin_device_id = origin_peer_id(&layout);
+    let origin_device_id = crate::local_input_peer_id();
     let peer = layout
         .devices
         .iter()
@@ -1736,6 +1766,7 @@ pub fn try_inject_packet_from_source(
     native_layout: &LayoutState,
     payload: &[u8],
     source: SocketAddr,
+    connection_id: u64,
     input_events: &Arc<AtomicU64>,
     local_peer_id: &str,
     clipboard_target: &Arc<Mutex<Option<ClipboardTarget>>>,
@@ -1755,6 +1786,26 @@ pub fn try_inject_packet_from_source(
 
     if !packet_targets_local(layout, &packet.target_device_id, local_peer_id) {
         return true;
+    }
+
+    #[cfg(target_os = "linux")]
+    let mut connection = LINUX_INPUT_CONNECTION
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    #[cfg(target_os = "linux")]
+    if crate::linux_input::wayland_session() && !crate::linux_input::receiving_ready() {
+        // Recheck under the packet-path lock: a compositor pause can race the
+        // transport's readiness check. Rejected packets must not change the
+        // remembered pointer/button state while the EIS session is suspended.
+        return true;
+    }
+    #[cfg(target_os = "linux")]
+    if *connection != Some(connection_id) {
+        if let Some(previous) = *connection {
+            crate::linux_input::controller_disconnected(previous);
+        }
+        reset_remote_mouse_state();
+        *connection = Some(connection_id);
     }
 
     if packet.origin_port != 0 && !packet.origin_transport_public_key.trim().is_empty() {
@@ -1784,6 +1835,7 @@ pub fn try_inject_packet_from_source(
         native_layout,
         packet.event,
         &packet.origin_device_id,
+        connection_id,
     );
     if injected {
         input_events.fetch_add(1, Ordering::Relaxed);
@@ -1891,10 +1943,6 @@ fn legacy_local_device_origin_allowed(
         && layout.paired_controllers.len() == 1
         && origin_device_id == "local-device"
         && !origin_transport_public_key.trim().is_empty()
-}
-
-fn origin_peer_id(layout: &LayoutState) -> String {
-    crate::local_peer_from_layout(layout).id
 }
 
 static LAST_UNAUTHORIZED_WARN: OnceLock<Mutex<Instant>> = OnceLock::new();
@@ -2095,8 +2143,37 @@ fn map_relative_to_native_axis(
     (native_start as f64 + ratio * native_size.max(1) as f64).round() as i32
 }
 
-#[cfg(any(target_os = "windows", target_os = "linux"))]
+#[cfg(target_os = "linux")]
 fn platform_native_screen(screen: &Screen) -> Screen {
+    linux_native_screen(screen, crate::linux_input::wayland_session())
+}
+
+#[cfg(target_os = "linux")]
+fn linux_native_screen(screen: &Screen, wayland: bool) -> Screen {
+    if wayland {
+        // Portal and EIS monitor geometry is logical, unlike XTEST/SendInput.
+        // Applying the physical scale here would scale HiDPI positions twice.
+        screen.clone()
+    } else {
+        physical_native_screen(screen)
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn platform_native_screen(screen: &Screen) -> Screen {
+    physical_native_screen(screen)
+}
+
+#[cfg(target_os = "linux")]
+fn clamp_to_native_screen(screen: &Screen, x: i32, y: i32) -> (i32, i32) {
+    (
+        x.clamp(screen.x, screen.x.saturating_add(screen.width.max(1) - 1)),
+        y.clamp(screen.y, screen.y.saturating_add(screen.height.max(1) - 1)),
+    )
+}
+
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+fn physical_native_screen(screen: &Screen) -> Screen {
     let scale = if screen.scale.is_finite() && screen.scale > 0.0 {
         screen.scale
     } else {
@@ -2165,7 +2242,10 @@ fn inject_input_event(
     native_layout: &LayoutState,
     event: InputEvent,
     controller_id: &str,
+    connection_id: u64,
 ) -> bool {
+    #[cfg(not(target_os = "linux"))]
+    let _ = connection_id;
     let debug_event = input_debug_event_from_input_event(&event);
     let Some(command) = input_event_to_command(layout, native_layout, &event) else {
         record_input_debug_event(InputDebugEvent {
@@ -2296,7 +2376,7 @@ fn inject_input_event(
     #[cfg(target_os = "linux")]
     {
         let (absolute_x, absolute_y) = command_coordinates(&command);
-        let outcome = crate::linux_input::inject(&command);
+        let outcome = crate::linux_input::inject(&command, connection_id);
         let injected = outcome.is_ok();
         let result = if injected { "injected" } else { "failed" };
         let timestamp_ms = now_input_debug_ms();
@@ -2311,11 +2391,11 @@ fn inject_input_event(
                 absolute_x,
                 absolute_y,
                 desktop: "linux".into(),
-                route: "x11-xtest".into(),
+                route: crate::linux_input::route().into(),
                 pipe_available: None,
                 result: result.into(),
                 detail: match outcome {
-                    Ok(()) => "injected through X11 XTEST".into(),
+                    Ok(()) => format!("submitted through {}", crate::linux_input::route()),
                     Err(error) => error,
                 },
             }
@@ -2417,6 +2497,14 @@ fn input_event_to_command(
                     native_screen.y,
                     native_screen.height,
                 );
+                // Rounding a scaled position at the far edge must not select
+                // the adjacent EIS monitor (or fall outside all regions).
+                #[cfg(target_os = "linux")]
+                let (absolute_x, absolute_y) = if crate::linux_input::wayland_session() {
+                    clamp_to_native_screen(&native_screen, absolute_x, absolute_y)
+                } else {
+                    (absolute_x, absolute_y)
+                };
                 let drag_button = update_remote_mouse_position(absolute_x, absolute_y);
                 return Some(InputCommand::MouseMove {
                     x: absolute_x,
@@ -2635,7 +2723,7 @@ struct MacCaptureContext {
     cursor_hidden: Mutex<bool>,
     cursor_hide_depth: Mutex<usize>,
     last_cursor_hide_reassert: Mutex<Option<Instant>>,
-    last_mouse_move_sent: Mutex<Option<Instant>>,
+    last_mouse_move_tick: Mutex<Option<Instant>>,
     last_cursor_repin: Mutex<Option<Instant>>,
     // Instant we last returned control to the local machine. We now land the
     // cursor flush against the edge (RETURN_EDGE_INSET=0) for a seamless
@@ -2809,7 +2897,7 @@ struct WindowsCaptureContext {
     switch_request: Arc<Mutex<Option<SwitchDirection>>>,
     anchor: Mutex<Option<(f64, f64)>>,
     last_point: Mutex<Option<(f64, f64)>>,
-    last_mouse_move_sent: Mutex<Option<Instant>>,
+    last_mouse_move_tick: Mutex<Option<Instant>>,
     remote_button_mask: AtomicU64,
     pressed_keys: Mutex<Vec<u16>>,
     cursor_hide_calls: Mutex<u8>,
@@ -2834,36 +2922,52 @@ fn clear_windows_capture_context() {
     }
 }
 
-fn should_send_mouse_move(last_sent: &Mutex<Option<Instant>>, dragging: bool) -> bool {
+fn should_send_mouse_move(last_tick: &Mutex<Option<Instant>>, dragging: bool) -> bool {
+    let Ok(mut last_tick) = last_tick.lock() else {
+        return true;
+    };
+    mouse_move_send_due(&mut last_tick, Instant::now(), dragging)
+}
+
+fn mouse_move_send_due(last_tick: &mut Option<Instant>, now: Instant, dragging: bool) -> bool {
     let interval = Duration::from_millis(if dragging {
         DRAG_MOVE_SEND_INTERVAL_MS
     } else {
         MOUSE_MOVE_SEND_INTERVAL_MS
     });
-    let Ok(mut last_sent) = last_sent.lock() else {
+    let Some(previous_tick) = *last_tick else {
+        *last_tick = Some(now);
         return true;
     };
-    let now = Instant::now();
-    if last_sent
-        .as_ref()
-        .map(|sent| now.duration_since(*sent) < interval)
-        .unwrap_or(false)
-    {
+    let next_tick = previous_tick + interval;
+    if now + MOUSE_MOVE_PACING_TOLERANCE < next_tick {
         return false;
     }
-    *last_sent = Some(now);
+
+    // Advance the scheduled tick, not the callback timestamp: resetting to
+    // `now` on every send can turn a jittery 125 Hz source into ~62.5 Hz.
+    // Keep at most 0.5 ms of phase debt, so late callbacks cannot accumulate
+    // catch-up credit. Consecutive sends stay at least interval - 1 ms apart,
+    // and the aggregate rate remains bounded by the original 8 ms cadence.
+    *last_tick = Some(if now.saturating_duration_since(next_tick) >= interval {
+        now // Resume immediately after idle, without replaying missed ticks.
+    } else {
+        next_tick.max(now.checked_sub(MOUSE_MOVE_PACING_TOLERANCE).unwrap_or(now))
+    });
     true
 }
 
-fn mark_mouse_move_sent(last_sent: &Mutex<Option<Instant>>) {
-    if let Ok(mut last_sent) = last_sent.lock() {
-        *last_sent = Some(Instant::now());
+fn mark_mouse_move_sent(last_tick: &Mutex<Option<Instant>>) {
+    if let Ok(mut last_tick) = last_tick.lock() {
+        // Button/key/scroll paths send the latest position first. Start a new
+        // phase there rather than carrying motion credit across that barrier.
+        *last_tick = Some(Instant::now());
     }
 }
 
-fn reset_mouse_move_timer(last_sent: &Mutex<Option<Instant>>) {
-    if let Ok(mut last_sent) = last_sent.lock() {
-        *last_sent = None;
+fn reset_mouse_move_timer(last_tick: &Mutex<Option<Instant>>) {
+    if let Ok(mut last_tick) = last_tick.lock() {
+        *last_tick = None;
     }
 }
 
@@ -3237,7 +3341,7 @@ fn release_windows_remote_control(context: &WindowsCaptureContext, clear_clipboa
 
     context.remote_active.store(false, Ordering::Relaxed);
     context.just_crossed.store(false, Ordering::Relaxed);
-    reset_mouse_move_timer(&context.last_mouse_move_sent);
+    reset_mouse_move_timer(&context.last_mouse_move_tick);
     show_windows_cursor_if_needed(context);
     if let Ok(mut anchor) = context.anchor.lock() {
         *anchor = None;
@@ -3353,7 +3457,7 @@ fn handle_windows_mouse_move(context: &WindowsCaptureContext, x: f64, y: f64) ->
                 &context.layout_state,
                 &context.input_events,
             );
-            reset_mouse_move_timer(&context.last_mouse_move_sent);
+            reset_mouse_move_timer(&context.last_mouse_move_tick);
             show_windows_cursor_if_needed(context);
             set_windows_cursor(point.0.round() as i32, point.1.round() as i32);
             if let Ok(mut anchor) = context.anchor.lock() {
@@ -3369,7 +3473,7 @@ fn handle_windows_mouse_move(context: &WindowsCaptureContext, x: f64, y: f64) ->
             .y
             .clamp(0.0, (active_target.current_screen.height - 1) as f64);
         let dragging = remote_button_is_down(&context.remote_button_mask);
-        if should_send_mouse_move(&context.last_mouse_move_sent, dragging) {
+        if should_send_mouse_move(&context.last_mouse_move_tick, dragging) {
             if !send_remote_mouse_move(
                 &context.quic_transport,
                 active_target,
@@ -3379,7 +3483,7 @@ fn handle_windows_mouse_move(context: &WindowsCaptureContext, x: f64, y: f64) ->
                 *active = None;
                 context.remote_active.store(false, Ordering::Relaxed);
                 clear_clipboard_target(&context.clipboard_target);
-                reset_mouse_move_timer(&context.last_mouse_move_sent);
+                reset_mouse_move_timer(&context.last_mouse_move_tick);
                 reset_remote_button_mask(&context.remote_button_mask);
                 if let Ok(mut pressed) = context.pressed_keys.lock() {
                     pressed.clear();
@@ -3423,12 +3527,12 @@ fn handle_windows_mouse_move(context: &WindowsCaptureContext, x: f64, y: f64) ->
             &context.layout_state,
             &context.input_events,
         ) {
-            reset_mouse_move_timer(&context.last_mouse_move_sent);
+            reset_mouse_move_timer(&context.last_mouse_move_tick);
             reset_remote_button_mask(&context.remote_button_mask);
             show_windows_cursor_if_needed(context);
             return false;
         }
-        mark_mouse_move_sent(&context.last_mouse_move_sent);
+        mark_mouse_move_sent(&context.last_mouse_move_tick);
         reset_remote_button_mask(&context.remote_button_mask);
         context.remote_active.store(true, Ordering::Relaxed);
         set_control_clipboard_target(
@@ -3479,7 +3583,7 @@ fn handle_windows_mouse_button(context: &WindowsCaptureContext, message: u32) ->
     ) {
         return false;
     }
-    mark_mouse_move_sent(&context.last_mouse_move_sent);
+    mark_mouse_move_sent(&context.last_mouse_move_tick);
 
     let sent = send_packet(
         &context.quic_transport,
@@ -3531,7 +3635,7 @@ fn handle_windows_scroll(context: &WindowsCaptureContext, message: u32, mouse_da
     ) {
         return false;
     }
-    mark_mouse_move_sent(&context.last_mouse_move_sent);
+    mark_mouse_move_sent(&context.last_mouse_move_tick);
 
     send_packet(
         &context.quic_transport,
@@ -3609,7 +3713,7 @@ fn send_macos_mouse_button(
     ) {
         return false;
     }
-    mark_mouse_move_sent(&context.last_mouse_move_sent);
+    mark_mouse_move_sent(&context.last_mouse_move_tick);
 
     let sent = send_packet(
         &context.quic_transport,
@@ -3702,7 +3806,7 @@ fn handle_macos_event(
                 repin_macos_cursor_while_remote(context);
                 return CallbackResult::Drop;
             }
-            mark_mouse_move_sent(&context.last_mouse_move_sent);
+            mark_mouse_move_sent(&context.last_mouse_move_tick);
             send_packet(
                 &context.quic_transport,
                 &target,
@@ -3831,7 +3935,7 @@ fn handle_macos_mouse_move(
                 }
                 // Keep the clipboard peer so copies still sync after returning.
                 release_held_remote_inputs_macos(context, &target);
-                reset_mouse_move_timer(&context.last_mouse_move_sent);
+                reset_mouse_move_timer(&context.last_mouse_move_tick);
                 reset_cursor_repin_timer(context);
                 if let Ok(mut anchor) = context.anchor.lock() {
                     *anchor = None;
@@ -3860,7 +3964,7 @@ fn handle_macos_mouse_move(
                 .y
                 .clamp(0.0, (active_target.current_screen.height - 1) as f64);
             let dragging = remote_button_is_down(&context.remote_button_mask);
-            if should_send_mouse_move(&context.last_mouse_move_sent, dragging) {
+            if should_send_mouse_move(&context.last_mouse_move_tick, dragging) {
                 if !send_remote_mouse_move(
                     &context.quic_transport,
                     active_target,
@@ -3874,7 +3978,7 @@ fn handle_macos_mouse_move(
                         .suppress_next_mouse_delta
                         .store(false, Ordering::Relaxed);
                     clear_clipboard_target(&context.clipboard_target);
-                    reset_mouse_move_timer(&context.last_mouse_move_sent);
+                    reset_mouse_move_timer(&context.last_mouse_move_tick);
                     reset_cursor_repin_timer(context);
                     reset_remote_button_mask(&context.remote_button_mask);
                     if let Ok(mut modifiers) = context.pressed_modifiers.lock() {
@@ -3942,7 +4046,7 @@ fn handle_macos_mouse_move(
             &context.layout_state,
             &context.input_events,
         ) {
-            reset_mouse_move_timer(&context.last_mouse_move_sent);
+            reset_mouse_move_timer(&context.last_mouse_move_tick);
             reset_remote_button_mask(&context.remote_button_mask);
             reset_cursor_repin_timer(context);
             set_macos_warp_suppression_interval(MACOS_DEFAULT_WARP_SUPPRESSION_SECS);
@@ -3951,7 +4055,7 @@ fn handle_macos_mouse_move(
             context.just_crossed.store(false, Ordering::Relaxed);
             return CallbackResult::Keep;
         }
-        reset_mouse_move_timer(&context.last_mouse_move_sent);
+        reset_mouse_move_timer(&context.last_mouse_move_tick);
         reset_cursor_repin_timer(context);
         reset_remote_button_mask(&context.remote_button_mask);
         context.remote_active.store(true, Ordering::Relaxed);
@@ -4440,7 +4544,7 @@ fn enter_remote_target_macos(context: &MacCaptureContext, active_target: ActiveT
         &context.layout_state,
         &context.input_events,
     ) {
-        reset_mouse_move_timer(&context.last_mouse_move_sent);
+        reset_mouse_move_timer(&context.last_mouse_move_tick);
         reset_remote_button_mask(&context.remote_button_mask);
         reset_cursor_repin_timer(context);
         set_macos_warp_suppression_interval(MACOS_DEFAULT_WARP_SUPPRESSION_SECS);
@@ -4459,7 +4563,7 @@ fn enter_remote_target_macos(context: &MacCaptureContext, active_target: ActiveT
     set_macos_warp_suppression_interval(0.0);
     hide_macos_cursor_if_needed(context);
     move_macos_cursor_without_event(context, CGPoint::new(anchor.0, anchor.1));
-    reset_mouse_move_timer(&context.last_mouse_move_sent);
+    reset_mouse_move_timer(&context.last_mouse_move_tick);
     reset_cursor_repin_timer(context);
     reset_remote_button_mask(&context.remote_button_mask);
     context.remote_active.store(true, Ordering::Relaxed);
@@ -4516,7 +4620,7 @@ fn return_to_local_macos(context: &MacCaptureContext) {
         *last_return = Some(Instant::now());
     }
     release_held_remote_inputs_macos(context, &target);
-    reset_mouse_move_timer(&context.last_mouse_move_sent);
+    reset_mouse_move_timer(&context.last_mouse_move_tick);
     reset_cursor_repin_timer(context);
     if let Ok(mut anchor) = context.anchor.lock() {
         *anchor = None;
@@ -4676,7 +4780,7 @@ fn drain_switch_request_windows(context: &WindowsCaptureContext) {
                 // first-delta guard would eat the user's first real movement.
                 context.just_crossed.store(false, Ordering::Relaxed);
             } else {
-                reset_mouse_move_timer(&context.last_mouse_move_sent);
+                reset_mouse_move_timer(&context.last_mouse_move_tick);
                 reset_remote_button_mask(&context.remote_button_mask);
                 show_windows_cursor_if_needed(context);
             }
@@ -5744,7 +5848,55 @@ pub fn reset_injected_modifiers() {
 
 #[cfg(target_os = "linux")]
 pub fn reset_injected_modifiers() {
+    let mut connection = LINUX_INPUT_CONNECTION
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    *connection = None;
     crate::linux_input::release_all();
+    reset_remote_mouse_state();
+}
+
+/// Only the current authorized connection may release received input. QUIC's
+/// keepalive/connection timeout detects a dead controller without treating a
+/// legitimately stationary held key as an idle timeout.
+pub fn input_connection_closed(connection_id: u64) {
+    #[cfg(target_os = "linux")]
+    {
+        let mut connection = LINUX_INPUT_CONNECTION
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if *connection == Some(connection_id) {
+            crate::linux_input::controller_disconnected(connection_id);
+            reset_remote_mouse_state();
+            *connection = None;
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = connection_id;
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn pause_received_input() {
+    // Serialize with an already-running input packet, but never hold the EIS
+    // phase lock here (packets acquire these locks in the opposite order).
+    let _connection = LINUX_INPUT_CONNECTION
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(mouse) = REMOTE_MOUSE_STATE.get() {
+        let mut mouse = mouse.lock().unwrap_or_else(|e| e.into_inner());
+        // The original devices/mapping are retained, so keep the last pointer
+        // position. Resetting it to (0, 0) would relocate a later button event.
+        mouse.buttons = 0;
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn reset_remote_mouse_state() {
+    if let Some(mouse) = REMOTE_MOUSE_STATE.get() {
+        if let Ok(mut mouse) = mouse.lock() {
+            *mouse = RemoteMouseState::default();
+        }
+    }
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -5838,6 +5990,148 @@ fn inject_key(_key_code: u16, _down: bool) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mouse_motion_can_send_at_125_hz_without_bypassing_the_rate_limit() {
+        let start = Instant::now();
+        for dragging in [false, true] {
+            let mut last_tick = None;
+            let mut sent_at = Vec::new();
+            // A 1 kHz source must not flood the network: only the initial
+            // sample and each subsequent 8 ms sample may be transmitted.
+            for ms in 0..=24 {
+                let now = start + Duration::from_millis(ms);
+                if mouse_move_send_due(&mut last_tick, now, dragging) {
+                    sent_at.push(ms);
+                }
+            }
+            assert_eq!(sent_at, vec![0, 8, 16, 24]);
+        }
+    }
+
+    #[test]
+    fn mouse_motion_keeps_125_hz_cadence_with_polling_jitter() {
+        let start = Instant::now();
+        for dragging in [false, true] {
+            let mut last_tick = None;
+            let mut sent = 0;
+            // Alternating 7.7/8.3 ms callbacks still represent a 125 Hz
+            // mouse. A strict elapsed-since-last-send gate loses half of them.
+            for sample in 0..=125 {
+                let micros = sample * 8_000 - (sample % 2) * 300;
+                if mouse_move_send_due(
+                    &mut last_tick,
+                    start + Duration::from_micros(micros),
+                    dragging,
+                ) {
+                    sent += 1;
+                }
+            }
+            assert_eq!(
+                sent, 126,
+                "125 Hz polling jitter must not halve the cadence"
+            );
+        }
+    }
+
+    #[test]
+    fn mouse_motion_keeps_near_125_hz_cadence_without_phase_drift() {
+        let start = Instant::now();
+        for dragging in [false, true] {
+            let mut last_tick = None;
+            let mut sent = 0;
+            for sample in 0..=1_250 {
+                if mouse_move_send_due(
+                    &mut last_tick,
+                    start + Duration::from_micros(sample * 7_999),
+                    dragging,
+                ) {
+                    sent += 1;
+                }
+            }
+            assert!((1_249..=1_250).contains(&sent), "sent {sent} of 1251 samples");
+        }
+    }
+
+    #[test]
+    fn mouse_motion_bounds_spacing_and_rate_with_irregular_callbacks() {
+        let start = Instant::now();
+        let interval_us = MOUSE_MOVE_SEND_INTERVAL_MS * 1_000;
+        let tolerance_us = MOUSE_MOVE_PACING_TOLERANCE.as_micros() as u64;
+        for dragging in [false, true] {
+            let mut last_tick = None;
+            let mut previous_send = None;
+            let mut sent = 0;
+            let mut micros = 0;
+            let mut random = 47_834_u64;
+            for _ in 0..100_000 {
+                let now = start + Duration::from_micros(micros);
+                if mouse_move_send_due(&mut last_tick, now, dragging) {
+                    if let Some(previous) = previous_send {
+                        assert!(micros - previous >= interval_us - 2 * tolerance_us);
+                    }
+                    previous_send = Some(micros);
+                    sent += 1;
+                    assert!(sent <= 1 + (micros + tolerance_us) / interval_us);
+                    // Multiple callbacks with the same timestamp cannot burst.
+                    assert!(!mouse_move_send_due(&mut last_tick, now, dragging));
+                }
+                random = random
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1);
+                micros += (random >> 32) % 16_001;
+            }
+        }
+    }
+
+    #[test]
+    fn mouse_motion_resumes_after_idle_without_catch_up_credit() {
+        let start = Instant::now();
+        for dragging in [false, true] {
+            let mut last_tick = None;
+            assert!(mouse_move_send_due(&mut last_tick, start, dragging));
+            let resumed = start + Duration::from_secs(1);
+            assert!(mouse_move_send_due(&mut last_tick, resumed, dragging));
+            assert_eq!(last_tick, Some(resumed));
+            // No old ticks may be replayed while the next interval is pending.
+            for micros in 0..7_500 {
+                assert!(!mouse_move_send_due(
+                    &mut last_tick,
+                    resumed + Duration::from_micros(micros),
+                    dragging,
+                ));
+            }
+            assert!(mouse_move_send_due(
+                &mut last_tick,
+                resumed + Duration::from_millis(8),
+                dragging,
+            ));
+        }
+    }
+
+    #[test]
+    fn mouse_motion_forced_position_and_reset_start_a_new_phase() {
+        let last_tick = Mutex::new(Some(Instant::now() - Duration::from_secs(1)));
+        let before = Instant::now();
+        mark_mouse_move_sent(&last_tick);
+        let after = Instant::now();
+        let mut tick = last_tick.lock().expect("mouse pacing lock");
+        let forced = tick.expect("forced position should reset the phase");
+        assert!((before..=after).contains(&forced));
+        for dragging in [false, true] {
+            assert!(!mouse_move_send_due(&mut tick, forced, dragging));
+            assert!(!mouse_move_send_due(
+                &mut tick,
+                forced + Duration::from_millis(7),
+                dragging,
+            ));
+        }
+        drop(tick);
+        reset_mouse_move_timer(&last_tick);
+        let mut tick = last_tick.lock().expect("mouse pacing lock");
+        assert!(tick.is_none());
+        assert!(mouse_move_send_due(&mut tick, after, false));
+    }
 
     #[test]
     fn input_debug_summary_keeps_recent_events_and_latest_failure() {
@@ -6001,7 +6295,7 @@ mod tests {
     fn linux_native_screen_uses_physical_pixels_for_x11() {
         let mut logical = screen("local", "display", 960, 0, 1280, 720);
         logical.scale = 2.0;
-        let native = platform_native_screen(&logical);
+        let native = linux_native_screen(&logical, false);
         assert_eq!((native.x, native.y), (1920, 0));
         assert_eq!((native.width, native.height), (2560, 1440));
         assert_eq!(
@@ -6010,8 +6304,31 @@ mod tests {
         );
 
         logical.scale = f64::NAN;
-        let native = platform_native_screen(&logical);
+        let native = linux_native_screen(&logical, false);
         assert_eq!((native.x, native.width), (960, 1280));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_wayland_coordinates_stay_logical_and_within_the_selected_monitor() {
+        for scale in [1.0, 1.5, 2.0] {
+            let mut logical = screen("local", "display", -1280, 100, 1280, 720);
+            logical.scale = scale;
+            let native = linux_native_screen(&logical, true);
+            assert_eq!((native.x, native.y), (-1280, 100));
+            assert_eq!((native.width, native.height), (1280, 720));
+            assert_eq!(clamp_to_native_screen(&native, -640, 400), (-640, 400));
+            assert_eq!(clamp_to_native_screen(&native, 0, 820), (-1, 819));
+            assert_eq!(
+                clamp_to_native_screen(&native, i32::MIN, i32::MIN),
+                (-1280, 100)
+            );
+        }
+        let one_pixel = screen("local", "pixel", i32::MAX, i32::MAX, 1, 1);
+        assert_eq!(
+            clamp_to_native_screen(&one_pixel, 0, 0),
+            (i32::MAX, i32::MAX)
+        );
     }
 
     fn screen(device_id: &str, id: &str, x: i32, y: i32, width: i32, height: i32) -> Screen {

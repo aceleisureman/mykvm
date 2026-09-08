@@ -34,7 +34,21 @@ Move your cursor off the edge of one screen and it lands on the next machine. Yo
 - **macOS first launch.** Builds are free self-signed (not Apple-notarized), so Gatekeeper warns the first time. Right-click the app → **Open** → **Open** to allow it once.
 - **Windows.** No special permission for normal use. Run as Administrator only if you need to control elevated/admin windows.
 - **Linux.** If you use the AppImage, mark it executable (`chmod +x`).
-- **Ubuntu / Linux client.** Input injection uses the X11 XTEST extension. Run MyKVM as the desktop user inside a logged-in Xorg session. Wayland input injection is not supported yet; select **Ubuntu on Xorg** after logging out if your login screen offers it. Missing display access or XTEST support appears in the input status and diagnostics. Global input capture on Linux is not implemented; configure the Linux device as a client.
+- **Ubuntu / Linux client.** Run MyKVM as the logged-in desktop user, in **Client** mode. X11 sessions continue to use **XTEST**. Wayland sessions use experimental **RemoteDesktop Portal + EIS** support; the desktop's portal backend must implement RemoteDesktop v2 / `ConnectToEIS` and ScreenCast monitor selection. No root access, `/dev/uinput` permission changes, or XWayland workaround is needed. Linux global input capture / Server mode is not implemented.
+
+### Wayland authorization
+
+When client input sharing starts (including automatic client startup), allow **keyboard and pointer control** and select **all physical monitors** in the desktop's sharing dialog. MyKVM requests monitor metadata to map the pointer, but does **not** open the PipeWire video stream, capture frames, or transmit screen video. Screen-sharing indicators may still appear because the portal provides the monitor selection.
+
+- The client is advertised as input-ready only after authorization and EIS device/monitor mapping are complete. Status/diagnostic polling and incoming packets never request authorization.
+- Denial, cancellation, revocation, missing EIS support, or ambiguous monitor mapping leaves input unavailable and reports an error. MyKVM does not silently fall back to XWayland or repeatedly reopen the dialog. To retry, click **Stop**, then **Start**; authorization is not persisted.
+- Stopping sharing, switching controllers, and QUIC disconnect detection release held keys/buttons. A dead controller can take up to the transport's 10-second idle timeout to detect. Revocation/device removal ends the virtual-device state at the compositor.
+- A temporary EIS device pause suspends reception, clears held input and discards queued commands. Sharing resumes within the existing grant only when the devices and monitor mappings are ready again; held keys/buttons are not replayed.
+- If the desktop removes and recreates a **keyboard-only** device, MyKVM waits for a resumed keyboard on the same authorized EIS connection and seat, then revalidates the unchanged pointer mapping. This also discards queued input when the replacement arrives before the old keyboard is removed. Pointer/mixed-device removal, seat removal, connection loss, and permission revocation still fail closed and require a manual sharing restart. If the desktop never restores the keyboard after local unlock, stop and start sharing to authorize again; no authorization is renewed automatically.
+- Mirrored/overlapping monitor layouts are rejected rather than guessing. After changing physical monitors, resolution, scaling, or rotation, **restart MyKVM** to refresh native display geometry, then authorize again.
+- Keys use the existing virtual-key protocol mapped to physical evdev keys. Matching keyboard layouts are recommended; differing layouts/IME behavior are not normalized. This is not an unattended-login, lock-screen, or secure-attention bypass.
+
+See the [Linux input verification checklist](docs/linux-input-testing.md) for automated coverage and the interactive desktop checks still required for a release.
 
 ## Limitations
 
